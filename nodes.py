@@ -817,6 +817,138 @@ class OnnxDetectionModelLoaderV2:
 
 
 # ---------------------------------------------------
+# Jitterless face-crop helpers
+# ---------------------------------------------------
+def _parse_keyframes_json(s, B):
+    """Return a list of dicts {frame, cx, cy, size?} sorted by frame.
+
+    Tolerates malformed input — bad entries are skipped with a warning.
+    """
+    if not s or not isinstance(s, str):
+        return []
+    try:
+        raw = json.loads(s)
+    except Exception as e:
+        print(f"[PoseAndFaceDetectionV2] keyframes_json parse error: {e}; ignoring.")
+        return []
+    if not isinstance(raw, list):
+        return []
+    out = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        try:
+            f = int(entry.get("frame", -1))
+            cx = float(entry.get("cx"))
+            cy = float(entry.get("cy"))
+        except (TypeError, ValueError):
+            continue
+        if f < 0 or f >= B:
+            continue
+        kf = {"frame": f, "cx": cx, "cy": cy}
+        if "size" in entry and entry["size"] is not None:
+            try:
+                kf["size"] = int(entry["size"])
+            except (TypeError, ValueError):
+                pass
+        out.append(kf)
+    out.sort(key=lambda e: e["frame"])
+    return out
+
+
+def _interp_keyframes(keyframes, B, default_cx, default_cy, default_size):
+    """Densify sorted keyframes into per-frame (cx, cy, size) arrays.
+
+    Frames before the first keyframe hold the first; after the last hold
+    the last; in-between frames are linearly interpolated.
+    Returns three np.ndarray of length B (or None if no keyframes).
+    """
+    if not keyframes:
+        return None, None, None
+    cx = np.full(B, default_cx, dtype=np.float32)
+    cy = np.full(B, default_cy, dtype=np.float32)
+    sz = np.full(B, default_size, dtype=np.float32)
+    # spread cx/cy across all frames
+    frames = np.array([k["frame"] for k in keyframes], dtype=np.int32)
+    cxs = np.array([k["cx"] for k in keyframes], dtype=np.float32)
+    cys = np.array([k["cy"] for k in keyframes], dtype=np.float32)
+    sizes_known = np.array([k.get("size", -1) for k in keyframes], dtype=np.float32)
+    xs = np.arange(B, dtype=np.float32)
+    cx = np.interp(xs, frames, cxs).astype(np.float32)
+    cy = np.interp(xs, frames, cys).astype(np.float32)
+    if np.any(sizes_known > 0):
+        # only interpolate sizes between keyframes that actually specify one
+        mask = sizes_known > 0
+        sz_known = sizes_known[mask]
+        f_known = frames[mask].astype(np.float32)
+        if f_known.size >= 2:
+            sz = np.interp(xs, f_known, sz_known).astype(np.float32)
+        elif f_known.size == 1:
+            sz = np.full(B, float(sz_known[0]), dtype=np.float32)
+    return cx, cy, sz
+
+
+def _gaussian_window(window):
+    """1D Gaussian kernel (length=window, odd) suitable for np.convolve."""
+    window = max(3, int(window) | 1)  # force odd and >= 3
+    sigma = max(0.5, window / 6.0)
+    xs = np.arange(window) - (window - 1) / 2.0
+    k = np.exp(-(xs ** 2) / (2.0 * sigma * sigma))
+    k /= k.sum()
+    return k
+
+
+def _smooth_centers(centers_xy, method, *, ema_strength=0.6, image_diag=1.0,
+                    one_euro_min_cutoff=1.0, one_euro_beta=0.05,
+                    gaussian_window=7):
+    """Apply a temporal filter to a (B, 2) array of (cx, cy)."""
+    centers_xy = np.asarray(centers_xy, dtype=np.float32)
+    if centers_xy.ndim != 2 or centers_xy.shape[0] < 2 or method == "none":
+        return centers_xy.copy()
+
+    if method == "ema":
+        out = np.empty_like(centers_xy)
+        out[0] = centers_xy[0]
+        norm = max(1.0, image_diag)
+        base = float(np.clip(ema_strength, 0.0, 1.0))
+        for i in range(1, len(centers_xy)):
+            curr = centers_xy[i]
+            prev = out[i - 1]
+            motion = float(np.mean(np.abs(curr - prev)) / norm)
+            dyn = base * np.exp(-motion * 5.0)
+            alpha = 1.0 - dyn
+            out[i] = alpha * curr + (1.0 - alpha) * prev
+        return out
+
+    if method == "gaussian":
+        k = _gaussian_window(gaussian_window)
+        # reflect-pad so the ends don't darken
+        pad = len(k) // 2
+        padded = np.pad(centers_xy, ((pad, pad), (0, 0)), mode="edge")
+        out = np.empty_like(centers_xy)
+        out[:, 0] = np.convolve(padded[:, 0], k, mode="valid")
+        out[:, 1] = np.convolve(padded[:, 1], k, mode="valid")
+        return out
+
+    # default: one_euro
+    _OEF = None
+    if _GAZE_BS_IMPORTED and _gaze_bs is not None:
+        _OEF = getattr(_gaze_bs, "OneEuroFilter", None)
+    if _OEF is None:
+        # graceful fallback
+        return _smooth_centers(centers_xy, "ema",
+                               ema_strength=ema_strength,
+                               image_diag=image_diag)
+    fx = _OEF(freq=30.0, min_cutoff=one_euro_min_cutoff, beta=one_euro_beta)
+    fy = _OEF(freq=30.0, min_cutoff=one_euro_min_cutoff, beta=one_euro_beta)
+    out = np.empty_like(centers_xy)
+    for i in range(len(centers_xy)):
+        out[i, 0] = fx(float(centers_xy[i, 0]))
+        out[i, 1] = fy(float(centers_xy[i, 1]))
+    return out
+
+
+# ---------------------------------------------------
 # Pose and Face Detection
 # ---------------------------------------------------
 class PoseAndFaceDetectionV2:
@@ -858,11 +990,24 @@ class PoseAndFaceDetectionV2:
                 "gaze_one_euro_beta": ("FLOAT", {"default": 0.3, "min": 0.0, "max": 5.0, "step": 0.05, "tooltip": "One-euro filter speed coefficient. Higher = filter relaxes faster on quick saccades, preserving responsiveness; lower = stronger smoothing during fast moves."}),
                 "gaze_max_yaw_deg": ("FLOAT", {"default": 30.0, "min": 5.0, "max": 60.0, "step": 1.0, "tooltip": "Saturation yaw angle in degrees that corresponds to blend shape value 1.0. 30\u00b0 covers the comfortable physiological range; raise for more dramatic eye motion."}),
                 "gaze_max_pitch_deg": ("FLOAT", {"default": 25.0, "min": 5.0, "max": 60.0, "step": 1.0, "tooltip": "Saturation pitch angle in degrees that corresponds to blend shape value 1.0. 25\u00b0 covers the comfortable physiological range."}),
+                # ---- Jitterless face crop (manual frame-0 anchor + keyframes) ----
+                "crop_mode": (["default", "auto", "jitterless"], {"default": "default", "tooltip": "default = raw detected bbox per frame (NO smoothing / NO constant size — crop is effectively 'off'). auto = legacy smoothed + optional constant-size box. jitterless = lock crop SIZE from frame 0, smoothly track the CENTER, allow manual frame-0 + key-frame overrides."}),
+                "frame0_cx": ("INT", {"default": -1, "min": -1, "max": 8192, "tooltip": "Frame 0 anchor center X in pixels. -1 = use detected face center on frame 0. Used only when crop_mode=jitterless."}),
+                "frame0_cy": ("INT", {"default": -1, "min": -1, "max": 8192, "tooltip": "Frame 0 anchor center Y in pixels. -1 = use detected face center on frame 0."}),
+                "frame0_size": ("INT", {"default": 0, "min": 0, "max": 4096, "step": 16, "tooltip": "Locked square crop size in pixels (used for the entire clip). 0 = fall back to face_box_size_px."}),
+                "keyframes_json": ("STRING", {"default": "[]", "multiline": True, "tooltip": "JSON list of per-frame overrides: [{\"frame\":N, \"cx\":X, \"cy\":Y, \"size\":S?}, ...]. Frames between key-frames are linearly interpolated. size is optional; if omitted the locked size is kept."}),
+                "smoothing_method": (["one_euro", "ema", "gaussian", "none"], {"default": "one_euro", "tooltip": "Center-trajectory filter. one_euro = jitterless adaptive low-pass (recommended). ema = legacy motion-adaptive EMA. gaussian = fixed-window 1D blur. none = raw."}),
+                "crop_one_euro_min_cutoff": ("FLOAT", {"default": 1.0, "min": 0.05, "max": 10.0, "step": 0.05, "tooltip": "One-euro min cutoff (Hz) for crop center. Lower = stronger jitter rejection."}),
+                "crop_one_euro_beta": ("FLOAT", {"default": 0.05, "min": 0.0, "max": 5.0, "step": 0.01, "tooltip": "One-euro speed coefficient for crop center. Higher = filter relaxes faster on quick motion."}),
+                "crop_gaussian_window": ("INT", {"default": 7, "min": 3, "max": 51, "step": 2, "tooltip": "Window size (odd) for the Gaussian temporal blur of the crop center."}),
+            },
+            "optional": {
+                "bbox_override": ("BBOX", {"tooltip": "Optional external BBOX for the frame-0 anchor. Highest priority; overrides frame0_cx/cy/size widgets."}),
             },
         }
 
-    RETURN_TYPES = ("POSEDATA", "IMAGE", "STRING", "BBOX", "BBOX", "STRING", "IMAGE", "STRING", "STRING", "FLOAT")
-    RETURN_NAMES = ("pose_data", "face_images", "key_frame_body_points", "bboxes", "face_bboxes", "iris_data", "debug_image", "right_pupil_xy", "left_pupil_xy", "lip_openness_ratio")
+    RETURN_TYPES = ("POSEDATA", "IMAGE", "STRING", "BBOX", "BBOX", "STRING", "IMAGE", "STRING", "STRING", "FLOAT", "FACE_RESTORE_INFO")
+    RETURN_NAMES = ("pose_data", "face_images", "key_frame_body_points", "bboxes", "face_bboxes", "iris_data", "debug_image", "right_pupil_xy", "left_pupil_xy", "lip_openness_ratio", "restore_info")
     OUTPUT_TOOLTIPS = (
         "Per-frame pose+face+iris dict bundle. Feed into Draw ViT Pose (V2).",
         "Cropped face IMAGE batch suitable for face-id encoders.",
@@ -874,6 +1019,7 @@ class PoseAndFaceDetectionV2:
         "Right pupil pixel xy as JSON (per frame).",
         "Left pupil pixel xy as JSON (per frame).",
         "Mouth-open scalar list (0=closed, 1=wide).",
+        "Per-frame {x1,y1,x2,y2,size,frame_shape} dict for paste-back nodes.",
     )
     FUNCTION = "process"
     CATEGORY = "WanAnimatePreprocess_V2"
@@ -902,6 +1048,16 @@ class PoseAndFaceDetectionV2:
         gaze_one_euro_beta=0.3,
         gaze_max_yaw_deg=30.0,
         gaze_max_pitch_deg=25.0,
+        crop_mode="default",
+        frame0_cx=-1,
+        frame0_cy=-1,
+        frame0_size=0,
+        keyframes_json="[]",
+        smoothing_method="one_euro",
+        crop_one_euro_min_cutoff=1.0,
+        crop_one_euro_beta=0.05,
+        crop_gaussian_window=7,
+        bbox_override=None,
     ):
         detector = model["yolo"]
         pose_model = model["vitpose"]
@@ -1012,54 +1168,170 @@ class PoseAndFaceDetectionV2:
             cy = 0.5 * (y1 + y2)
             raw_centers.append(np.array([cx, cy], dtype=np.float32))
 
-        # --- Temporal smoothing for centers (motion-adaptive) ---
-        if use_face_smoothing and len(raw_centers) > 1:
-            base_strength = float(np.clip(face_smoothing_strength, 0.0, 1.0))
-            smoothed_centers = [raw_centers[0].copy()]
-            norm = max(1.0, (W + H) / 2.0)
-            for i in range(1, len(raw_centers)):
-                curr = raw_centers[i]
-                prev = smoothed_centers[-1]
-                motion = float(np.mean(np.abs(curr - prev)) / norm)
-                # More motion -> less smoothing
-                k = 5.0
-                dynamic_strength = base_strength * np.exp(-motion * k)
-                alpha = 1.0 - dynamic_strength  # 1=no smoothing, 0=full smoothing
-                smoothed = alpha * curr + (1.0 - alpha) * prev
-                smoothed_centers.append(smoothed.astype(np.float32))
-        else:
-            smoothed_centers = raw_centers
+        crop_mode_str = str(crop_mode)
+        jitterless = crop_mode_str == "jitterless"
+        crop_off = crop_mode_str == "default"
 
-        # --- Build final face bboxes from smoothed centers ---
-        face_bboxes = []
-        if use_constant_face_box:
-            half = face_box_size_px / 2.0
-            for c in smoothed_centers:
-                cx, cy = float(c[0]), float(c[1])
-                # Clamp so the square stays in bounds
-                x1 = int(np.clip(cx - half, 0, W - face_box_size_px))
-                y1 = int(np.clip(cy - half, 0, H - face_box_size_px))
-                x2 = x1 + int(face_box_size_px)
-                y2 = y1 + int(face_box_size_px)
+        if crop_off:
+            # ── default: raw detected bboxes, no smoothing, no constant-size ──
+            face_bboxes = list(raw_face_bboxes)
+        elif jitterless:
+            # ── Jitterless crop pipeline ─────────────────────────────────
+            # 1. Resolve the frame-0 anchor (size & center) with priority:
+            #      bbox_override > frame0_cx/cy widgets > raw detection.
+            #    The locked size is then used for the whole clip.
+            anchor_cx = None
+            anchor_cy = None
+            anchor_size = None
+            if bbox_override is not None:
+                try:
+                    bb = bbox_override
+                    # Accept (x1,y1,x2,y2) or (x1,x2,y1,y2) — heuristic:
+                    if isinstance(bb, (list, tuple)) and len(bb) > 0 and isinstance(bb[0], (list, tuple)):
+                        bb = bb[0]
+                    bb = [float(v) for v in (bb[:4] if hasattr(bb, "__len__") else [])]
+                    if len(bb) == 4:
+                        # detect ordering by checking which pair is closer
+                        a, b, c, d = bb
+                        # try (x1,y1,x2,y2)
+                        x1o, y1o, x2o, y2o = sorted([a, c])[0], sorted([b, d])[0], sorted([a, c])[1], sorted([b, d])[1]
+                        anchor_cx = 0.5 * (x1o + x2o)
+                        anchor_cy = 0.5 * (y1o + y2o)
+                        anchor_size = max(x2o - x1o, y2o - y1o)
+                except Exception as e:
+                    print(f"[PoseAndFaceDetectionV2] bbox_override parse failed: {e}; ignoring.")
+            if (anchor_cx is None) and frame0_cx >= 0 and frame0_cy >= 0:
+                anchor_cx = float(frame0_cx)
+                anchor_cy = float(frame0_cy)
+            if anchor_cx is None and len(raw_centers) > 0:
+                anchor_cx = float(raw_centers[0][0])
+                anchor_cy = float(raw_centers[0][1])
+            if anchor_size is None or anchor_size <= 0:
+                if frame0_size and int(frame0_size) > 0:
+                    anchor_size = float(frame0_size)
+                else:
+                    anchor_size = float(face_box_size_px)
+            anchor_size = float(np.clip(anchor_size, 8.0, max(W, H)))
+            anchor_cx = 0.0 if anchor_cx is None else float(np.clip(anchor_cx, 0.0, W - 1))
+            anchor_cy = 0.0 if anchor_cy is None else float(np.clip(anchor_cy, 0.0, H - 1))
+
+            # 2. Build the per-frame target-center series.
+            #    Start from raw detected centers (so the face is followed
+            #    when the user adds no keyframes) and overwrite with
+            #    interpolated keyframe centers wherever keyframes exist.
+            kfs = _parse_keyframes_json(keyframes_json, B)
+            # Always anchor frame 0 to (anchor_cx, anchor_cy, anchor_size)
+            kfs = [k for k in kfs if k["frame"] != 0]
+            kfs.insert(0, {"frame": 0, "cx": anchor_cx, "cy": anchor_cy, "size": int(anchor_size)})
+
+            kf_cx, kf_cy, kf_sz = _interp_keyframes(
+                kfs, B,
+                default_cx=anchor_cx,
+                default_cy=anchor_cy,
+                default_size=anchor_size,
+            )
+
+            # If user supplied >1 keyframes (besides frame 0), trust them
+            # fully for the center; otherwise blend with the smoothed raw
+            # detection so the crop still tracks the face.
+            user_added = len([k for k in kfs if k["frame"] != 0])
+            target_centers = np.stack(raw_centers, axis=0).astype(np.float32) \
+                if raw_centers else np.zeros((B, 2), dtype=np.float32)
+            if user_added >= 1:
+                # The user-controlled trajectory wins.
+                target_centers[:, 0] = kf_cx
+                target_centers[:, 1] = kf_cy
+            else:
+                # No extra keyframes — keep the detected centers but
+                # snap frame 0 to the anchor (so the user's manual frame-0
+                # override actually takes effect).
+                target_centers[0, 0] = anchor_cx
+                target_centers[0, 1] = anchor_cy
+
+            # 3. Smooth the trajectory.
+            image_diag = float((W * W + H * H) ** 0.5)
+            smoothed_centers = _smooth_centers(
+                target_centers,
+                method=str(smoothing_method),
+                ema_strength=face_smoothing_strength,
+                image_diag=image_diag,
+                one_euro_min_cutoff=crop_one_euro_min_cutoff,
+                one_euro_beta=crop_one_euro_beta,
+                gaussian_window=int(crop_gaussian_window),
+            )
+
+            # 4. Hold-last-known on missing detections (raw_face_bbox was
+            #    the placeholder fallback (0,0,128,128) — treat that as
+            #    "missing" and carry forward the previous smoothed center).
+            for i in range(1, B):
+                rb = raw_face_bboxes[i]
+                if rb == (0, 0, min(W, 128), min(H, 128)) and user_added == 0:
+                    smoothed_centers[i] = smoothed_centers[i - 1]
+
+            # 5. Build final fixed-size square crops.
+            face_bboxes = []
+            for i in range(B):
+                size_i = float(kf_sz[i]) if (kf_sz is not None and user_added >= 1) else anchor_size
+                size_i = float(np.clip(size_i, 8.0, min(W, H)))
+                size_i_int = int(round(size_i))
+                half = size_i / 2.0
+                cx_i = float(smoothed_centers[i, 0])
+                cy_i = float(smoothed_centers[i, 1])
+                x1 = int(np.clip(cx_i - half, 0, W - size_i_int))
+                y1 = int(np.clip(cy_i - half, 0, H - size_i_int))
+                x2 = x1 + size_i_int
+                y2 = y1 + size_i_int
                 face_bboxes.append((x1, x2, y1, y2))
         else:
-            # If not constant size, just slightly pad the original (helps tilted heads)
-            for (x1, x2, y1, y2), c in zip(raw_face_bboxes, smoothed_centers):
-                w = x2 - x1
-                h = y2 - y1
-                x_pad = int(w * 0.2)
-                y_pad = int(h * 0.3)
-                # Recenter to smoothed center but keep variable size
-                cx, cy = float(c[0]), float(c[1])
-                half_w = (w / 2.0) + x_pad
-                half_h = (h / 2.0) + y_pad
-                nx1 = int(np.clip(cx - half_w, 0, W - 1))
-                ny1 = int(np.clip(cy - half_h, 0, H - 1))
-                nx2 = int(np.clip(cx + half_w, 0, W))
-                ny2 = int(np.clip(cy + half_h, 0, H))
-                if nx2 <= nx1 or ny2 <= ny1:
-                    nx1, ny1, nx2, ny2 = x1, y1, x2, y2  # fallback to raw
-                face_bboxes.append((nx1, nx2, ny1, ny2))
+            # ── Legacy auto pipeline (unchanged) ──────────────────────────
+            # --- Temporal smoothing for centers (motion-adaptive) ---
+            if use_face_smoothing and len(raw_centers) > 1:
+                base_strength = float(np.clip(face_smoothing_strength, 0.0, 1.0))
+                smoothed_centers = [raw_centers[0].copy()]
+                norm = max(1.0, (W + H) / 2.0)
+                for i in range(1, len(raw_centers)):
+                    curr = raw_centers[i]
+                    prev = smoothed_centers[-1]
+                    motion = float(np.mean(np.abs(curr - prev)) / norm)
+                    # More motion -> less smoothing
+                    k = 5.0
+                    dynamic_strength = base_strength * np.exp(-motion * k)
+                    alpha = 1.0 - dynamic_strength  # 1=no smoothing, 0=full smoothing
+                    smoothed = alpha * curr + (1.0 - alpha) * prev
+                    smoothed_centers.append(smoothed.astype(np.float32))
+            else:
+                smoothed_centers = raw_centers
+
+            # --- Build final face bboxes from smoothed centers ---
+            face_bboxes = []
+            if use_constant_face_box:
+                half = face_box_size_px / 2.0
+                for c in smoothed_centers:
+                    cx, cy = float(c[0]), float(c[1])
+                    # Clamp so the square stays in bounds
+                    x1 = int(np.clip(cx - half, 0, W - face_box_size_px))
+                    y1 = int(np.clip(cy - half, 0, H - face_box_size_px))
+                    x2 = x1 + int(face_box_size_px)
+                    y2 = y1 + int(face_box_size_px)
+                    face_bboxes.append((x1, x2, y1, y2))
+            else:
+                # If not constant size, just slightly pad the original (helps tilted heads)
+                for (x1, x2, y1, y2), c in zip(raw_face_bboxes, smoothed_centers):
+                    w = x2 - x1
+                    h = y2 - y1
+                    x_pad = int(w * 0.2)
+                    y_pad = int(h * 0.3)
+                    # Recenter to smoothed center but keep variable size
+                    cx, cy = float(c[0]), float(c[1])
+                    half_w = (w / 2.0) + x_pad
+                    half_h = (h / 2.0) + y_pad
+                    nx1 = int(np.clip(cx - half_w, 0, W - 1))
+                    ny1 = int(np.clip(cy - half_h, 0, H - 1))
+                    nx2 = int(np.clip(cx + half_w, 0, W))
+                    ny2 = int(np.clip(cy + half_h, 0, H))
+                    if nx2 <= nx1 or ny2 <= ny1:
+                        nx1, ny1, nx2, ny2 = x1, y1, x2, y2  # fallback to raw
+                    face_bboxes.append((nx1, nx2, ny1, ny2))
 
         # --- Face crops from sharp original frames ---
         face_images = []
@@ -1115,23 +1387,44 @@ class PoseAndFaceDetectionV2:
             "WanAnimateV2: face/gaze per-frame",
         ):
             mp_result = None
+            # IMPORTANT: MediaPipe FaceLandmarker expects the ENTIRE face
+            # in its input. The YOLO/raw face bbox is often tight (eyes
+            # outside the box), which makes the model produce landmarks
+            # in wrong locations. We pad the *landmark* crop here, while
+            # keeping `face_bboxes[idx]` as the user-configured output
+            # crop (which downstream consumers and the cyan FACE rect use).
+            rx1, rx2, ry1, ry2 = raw_face_bboxes[idx]
+            rw, rh = rx2 - rx1, ry2 - ry1
+            # Square + 40% padding around the raw face box so eyes /
+            # forehead / chin always fit, then clamp to image bounds.
+            side = max(rw, rh) * 1.4
+            cx_r = 0.5 * (rx1 + rx2)
+            cy_r = 0.5 * (ry1 + ry2)
+            half = 0.5 * side
+            mx1 = int(max(0, round(cx_r - half)))
+            my1 = int(max(0, round(cy_r - half)))
+            mx2 = int(min(W, round(cx_r + half)))
+            my2 = int(min(H, round(cy_r + half)))
+            mcw, mch = mx2 - mx1, my2 - my1
+            crop_rgb = None
+            if mcw > 8 and mch > 8:
+                crop_rgb = (np.clip(images_np[idx][my1:my2, mx1:mx2], 0, 1) * 255).astype(np.uint8)
+            # Output-crop coords (kept for parity with legacy code paths
+            # that still expected `x1..y2` in scope below).
             x1, x2, y1, y2 = face_bboxes[idx]
             cw, ch = x2 - x1, y2 - y1
-            crop_rgb = None
-            if cw > 8 and ch > 8:
-                crop_rgb = (np.clip(images_np[idx][y1:y2, x1:x2], 0, 1) * 255).astype(np.uint8)
 
             # 1) Try FaceLandmarker Tasks API (with blend-shape gaze)
             if bs_enabled and crop_rgb is not None:
                 mp_result = _run_face_landmarker_on_face_crop(
-                    crop_rgb, (x1, y1), (cw, ch), W, H,
+                    crop_rgb, (mx1, my1), (mcw, mch), W, H,
                 )
                 if mp_result is not None:
                     bs_used_count += 1
             # 2) Fall back to legacy FaceMesh (no blend shapes)
             if mp_result is None and mp_enabled and crop_rgb is not None:
                 mp_result = _run_mediapipe_on_face_crop(
-                    crop_rgb, (x1, y1), (cw, ch), W, H,
+                    crop_rgb, (mx1, my1), (mcw, mch), W, H,
                 )
 
             if mp_result is not None:
@@ -1318,6 +1611,25 @@ class PoseAndFaceDetectionV2:
         ]
         mean_lip_openness = float(np.mean(all_lip_ratios)) if all_lip_ratios else 0.0
 
+        # Per-frame paste-back metadata. Always emit so downstream nodes
+        # can rely on it regardless of crop_mode.
+        restore_info = {
+            "frame_shape": [int(H), int(W)],
+            "resized_to": [512, 512],
+            "crop_mode": str(crop_mode),
+            "crops": [
+                {
+                    "frame": int(i),
+                    "x1": int(x1),
+                    "y1": int(y1),
+                    "x2": int(x2),
+                    "y2": int(y2),
+                    "size": [int(y2 - y1), int(x2 - x1)],
+                }
+                for i, (x1, x2, y1, y2) in enumerate(face_bboxes)
+            ],
+        }
+
         return (
             pose_data,
             face_images_tensor,
@@ -1329,6 +1641,7 @@ class PoseAndFaceDetectionV2:
             json.dumps(right_pupil_seq),
             json.dumps(left_pupil_seq),
             mean_lip_openness,
+            restore_info,
         )
 
 
