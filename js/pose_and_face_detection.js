@@ -8,21 +8,47 @@ const ALWAYS = new Set([
 ]);
 
 function setHidden(w, hidden) {
+    if (!w) return;
     if (hidden) {
-        if (!w.__origComputeSize) {
-            w.__origComputeSize = w.computeSize;
-            w.__origType = w.type;
-        }
+        if (w.__mec_origType === undefined) w.__mec_origType = w.type;
+        if (w.__mec_origComputeSize === undefined) w.__mec_origComputeSize = w.computeSize;
         w.computeSize = () => [0, -4];
-        w.hidden = true;
         w.type = "hidden";
+        w.hidden = true;
+        const el = w.element;
+        if (el) {
+            if (w.__mec_origElDisplay === undefined) {
+                w.__mec_origElDisplay = el.style.display || "";
+            }
+            el.style.display = "none";
+            const wrap = el.parentElement;
+            if (wrap && wrap.classList?.contains("dom-widget")) {
+                if (w.__mec_origWrapDisplay === undefined) {
+                    w.__mec_origWrapDisplay = wrap.style.display || "";
+                }
+                wrap.style.display = "none";
+            }
+        }
     } else {
-        if (w.__origComputeSize) {
-            w.computeSize = w.__origComputeSize;
-            delete w.__origComputeSize;
+        if (w.__mec_origType !== undefined) {
+            w.type = w.__mec_origType;
+            delete w.__mec_origType;
+        }
+        if (w.__mec_origComputeSize !== undefined) {
+            w.computeSize = w.__mec_origComputeSize;
+            delete w.__mec_origComputeSize;
         }
         w.hidden = false;
-        w.type = w.__origType || w.type;
+        const el = w.element;
+        if (el) {
+            el.style.display = w.__mec_origElDisplay ?? "";
+            delete w.__mec_origElDisplay;
+            const wrap = el.parentElement;
+            if (wrap && wrap.classList?.contains("dom-widget")) {
+                wrap.style.display = w.__mec_origWrapDisplay ?? "";
+                delete w.__mec_origWrapDisplay;
+            }
+        }
     }
 }
 
