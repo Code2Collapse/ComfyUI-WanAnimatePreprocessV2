@@ -948,6 +948,49 @@ def _smooth_centers(centers_xy, method, *, ema_strength=0.6, image_diag=1.0,
     return out
 
 
+def _smooth_1d(values, method, *, ema_strength=0.6, scale_norm=1.0,
+               one_euro_min_cutoff=1.0, one_euro_beta=0.05,
+               gaussian_window=7):
+    """Temporal filter for a 1-D scalar series (e.g. per-frame crop sizes).
+
+    Same methods as _smooth_centers: one_euro (default), ema, gaussian, none.
+    ``scale_norm`` normalises the motion magnitude for the adaptive EMA.
+    """
+    values = np.asarray(values, dtype=np.float32)
+    if len(values) < 2 or method == "none":
+        return values.copy()
+
+    if method == "gaussian":
+        k = _gaussian_window(gaussian_window)
+        pad = len(k) // 2
+        padded = np.pad(values, (pad, pad), mode="edge")
+        return np.convolve(padded, k, mode="valid").astype(np.float32)
+
+    if method == "ema":
+        out = np.empty_like(values)
+        out[0] = values[0]
+        norm = max(1.0, float(scale_norm))
+        base = float(np.clip(ema_strength, 0.0, 1.0))
+        for i in range(1, len(values)):
+            motion = abs(float(values[i]) - float(out[i - 1])) / norm
+            dyn = base * np.exp(-motion * 5.0)
+            out[i] = (1.0 - dyn) * float(values[i]) + dyn * float(out[i - 1])
+        return out
+
+    # default: one_euro
+    _OEF = None
+    if _GAZE_BS_IMPORTED and _gaze_bs is not None:
+        _OEF = getattr(_gaze_bs, "OneEuroFilter", None)
+    if _OEF is None:
+        return _smooth_1d(values, "ema", ema_strength=ema_strength,
+                          scale_norm=scale_norm)
+    f = _OEF(freq=30.0, min_cutoff=one_euro_min_cutoff, beta=one_euro_beta)
+    out = np.empty_like(values)
+    for i in range(len(values)):
+        out[i] = f(float(values[i]))
+    return out
+
+
 # ---------------------------------------------------
 # Pose and Face Detection
 # ---------------------------------------------------
@@ -1161,12 +1204,14 @@ class PoseAndFaceDetectionV2:
                 x1, y1, x2, y2 = 0, 0, min(W, 128), min(H, 128)
             raw_face_bboxes.append((x1, x2, y1, y2))
 
-        # --- Convert to centers (for better, rotation-robust smoothing) ---
+        # --- Convert to centers and raw face sizes (for smoothing) ---
         raw_centers = []
+        raw_face_sizes = []
         for (x1, x2, y1, y2) in raw_face_bboxes:
             cx = 0.5 * (x1 + x2)
             cy = 0.5 * (y1 + y2)
             raw_centers.append(np.array([cx, cy], dtype=np.float32))
+            raw_face_sizes.append(float(max(x2 - x1, y2 - y1)))
 
         crop_mode_str = str(crop_mode)
         jitterless = crop_mode_str == "jitterless"
@@ -1215,6 +1260,19 @@ class PoseAndFaceDetectionV2:
             anchor_cx = 0.0 if anchor_cx is None else float(np.clip(anchor_cx, 0.0, W - 1))
             anchor_cy = 0.0 if anchor_cy is None else float(np.clip(anchor_cy, 0.0, H - 1))
 
+            # 1b. Face-scale ratio.
+            #    anchor_face_size_0: how many pixels wide the YOLO face bbox
+            #    was on frame 0.  anchor_scale_ratio = anchor_size / that width.
+            #    Per frame N:  target_crop_size_N = raw_face_size_N * ratio.
+            #    This keeps the face occupying the same fraction of the output
+            #    512×512 tile regardless of camera pan / zoom.
+            anchor_face_size_0 = float(raw_face_sizes[0]) if raw_face_sizes else anchor_size
+            if anchor_face_size_0 < 4.0:
+                # No reliable detection on frame 0 — fall back to constant size.
+                anchor_face_size_0 = anchor_size
+            anchor_scale_ratio = anchor_size / max(anchor_face_size_0, 4.0)
+            _missing_bbox = (0, 0, min(W, 128), min(H, 128))
+
             # 2. Build the per-frame target-center series.
             #    Start from raw detected centers (so the face is followed
             #    when the user adds no keyframes) and overwrite with
@@ -1248,7 +1306,23 @@ class PoseAndFaceDetectionV2:
                 target_centers[0, 0] = anchor_cx
                 target_centers[0, 1] = anchor_cy
 
-            # 3. Smooth the trajectory.
+            # 2b. Build per-frame target crop sizes.
+            #    If user keyframes supply explicit sizes, trust them.
+            #    Otherwise scale each frame's crop proportionally to the
+            #    detected face size so the face stays at constant apparent
+            #    scale in the output (face-scale-preserving crop).
+            if user_added >= 1 and kf_sz is not None:
+                target_sizes = kf_sz.copy()
+            else:
+                target_sizes = np.array(
+                    [float(s) * anchor_scale_ratio
+                     if (s >= 4.0 and raw_face_bboxes[idx] != _missing_bbox)
+                     else anchor_size
+                     for idx, s in enumerate(raw_face_sizes)],
+                    dtype=np.float32)
+            target_sizes = np.clip(target_sizes, 8.0, float(min(W, H)))
+
+            # 3. Smooth the trajectory (centers + crop sizes independently).
             image_diag = float((W * W + H * H) ** 0.5)
             smoothed_centers = _smooth_centers(
                 target_centers,
@@ -1259,19 +1333,30 @@ class PoseAndFaceDetectionV2:
                 one_euro_beta=crop_one_euro_beta,
                 gaussian_window=int(crop_gaussian_window),
             )
+            smoothed_sizes = _smooth_1d(
+                target_sizes,
+                method=str(smoothing_method),
+                ema_strength=face_smoothing_strength,
+                scale_norm=anchor_size,
+                one_euro_min_cutoff=crop_one_euro_min_cutoff,
+                one_euro_beta=crop_one_euro_beta,
+                gaussian_window=int(crop_gaussian_window),
+            )
 
             # 4. Hold-last-known on missing detections (raw_face_bbox was
             #    the placeholder fallback (0,0,128,128) — treat that as
-            #    "missing" and carry forward the previous smoothed center).
+            #    "missing" and carry forward the previous smoothed values).
             for i in range(1, B):
-                rb = raw_face_bboxes[i]
-                if rb == (0, 0, min(W, 128), min(H, 128)) and user_added == 0:
+                if raw_face_bboxes[i] == _missing_bbox and user_added == 0:
                     smoothed_centers[i] = smoothed_centers[i - 1]
+                    smoothed_sizes[i] = smoothed_sizes[i - 1]
 
-            # 5. Build final fixed-size square crops.
+            # 5. Build face-scale-preserving square crops.
+            #    Each frame uses its own smoothed crop size so that the face
+            #    fills the same fraction of the 512×512 output every frame.
             face_bboxes = []
             for i in range(B):
-                size_i = float(kf_sz[i]) if (kf_sz is not None and user_added >= 1) else anchor_size
+                size_i = float(smoothed_sizes[i])
                 size_i = float(np.clip(size_i, 8.0, min(W, H)))
                 size_i_int = int(round(size_i))
                 half = size_i / 2.0
