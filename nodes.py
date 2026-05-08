@@ -1110,7 +1110,7 @@ class PoseAndFaceDetectionV2:
 
         B, H, W, C = images.shape
         shape = np.array([H, W])[None]
-        images_np = images.numpy()
+        images_np = images.detach().cpu().numpy() if hasattr(images, "detach") else images.cpu().numpy()
 
         # --- Prepare blurred version for detection & pose ---
         if use_blur_for_pose:
