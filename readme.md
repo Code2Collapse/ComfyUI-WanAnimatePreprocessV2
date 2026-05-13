@@ -999,3 +999,11 @@ Wiring pattern for the canonical Wan-Animate V2 graph:
 ```
 
 Bounding-box outputs are also useful as input to crop / inpaint pipelines (e.g. ComfyUI-CustomNodePacks `Inpaint Crop Pro`) when refining only the body or face region.
+
+
+---
+
+## Full Node & Parameter Reference
+
+A complete, auto-generated reference covering every node, return type and widget exposed by this pack lives in [NODE_REFERENCE.md](./NODE_REFERENCE.md). It is regenerated whenever `INPUT_TYPES` change.
+
