@@ -366,7 +366,14 @@ folder_paths.add_model_folder_path("detection", os.path.join(folder_paths.models
 
 from .models.onnx_models import ViTPose, Yolo
 from .pose_utils.pose2d_utils import load_pose_metas_from_kp2ds_seq, crop, bbox_from_detector
-from .utils import get_face_bboxes, padding_resize
+from .utils import (
+    get_face_bboxes,
+    padding_resize,
+    adjust_bbox_eye_upper_third,
+    compute_eye_midpoint_from_face_kps,
+    compute_frame_blur_score,
+    compute_eye_region_brightness,
+)
 from .pose_utils.human_visualization import AAPoseMeta, draw_aapose_by_meta_new
 
 
@@ -674,8 +681,19 @@ def estimate_iris_positions(face_kps, image_np, img_width, img_height):
         dx = ix - float(geo[0])
         dy = iy - float(geo[1])
         norm = max(np.hypot(dx, dy), 1e-6)
+        # Approximate yaw/pitch from 2D iris-offset (small-angle, scaled by
+        # eye span). This lets the downstream gaze-lock + OneEuro paths
+        # work even when MediaPipe blendshapes are unavailable.
+        eye_span_x = float(np.ptp(pts[:, 0])) or 1.0
+        eye_span_y = float(np.ptp(pts[:, 1])) or 1.0
+        yaw_rad = np.clip(dx / (eye_span_x * 0.5), -1.2, 1.2) * 0.5  # ~30 deg max
+        pitch_rad = np.clip(dy / (eye_span_y * 0.5), -1.2, 1.2) * 0.4  # ~25 deg max
         results[f'{eye_name}_gaze'] = {
-            'dx': round(dx / norm, 4), 'dy': round(dy / norm, 4)}
+            'dx': round(dx / norm, 4), 'dy': round(dy / norm, 4),
+            'yaw_rad': float(yaw_rad), 'pitch_rad': float(pitch_rad),
+            'magnitude': float(np.hypot(yaw_rad, pitch_rad)),
+            'source': 'iris_offset_2d',
+        }
 
     return results
 
@@ -1023,8 +1041,14 @@ class PoseAndFaceDetectionV2:
                 "use_constant_face_box": ("BOOLEAN", {"default": True, "tooltip": "Keep a constant pixel size face crop; position adapts."}),
                 "face_box_size_px": ("INT", {"default": 224, "min": 64, "max": 1024, "step": 16, "tooltip": "Pixel size of the square face crop when constant mode is on."}),
                 # Iris estimation
-                "use_iris_smoothing": ("BOOLEAN", {"default": True, "tooltip": "Temporally smooth iris positions across frames."}),
-                "iris_smoothing_strength": ("FLOAT", {"default": 0.4, "min": 0.0, "max": 1.0, "step": 0.05, "tooltip": "Higher = more temporal smoothing for iris."}),
+                "use_iris_smoothing": ("BOOLEAN", {"default": True, "tooltip": "Temporally smooth iris pixel positions across frames. Reduces per-frame jitter that Wan 2.2 Animate's face encoder picks up and reproduces as wobbly gaze."}),
+                "iris_smoothing_strength": ("FLOAT", {"default": 0.4, "min": 0.0, "max": 1.0, "step": 0.05, "tooltip": "EMA mix weight when iris_smoothing_method='ema'. Higher = more smoothing, more lag. Ignored for one_euro / none."}),
+                "iris_smoothing_method": (["one_euro", "ema", "none"], {"default": "one_euro", "tooltip": "Iris pixel-position smoother. one_euro = adaptive low-pass (Casiez 2012, recommended). ema = legacy first-order; tweak via iris_smoothing_strength. none = raw per-frame positions."}),
+                "iris_one_euro_min_cutoff": ("FLOAT", {"default": 1.0, "min": 0.05, "max": 10.0, "step": 0.05, "tooltip": "One-euro min cutoff (Hz) for iris pixel coords. Lower = stronger jitter rejection on near-static eyes (small saccades preserved)."}),
+                "iris_one_euro_beta": ("FLOAT", {"default": 0.05, "min": 0.0, "max": 5.0, "step": 0.01, "tooltip": "One-euro speed coefficient for iris pixel coords. Higher = filter relaxes faster on quick eye movements; lower = stronger steady-state smoothing."}),
+                # Cross-eye coupling (NEW: directly fixes 'eyeballs not in same direction').
+                "gaze_lock_eyes": ("BOOLEAN", {"default": True, "tooltip": "Couple left & right eye gaze so they always look in the SAME direction. Both eyes' yaw/pitch are blended toward their per-frame average. Single most effective fix for the 'eyes pointing different directions' artefact in Wan 2.2 Animate output."}),
+                "gaze_lock_strength": ("FLOAT", {"default": 0.7, "min": 0.0, "max": 1.0, "step": 0.05, "tooltip": "How strongly to pull each eye toward the shared average. 0 = independent (legacy). 1 = perfectly conjugate (both eyes always parallel). 0.7 keeps a touch of natural convergence/divergence."}),
                 # MediaPipe face mesh (high-fidelity iris/lip tracking, falls back to ViTPose if unavailable)
                 "use_mediapipe_face": ("BOOLEAN", {"default": True, "tooltip": "Use MediaPipe FaceMesh (478 pts incl. iris/lips) to override face landmarks. Falls back to ViTPose pupil voting if MediaPipe is missing or fails on a frame."}),
                 # Production gaze (ARKit blend shapes via FaceLandmarker Tasks API)
@@ -1043,14 +1067,18 @@ class PoseAndFaceDetectionV2:
                 "crop_one_euro_min_cutoff": ("FLOAT", {"default": 1.0, "min": 0.05, "max": 10.0, "step": 0.05, "tooltip": "One-euro min cutoff (Hz) for crop center. Lower = stronger jitter rejection."}),
                 "crop_one_euro_beta": ("FLOAT", {"default": 0.05, "min": 0.0, "max": 5.0, "step": 0.01, "tooltip": "One-euro speed coefficient for crop center. Higher = filter relaxes faster on quick motion."}),
                 "crop_gaussian_window": ("INT", {"default": 7, "min": 3, "max": 51, "step": 2, "tooltip": "Window size (odd) for the Gaussian temporal blur of the crop center."}),
+                # ---- Wan-Animate paper-driven gaze fixes (arXiv:2509.14055) ----
+                "eye_align_mode": (["default", "eye_upper_third"], {"default": "default", "tooltip": "Wan-Animate paper recommendation #1: 'eye_upper_third' vertically shifts the face crop so eyes land at the upper third of the 512x512 face encoder input. The encoder reads holistic face appearance, so consistent eye placement directly improves gaze fidelity. 'default' keeps legacy bbox center."}),
+                "eye_y_fraction": ("FLOAT", {"default": 0.30, "min": 0.10, "max": 0.60, "step": 0.01, "tooltip": "Target eye row as a fraction of crop height (0.30 = upper third). Only used when eye_align_mode = 'eye_upper_third'."}),
+                "face_cfg_scale": ("FLOAT", {"default": 1.0, "min": 1.0, "max": 10.0, "step": 0.1, "tooltip": "Wan-Animate paper recommendation #3 (paper section 4.3): CFG on the face conditioning input gives finer control over expression / gaze when finer reenactment is desired. This widget is a passthrough -- wire the FLOAT output 'face_cfg_scale' into your Wan-Animate sampler's face CFG input. 1.0 = CFG disabled (default, fastest). 2.0-4.0 = stronger expression adherence. >5.0 may over-saturate."}),
             },
             "optional": {
                 "bbox_override": ("BBOX", {"tooltip": "Optional external BBOX for the frame-0 anchor. Highest priority; overrides frame0_cx/cy/size widgets."}),
             },
         }
 
-    RETURN_TYPES = ("POSEDATA", "IMAGE", "STRING", "BBOX", "BBOX", "STRING", "IMAGE", "STRING", "STRING", "FLOAT", "FACE_RESTORE_INFO")
-    RETURN_NAMES = ("pose_data", "face_images", "key_frame_body_points", "bboxes", "face_bboxes", "iris_data", "debug_image", "right_pupil_xy", "left_pupil_xy", "lip_openness_ratio", "restore_info")
+    RETURN_TYPES = ("POSEDATA", "IMAGE", "STRING", "BBOX", "BBOX", "STRING", "IMAGE", "STRING", "STRING", "FLOAT", "FACE_RESTORE_INFO", "FLOAT")
+    RETURN_NAMES = ("pose_data", "face_images", "key_frame_body_points", "bboxes", "face_bboxes", "iris_data", "debug_image", "right_pupil_xy", "left_pupil_xy", "lip_openness_ratio", "restore_info", "face_cfg_scale")
     OUTPUT_TOOLTIPS = (
         "Per-frame pose+face+iris dict bundle. Feed into Draw ViT Pose (V2).",
         "Cropped face IMAGE batch suitable for face-id encoders.",
@@ -1063,6 +1091,7 @@ class PoseAndFaceDetectionV2:
         "Left pupil pixel xy as JSON (per frame).",
         "Mouth-open scalar list (0=closed, 1=wide).",
         "Per-frame {x1,y1,x2,y2,size,frame_shape} dict for paste-back nodes.",
+        "CFG scale for the face conditioning input. Wire into the Wan-Animate sampler's face CFG. 1.0 = CFG off (paper default).",
     )
     FUNCTION = "process"
     CATEGORY = "WanAnimatePreprocess_V2"
@@ -1085,6 +1114,11 @@ class PoseAndFaceDetectionV2:
         face_box_size_px,
         use_iris_smoothing,
         iris_smoothing_strength,
+        iris_smoothing_method="one_euro",
+        iris_one_euro_min_cutoff=1.0,
+        iris_one_euro_beta=0.05,
+        gaze_lock_eyes=True,
+        gaze_lock_strength=0.7,
         use_mediapipe_face=True,
         use_blendshape_gaze=True,
         gaze_one_euro_min_cutoff=1.7,
@@ -1100,6 +1134,9 @@ class PoseAndFaceDetectionV2:
         crop_one_euro_min_cutoff=1.0,
         crop_one_euro_beta=0.05,
         crop_gaussian_window=7,
+        eye_align_mode="default",
+        eye_y_fraction=0.30,
+        face_cfg_scale=1.0,
         bbox_override=None,
     ):
         detector = model["yolo"]
@@ -1418,6 +1455,30 @@ class PoseAndFaceDetectionV2:
                         nx1, ny1, nx2, ny2 = x1, y1, x2, y2  # fallback to raw
                     face_bboxes.append((nx1, nx2, ny1, ny2))
 
+        # --- Wan-Animate paper recommendation #1: eye-centred crop -----
+        # Vertically shift each per-frame face bbox so the eyes land at
+        # `eye_y_fraction` of the crop height (0.30 = upper third).
+        # This is a temporal-stable post-pass on top of whatever crop
+        # mode the user picked: crop SIZE is preserved, only y1/y2 shift.
+        # Rationale (paper Sec. 3.2 + 4.3): the face encoder reads the
+        # holistic appearance from a fixed-size 512x512 crop. If the eyes
+        # drift around within that crop frame-to-frame the encoder learns
+        # spurious gaze cues and produces flicker / wrong gaze direction.
+        if str(eye_align_mode) == "eye_upper_third":
+            ey_frac = float(np.clip(eye_y_fraction, 0.05, 0.80))
+            adjusted = []
+            for idx, fb in enumerate(face_bboxes):
+                eye_xy = compute_eye_midpoint_from_face_kps(
+                    pose_metas[idx]['keypoints_face'], W, H
+                )
+                if eye_xy is None:
+                    adjusted.append(fb)
+                    continue
+                adjusted.append(
+                    adjust_bbox_eye_upper_third(fb, eye_xy, W, H, ey_frac)
+                )
+            face_bboxes = adjusted
+
         # --- Face crops from sharp original frames ---
         face_images = []
         for idx, (x1, x2, y1, y2) in enumerate(face_bboxes):
@@ -1595,18 +1656,54 @@ class PoseAndFaceDetectionV2:
             )
 
         # --- Temporal smoothing ---
-        # Iris pixel positions: simple EMA (kept; helps debug overlay).
-        if use_iris_smoothing and len(all_iris) > 1:
-            strength = float(np.clip(iris_smoothing_strength, 0.0, 1.0))
-            for eye_key in ('right_iris', 'left_iris'):
-                prev_x = all_iris[0][eye_key]['x']
-                prev_y = all_iris[0][eye_key]['y']
-                for i in range(1, len(all_iris)):
-                    cur = all_iris[i][eye_key]
-                    alpha = 1.0 - strength
-                    cur['x'] = alpha * cur['x'] + strength * prev_x
-                    cur['y'] = alpha * cur['y'] + strength * prev_y
-                    prev_x, prev_y = cur['x'], cur['y']
+        # Iris pixel positions: choose method (one_euro recommended).
+        if use_iris_smoothing and len(all_iris) > 1 and iris_smoothing_method != "none":
+            if iris_smoothing_method == "one_euro":
+                # Per-eye, per-axis One-Euro filter on the iris pixel
+                # coordinates. Far better than EMA at separating jitter
+                # from real saccades — exactly what the Wan 2.2 face
+                # encoder needs to reproduce stable gaze.
+                try:
+                    from .gaze_blendshape import OneEuroFilter as _OEF
+                    fps_est = 30.0
+                    filt_kw = dict(
+                        freq=fps_est,
+                        min_cutoff=float(iris_one_euro_min_cutoff),
+                        beta=float(iris_one_euro_beta),
+                    )
+                    filters = {
+                        ("right_iris", "x"): _OEF(**filt_kw),
+                        ("right_iris", "y"): _OEF(**filt_kw),
+                        ("left_iris",  "x"): _OEF(**filt_kw),
+                        ("left_iris",  "y"): _OEF(**filt_kw),
+                    }
+                    for fr in all_iris:
+                        for eye_key in ("right_iris", "left_iris"):
+                            iris = fr.get(eye_key)
+                            if not isinstance(iris, dict):
+                                continue
+                            # Skip blink frames so the filter doesn't drift.
+                            if float(iris.get("confidence", 1.0)) < 0.05:
+                                continue
+                            iris["x"] = filters[(eye_key, "x")](float(iris["x"]))
+                            iris["y"] = filters[(eye_key, "y")](float(iris["y"]))
+                except Exception as _exc:
+                    logging.getLogger(__name__).warning(
+                        "Iris one-euro smoothing failed (%s); falling back to EMA.", _exc,
+                    )
+                    iris_smoothing_method = "ema"
+
+            if iris_smoothing_method == "ema":
+                strength = float(np.clip(iris_smoothing_strength, 0.0, 1.0))
+                for eye_key in ('right_iris', 'left_iris'):
+                    prev_x = all_iris[0][eye_key]['x']
+                    prev_y = all_iris[0][eye_key]['y']
+                    for i in range(1, len(all_iris)):
+                        cur = all_iris[i][eye_key]
+                        alpha = 1.0 - strength
+                        cur['x'] = alpha * cur['x'] + strength * prev_x
+                        cur['y'] = alpha * cur['y'] + strength * prev_y
+                        prev_x, prev_y = cur['x'], cur['y']
 
         # Gaze yaw/pitch: one-euro filter per eye (low-lag, kills jitter).
         if bs_used_count > 0 and _GAZE_BS_IMPORTED and _gaze_bs is not None:
@@ -1640,6 +1737,37 @@ class PoseAndFaceDetectionV2:
                 logging.getLogger(__name__).warning(
                     "Gaze one-euro smoothing failed (%s); using raw values.", _exc,
                 )
+
+        # --- Cross-eye gaze locking (NEW) ---------------------------------
+        # The single most common Wan-Animate artefact is the two eyes
+        # pointing in slightly different directions. Per-eye OneEuro
+        # smoothing leaves them independent; here we pull each eye toward
+        # the per-frame average (yaw, pitch) of the two eyes.
+        # Re-derive dx/dy/magnitude after the blend so debug arrows match.
+        if gaze_lock_eyes and len(all_iris) > 0:
+            lock = float(np.clip(gaze_lock_strength, 0.0, 1.0))
+            if lock > 0.0:
+                for fr in all_iris:
+                    rg = fr.get('right_gaze')
+                    lg = fr.get('left_gaze')
+                    if not (isinstance(rg, dict) and isinstance(lg, dict)
+                            and 'yaw_rad' in rg and 'yaw_rad' in lg):
+                        continue
+                    avg_yaw = 0.5 * (float(rg['yaw_rad']) + float(lg['yaw_rad']))
+                    avg_pitch = 0.5 * (float(rg['pitch_rad']) + float(lg['pitch_rad']))
+                    for e in (rg, lg):
+                        e['yaw_rad']   = (1.0 - lock) * float(e['yaw_rad'])   + lock * avg_yaw
+                        e['pitch_rad'] = (1.0 - lock) * float(e['pitch_rad']) + lock * avg_pitch
+                        dx = -math.sin(e['yaw_rad'])
+                        dy = -math.sin(e['pitch_rad'])
+                        n = math.hypot(dx, dy)
+                        if n > 1e-6:
+                            e['dx'] = round(dx / n, 4)
+                            e['dy'] = round(dy / n, 4)
+                        else:
+                            e['dx'] = 0.0
+                            e['dy'] = 0.0
+                        e['magnitude'] = float(math.hypot(e['yaw_rad'], e['pitch_rad']))
 
         # Build per-frame iris output
         iris_output = []
@@ -1727,6 +1855,7 @@ class PoseAndFaceDetectionV2:
             json.dumps(left_pupil_seq),
             mean_lip_openness,
             restore_info,
+            float(face_cfg_scale),
         )
 
 
@@ -1915,14 +2044,847 @@ class DrawViTPoseV2:
         return (pose_images_tensor, )
 
 
+# ====================================================================
+# Wan-Animate paper recommendation #4: face-quality gating.
+# ====================================================================
+class WanAnimateFaceQualityCheckV2:
+    DESCRIPTION = (
+        "Score each face crop on (a) Laplacian-variance sharpness and "
+        "(b) eye-region brightness, then optionally repair bad frames by "
+        "copying the previous good frame or by simple sharpening. Bad "
+        "face conditioning frames cause the Wan-Animate face encoder to "
+        "produce drifting / wrong-direction gaze (paper Sec. 4.3). "
+        "Connect this BETWEEN Pose-and-Face-Detection (V2)'s `face_images` "
+        "output and your downstream face-id encoder."
+    )
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "face_images":           ("IMAGE", {"tooltip": "Per-frame 512x512 face crops (output of Pose and Face Detection V2)."}),
+                "blur_threshold":        ("FLOAT", {"default": 50.0, "min": 0.0, "max": 5000.0, "step": 1.0, "tooltip": "Laplacian-variance threshold below which a frame is flagged as blurry. Typical sharp 512x512 frames score 100-1000; <50 indicates motion blur or out-of-focus."}),
+                "min_eye_brightness":    ("FLOAT", {"default": 0.10, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "Minimum mean luma of the eye-region strip (rows 30%-55%). Below this, eyes are likely closed or the frame is too dark for the encoder to read gaze."}),
+                "auto_repair_bad_frames": ("BOOLEAN", {"default": True, "tooltip": "If true, repair frames flagged as bad. If false, just report stats."}),
+                "repair_strategy":       (["copy_previous_good", "unsharp_mask", "skip"], {"default": "copy_previous_good", "tooltip": "copy_previous_good: replace with last good frame. unsharp_mask: deconvolve-style sharpening. skip: leave untouched but report."}),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", "FLOAT", "STRING")
+    RETURN_NAMES = ("face_images_repaired", "good_frame_ratio", "report_json")
+    OUTPUT_TOOLTIPS = (
+        "Repaired face IMAGE batch (same shape as input).",
+        "Fraction of frames that passed BOTH thresholds (0..1).",
+        "JSON report: per-frame blur score, eye brightness, verdict, repair action.",
+    )
+    FUNCTION = "process"
+    CATEGORY = "WanAnimatePreprocess_V2"
+
+    def _unsharp(self, frame_np):
+        # Frame is float32 [0,1].
+        u8 = (np.clip(frame_np, 0.0, 1.0) * 255.0).astype(np.uint8)
+        blurred = cv2.GaussianBlur(u8, (0, 0), sigmaX=1.5)
+        sharp = cv2.addWeighted(u8, 1.5, blurred, -0.5, 0)
+        return np.clip(sharp.astype(np.float32) / 255.0, 0.0, 1.0)
+
+    def process(self, face_images, blur_threshold, min_eye_brightness,
+                auto_repair_bad_frames, repair_strategy):
+        if hasattr(face_images, "detach"):
+            arr = face_images.detach().cpu().numpy()
+        else:
+            arr = np.asarray(face_images)
+        if arr.ndim != 4 or arr.shape[-1] != 3:
+            raise ValueError(
+                f"WanAnimateFaceQualityCheckV2: expected (B,H,W,3); got {arr.shape}"
+            )
+        B = arr.shape[0]
+        report = []
+        good_count = 0
+        repaired = arr.copy().astype(np.float32)
+        last_good_idx = -1
+
+        for i in range(B):
+            frame = repaired[i]
+            blur = compute_frame_blur_score(frame)
+            eye_lum = compute_eye_region_brightness(frame)
+            blur_ok = blur >= float(blur_threshold)
+            lum_ok = eye_lum >= float(min_eye_brightness)
+            ok = blur_ok and lum_ok
+            action = "none"
+            if ok:
+                good_count += 1
+                last_good_idx = i
+            elif auto_repair_bad_frames:
+                if repair_strategy == "copy_previous_good" and last_good_idx >= 0:
+                    repaired[i] = repaired[last_good_idx]
+                    action = f"copied_from_frame_{last_good_idx}"
+                elif repair_strategy == "unsharp_mask":
+                    repaired[i] = self._unsharp(frame)
+                    action = "unsharp_mask"
+                else:
+                    action = "skipped_no_prior_good_frame"
+            report.append({
+                "frame": int(i),
+                "blur_score": round(blur, 2),
+                "eye_brightness": round(eye_lum, 4),
+                "blur_ok": bool(blur_ok),
+                "brightness_ok": bool(lum_ok),
+                "verdict": "ok" if ok else "bad",
+                "action": action,
+            })
+
+        ratio = float(good_count) / float(max(1, B))
+        report_json = json.dumps({
+            "good_frame_ratio": round(ratio, 4),
+            "blur_threshold": float(blur_threshold),
+            "min_eye_brightness": float(min_eye_brightness),
+            "frames": report,
+        })
+        return (torch.from_numpy(repaired.astype(np.float32)), ratio, report_json)
+
+
+# ====================================================================
+# Standalone Depth + Pose + Canny composer
+# ====================================================================
+class DepthPoseCannyCombinedV2:
+    DESCRIPTION = (
+        "Self-contained ControlNet preprocessor producing depth, pose, canny, "
+        "normal, layout-combined preview, AND a weighted blended map.\n\n"
+        "DEPTH backends (set via `depth_backend`):\n"
+        "  - auto       : prefer external_depth_map -> any wired loader -> built_in_midas\n"
+        "  - external   : require external_depth_map IMAGE input\n"
+        "  - built_in_midas : MiDaS small via torch.hub (downloads ~80MB to torch hub cache, no extra node pack needed)\n"
+        "  - damodel_v2     : kijai/ComfyUI-DepthAnythingV2 (models/depthanything/)\n"
+        "  - da3            : PozzettiAndrea/ComfyUI-DepthAnythingV3 (models/depthanything3/) - delegates to V3 pack\n"
+        "  - depthcrafter   : akatz-ai/ComfyUI-DepthCrafter-Nodes (models/depthcrafter/)\n"
+        "  - depth_pro      : spacepxl/ComfyUI-Depth-Pro (models/depth/ml-depth-pro/)\n\n"
+        "POSE source priority: external_pose_map > posemodel.\n\n"
+        "NORMAL map: Sobel-from-depth (Lambertian-style RGB). No extra model.\n\n"
+        "BLEND modes (research-backed, Wikipedia/W3C Compositing 1.0):\n"
+        "  - none           : returns the depth_map\n"
+        "  - weighted_avg   : per-channel sum normalised by total weight (perceptually balanced)\n"
+        "  - screen         : 1 - prod(1 - layer_i*w_i)  (avoids highlight clipping, good for stacking depth+canny gradients)\n"
+        "  - linear_dodge   : min(1, sum(layer_i*w_i))  (additive; sharpens edges; preferred for pose+canny per Fooocus/SDXL controlnet community)\n"
+        "  - max            : per-pixel maximum across weighted layers (preserves strongest cue per pixel)\n"
+        "  - multiply       : prod(layer_i^w_i)  (darkening; emphasises overlap)\n"
+        "  - overlay        : combined multiply/screen S-curve on weighted_avg base\n"
+        "  - channel_split  : R=depth, G=canny, B=pose (Fun-Control / IP-Adapter style multi-condition packing)\n\n"
+        "OUTPUTS: depth_map, pose_map, canny_map, normal_map, combined_map (layout), blended_map (per blend_mode)."
+    )
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "images":             ("IMAGE", {"tooltip": "Input video frames (B,H,W,3) float32 [0,1]."}),
+                "width":              ("INT", {"default": 832, "min": 64, "max": 4096, "tooltip": "Output canvas width."}),
+                "height":             ("INT", {"default": 480, "min": 64, "max": 4096, "tooltip": "Output canvas height."}),
+                "enable_depth":       ("BOOLEAN", {"default": True, "tooltip": "Run the depth pass. Requires at least ONE depth source wired."}),
+                "enable_pose":        ("BOOLEAN", {"default": True, "tooltip": "Run the pose pass."}),
+                "enable_canny":       ("BOOLEAN", {"default": True, "tooltip": "Run the canny pass."}),
+                "canny_threshold1":   ("INT", {"default": 100, "min": 0, "max": 500, "tooltip": "Canny lower hysteresis threshold."}),
+                "canny_threshold2":   ("INT", {"default": 200, "min": 0, "max": 500, "tooltip": "Canny upper hysteresis threshold."}),
+                "canny_aperture":     ([3, 5, 7], {"default": 3, "tooltip": "Sobel aperture for Canny (odd: 3/5/7)."}),
+                "depth_colorize":     ("BOOLEAN", {"default": False, "tooltip": "If true, colorize grayscale depth with INFERNO colormap. Skipped when external_depth_map is already RGB."}),
+                "depth_invert":       ("BOOLEAN", {"default": False, "tooltip": "Invert depth (1 - depth). Use when source produces 'far = bright' but you want 'near = bright' (typical ControlNet expectation)."}),
+                "pose_detection_threshold": ("FLOAT", {"default": 0.05, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "YOLO confidence threshold (only used when posemodel is wired)."}),
+                "pose_draw_threshold":      ("FLOAT", {"default": 0.30, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "Per-keypoint score threshold for drawing the skeleton."}),
+                "combined_layout":    (["horizontal_3", "vertical_3", "grid_2x2", "depth_only", "pose_only", "canny_only"], {"default": "horizontal_3", "tooltip": "Layout for the combined output. grid_2x2 = depth | pose // canny | original."}),
+                # ---- Task 2: self-contained additions (appended at end so saved workflows keep their positional values) ----
+                "depth_backend":      (["auto", "external", "built_in_midas", "damodel_v2", "da3", "depthcrafter", "depth_pro"], {"default": "auto", "tooltip": "Which depth backend to use. 'auto' tries: external_depth_map -> any wired loader -> built_in_midas. 'built_in_midas' makes the node fully self-contained (downloads MiDaS small via torch.hub on first use, ~80MB)."}),
+                "enable_normal":      ("BOOLEAN", {"default": True, "tooltip": "Compute Sobel-from-depth NORMAL map. No model required (uses depth pass output)."}),
+                "normal_strength":    ("FLOAT", {"default": 1.0, "min": 0.1, "max": 10.0, "step": 0.1, "tooltip": "Scales the Sobel gradients before normalisation. Higher = stronger normal contrast."}),
+                "blend_mode":         (["none", "weighted_avg", "screen", "linear_dodge", "max", "multiply", "overlay", "channel_split"], {"default": "weighted_avg", "tooltip": "How to combine depth+pose+canny+normal into blended_map. linear_dodge=additive (sharp), screen=highlight-safe, channel_split=Fun-Control (R=depth/G=canny/B=pose)."}),
+                "depth_weight":       ("FLOAT", {"default": 1.0, "min": 0.0, "max": 4.0, "step": 0.05, "tooltip": "Weight of depth in blended_map."}),
+                "pose_weight":        ("FLOAT", {"default": 1.0, "min": 0.0, "max": 4.0, "step": 0.05, "tooltip": "Weight of pose in blended_map."}),
+                "canny_weight":       ("FLOAT", {"default": 1.0, "min": 0.0, "max": 4.0, "step": 0.05, "tooltip": "Weight of canny in blended_map."}),
+                "normal_weight":      ("FLOAT", {"default": 0.5, "min": 0.0, "max": 4.0, "step": 0.05, "tooltip": "Weight of normal map in blended_map."}),
+            },
+            "optional": {
+                "external_depth_map":  ("IMAGE", {"tooltip": "Pre-computed depth IMAGE batch from ANY upstream node. Highest priority."}),
+                "damodel_v2":          ("DAMODEL", {"tooltip": "DepthAnything V2 model bundle from kijai/ComfyUI-DepthAnythingV2 (DownloadAndLoadDepthAnythingV2Model). Models: ComfyUI/models/depthanything/."}),
+                "da3_model":           ("DA3MODEL", {"tooltip": "DepthAnything V3 config bundle from PozzettiAndrea/ComfyUI-DepthAnythingV3. Use the V3 pack's Inference node and feed its IMAGE output into external_depth_map. Models: ComfyUI/models/depthanything3/."}),
+                "depthcrafter_model":  ("DEPTHCRAFTER_MODEL", {"tooltip": "DepthCrafter bundle from akatz-ai/ComfyUI-DepthCrafter-Nodes. Temporally consistent video depth. Models: ComfyUI/models/depthcrafter/."}),
+                "depth_pro_model":     ("DEPTH_PRO_MODEL", {"tooltip": "Depth-Pro bundle from spacepxl/ComfyUI-Depth-Pro. Metric depth. Models: ComfyUI/models/depth/ml-depth-pro/."}),
+                "posemodel":           ("POSEMODEL", {"tooltip": "From ONNX Detection Model Loader (V2) or animal-pose loader. Used if enable_pose=True AND no external_pose_map wired."}),
+                "external_pose_map":   ("IMAGE", {"tooltip": "Pre-rendered pose map from any upstream node (e.g. Fannovel16/comfyui_controlnet_aux DWPose / OpenPose / AnimalPose). Highest priority for pose."}),
+                "depthcrafter_steps":      ("INT", {"default": 5, "min": 1, "max": 100, "tooltip": "DepthCrafter only: diffusion inference steps."}),
+                "depthcrafter_guidance":   ("FLOAT", {"default": 1.0, "min": 0.1, "max": 10.0, "step": 0.1, "tooltip": "DepthCrafter only: classifier-free guidance."}),
+                "depthcrafter_window":     ("INT", {"default": 110, "min": 1, "max": 200, "tooltip": "DepthCrafter only: temporal window size."}),
+                "depthcrafter_overlap":    ("INT", {"default": 25, "min": 0, "max": 100, "tooltip": "DepthCrafter only: window overlap."}),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", "IMAGE", "IMAGE", "IMAGE", "IMAGE", "IMAGE")
+    RETURN_NAMES = ("depth_map", "pose_map", "canny_map", "normal_map", "combined_map", "blended_map")
+    OUTPUT_TOOLTIPS = (
+        "Per-frame depth IMAGE batch (3-channel, height x width).",
+        "Per-frame pose IMAGE batch (3-channel, on black canvas).",
+        "Per-frame canny edge IMAGE batch (3-channel grayscale).",
+        "Per-frame normal map (RGB-encoded surface normals from Sobel-of-depth).",
+        "Side-by-side combined preview per `combined_layout`.",
+        "Weighted blend of {depth, pose, canny, normal} per `blend_mode` and per-channel weights.",
+    )
+    FUNCTION = "process"
+    CATEGORY = "WanAnimatePreprocess_V2"
+
+    # ---------- helpers ----------
+    @staticmethod
+    def _to_np(images):
+        if hasattr(images, "detach"):
+            return images.detach().cpu().numpy().astype(np.float32)
+        return np.asarray(images, dtype=np.float32)
+
+    @staticmethod
+    def _resize_batch(arr, target_w, target_h):
+        # arr: (B,H,W,3) float32 [0,1]
+        if arr.shape[1] == target_h and arr.shape[2] == target_w:
+            return arr
+        out = np.zeros((arr.shape[0], target_h, target_w, arr.shape[3]), dtype=np.float32)
+        for i in range(arr.shape[0]):
+            out[i] = cv2.resize(arr[i], (target_w, target_h), interpolation=cv2.INTER_LINEAR)
+        return out
+
+    def _depth_pass(self, images_np, target_w, target_h, colorize, invert,
+                    external_depth_map, damodel_v2, da3_model,
+                    depthcrafter_model, depth_pro_model,
+                    dc_steps, dc_guidance, dc_window, dc_overlap,
+                    depth_backend="auto"):
+        """Run depth using the selected backend.
+
+        depth_backend:
+          - auto       : external_depth_map -> any wired loader -> built_in_midas (fully self-contained fallback)
+          - external   : requires external_depth_map
+          - built_in_midas : torch.hub MiDaS small (downloads on first use)
+          - damodel_v2 / da3 / depthcrafter / depth_pro : require the matching loader wired
+        Always returns (B, target_h, target_w, 3) float32 in [0, 1].
+        """
+        depth_2d = None
+        depth_rgb = None
+
+        backend = (depth_backend or "auto").lower()
+
+        def _from_external():
+            ext = self._to_np(external_depth_map)
+            if ext.ndim != 4 or ext.shape[-1] != 3:
+                raise ValueError(
+                    f"external_depth_map must be IMAGE (B,H,W,3); got {ext.shape}"
+                )
+            return self._resize_batch(ext, target_w, target_h)
+
+        if backend == "external":
+            if external_depth_map is None:
+                raise RuntimeError("depth_backend='external' but external_depth_map is not wired.")
+            depth_rgb = _from_external()
+        elif backend == "built_in_midas":
+            depth_2d = self._infer_midas_small(images_np)
+        elif backend == "damodel_v2":
+            if damodel_v2 is None:
+                raise RuntimeError("depth_backend='damodel_v2' but damodel_v2 is not wired.")
+            depth_2d = self._infer_damodel_v2(damodel_v2, images_np)
+        elif backend == "da3":
+            if da3_model is None:
+                raise RuntimeError("depth_backend='da3' but da3_model is not wired.")
+            depth_2d = self._infer_da3model(da3_model, images_np)
+        elif backend == "depthcrafter":
+            if depthcrafter_model is None:
+                raise RuntimeError("depth_backend='depthcrafter' but depthcrafter_model is not wired.")
+            depth_2d = self._infer_depthcrafter(
+                depthcrafter_model, images_np,
+                int(dc_steps), float(dc_guidance), int(dc_window), int(dc_overlap),
+            )
+        elif backend == "depth_pro":
+            if depth_pro_model is None:
+                raise RuntimeError("depth_backend='depth_pro' but depth_pro_model is not wired.")
+            depth_2d = self._infer_depth_pro(depth_pro_model, images_np)
+        else:
+            # auto: external -> any loader -> built_in_midas
+            if external_depth_map is not None:
+                depth_rgb = _from_external()
+            elif damodel_v2 is not None:
+                depth_2d = self._infer_damodel_v2(damodel_v2, images_np)
+            elif da3_model is not None:
+                depth_2d = self._infer_da3model(da3_model, images_np)
+            elif depthcrafter_model is not None:
+                depth_2d = self._infer_depthcrafter(
+                    depthcrafter_model, images_np,
+                    int(dc_steps), float(dc_guidance), int(dc_window), int(dc_overlap),
+                )
+            elif depth_pro_model is not None:
+                depth_2d = self._infer_depth_pro(depth_pro_model, images_np)
+            else:
+                # Self-contained fallback
+                depth_2d = self._infer_midas_small(images_np)
+
+        if depth_2d is not None:
+            if depth_2d.shape[1:] != (target_h, target_w):
+                resized = np.zeros((depth_2d.shape[0], target_h, target_w), dtype=np.float32)
+                for i in range(depth_2d.shape[0]):
+                    resized[i] = cv2.resize(
+                        depth_2d[i], (target_w, target_h), interpolation=cv2.INTER_LINEAR
+                    )
+                depth_2d = resized
+            if invert:
+                depth_2d = 1.0 - depth_2d
+            if colorize:
+                out = np.zeros((depth_2d.shape[0], target_h, target_w, 3), dtype=np.float32)
+                for i in range(depth_2d.shape[0]):
+                    u8 = (np.clip(depth_2d[i], 0.0, 1.0) * 255.0).astype(np.uint8)
+                    col = cv2.applyColorMap(u8, cv2.COLORMAP_INFERNO)
+                    col_rgb = cv2.cvtColor(col, cv2.COLOR_BGR2RGB)
+                    out[i] = col_rgb.astype(np.float32) / 255.0
+                return out
+            return np.repeat(depth_2d[..., None], 3, axis=-1).astype(np.float32)
+
+        if invert:
+            depth_rgb = 1.0 - depth_rgb
+        return depth_rgb.astype(np.float32)
+
+    # ---------- per-backend inference adapters ----------
+    @staticmethod
+    def _normalize_per_frame(depth_np):
+        """Per-frame min-max normalize (B,H,W) -> [0,1]."""
+        out = np.zeros_like(depth_np, dtype=np.float32)
+        for i in range(depth_np.shape[0]):
+            f = depth_np[i].astype(np.float32)
+            fmin, fmax = float(f.min()), float(f.max())
+            if fmax - fmin > 1e-6:
+                out[i] = (f - fmin) / (fmax - fmin)
+        return out
+
+    def _infer_damodel_v2(self, damodel, images_np):
+        """Mirror kijai/ComfyUI-DepthAnythingV2 inference loop."""
+        import torch.nn.functional as F
+        from torchvision.transforms import Normalize
+        try:
+            import comfy.model_management as mm
+        except ImportError:
+            mm = None
+
+        device = mm.get_torch_device() if mm else (
+            torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        )
+        offload_device = mm.unet_offload_device() if mm else torch.device("cpu")
+        model = damodel["model"]
+        dtype = damodel.get("dtype", torch.float32)
+        is_metric = damodel.get("is_metric", False)
+
+        images_t = torch.from_numpy(images_np).float()
+        B, H, W, _ = images_t.shape
+        images_t = images_t.permute(0, 3, 1, 2)
+        new_W = W - (W % 14)
+        new_H = H - (H % 14)
+        if new_W != W or new_H != H:
+            images_t = F.interpolate(images_t, size=(new_H, new_W), mode="bilinear")
+        normalize = Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        images_t = normalize(images_t)
+
+        model.to(device)
+        autocast_ok = (dtype != torch.float32) and (device.type == "cuda")
+        out = []
+        with torch.inference_mode():
+            if autocast_ok:
+                with torch.autocast("cuda", dtype=dtype):
+                    for img in images_t:
+                        d = model(img.unsqueeze(0).to(device))
+                        d = (d - d.min()) / (d.max() - d.min() + 1e-8)
+                        out.append(d.detach().float().cpu())
+            else:
+                for img in images_t:
+                    d = model(img.unsqueeze(0).to(device))
+                    d = (d - d.min()) / (d.max() - d.min() + 1e-8)
+                    out.append(d.detach().float().cpu())
+        try:
+            model.to(offload_device)
+            if mm:
+                mm.soft_empty_cache()
+        except Exception:
+            pass
+        depth = torch.cat(out, dim=0).numpy()
+        if depth.ndim == 4:
+            depth = depth.squeeze(1)
+        if is_metric:
+            depth = 1.0 - depth
+        if depth.shape[1:] != (H, W):
+            resized = np.zeros((B, H, W), dtype=np.float32)
+            for i in range(B):
+                resized[i] = cv2.resize(depth[i], (W, H), interpolation=cv2.INTER_LINEAR)
+            depth = resized
+        return depth.astype(np.float32)
+
+    def _infer_da3model(self, da3_config, images_np):
+        """DA3 inference is tightly coupled to V3 internals; route via V3 pack."""
+        raise RuntimeError(
+            "DA3MODEL is a JSON config bundle. Please run the V3 pack's own "
+            "inference node (DepthAnythingV3 Inference) on the V3 pack, then "
+            "feed its IMAGE output into `external_depth_map` here. We do not "
+            "duplicate V3 inference internals (they are version-dependent)."
+        )
+
+    def _infer_depthcrafter(self, dc_model, images_np, steps, guidance, window, overlap):
+        """Mirror akatz-ai/ComfyUI-DepthCrafter-Nodes inference logic."""
+        device = dc_model.get("device") if isinstance(dc_model, dict) else None
+        pipe = dc_model["pipe"] if isinstance(dc_model, dict) else dc_model
+        if device is None:
+            try:
+                import comfy.model_management as mm
+                device = mm.get_torch_device()
+            except Exception:
+                device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        images_t = torch.from_numpy(images_np).float()
+        B, H, W, _ = images_t.shape
+        new_W = max(64, (round(W / 64) * 64) or 64)
+        new_H = max(64, (round(H / 64) * 64) or 64)
+        if new_W != W or new_H != H:
+            x = images_t.permute(0, 3, 1, 2)
+            x = torch.nn.functional.interpolate(
+                x, size=(new_H, new_W), mode="bilinear", align_corners=False
+            )
+            images_t = x.permute(0, 2, 3, 1)
+        x = images_t.permute(0, 3, 1, 2).to(device=device, dtype=torch.float16)
+        x = torch.clamp(x, 0.0, 1.0)
+        with torch.inference_mode():
+            result = pipe(
+                x,
+                height=new_H,
+                width=new_W,
+                output_type="pt",
+                guidance_scale=float(guidance),
+                num_inference_steps=int(steps),
+                window_size=int(window),
+                overlap=int(overlap),
+                track_time=False,
+            )
+        res = result.frames[0]
+        depth = res.detach().float().cpu().numpy()
+        if depth.ndim == 4:
+            depth = depth.squeeze(-1) if depth.shape[-1] == 1 else depth.mean(axis=-1)
+        depth = self._normalize_per_frame(depth)
+        if depth.shape[1:] != (H, W):
+            resized = np.zeros((depth.shape[0], H, W), dtype=np.float32)
+            for i in range(depth.shape[0]):
+                resized[i] = cv2.resize(depth[i], (W, H), interpolation=cv2.INTER_LINEAR)
+            depth = resized
+        return depth.astype(np.float32)
+
+    def _infer_depth_pro(self, dp_model, images_np):
+        """Mirror spacepxl/ComfyUI-Depth-Pro inference (relative depth)."""
+        from torchvision.transforms import Normalize
+        model = dp_model["model"]
+        device = dp_model.get("device")
+        dtype = dp_model.get("dtype", torch.float32)
+        if device is None:
+            try:
+                import comfy.model_management as mm
+                device = mm.get_torch_device()
+            except Exception:
+                device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        rgb = torch.from_numpy(images_np).float().movedim(-1, 1)
+        transform = Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5])
+        depth_list = []
+        with torch.inference_mode():
+            for i in range(rgb.size(0)):
+                rgb_i = rgb[i].unsqueeze(0).to(device, dtype=dtype)
+                rgb_i = transform(rgb_i)
+                pred = model.infer(rgb_i, f_px=None)
+                d = pred["depth"].detach().float().cpu().numpy()
+                depth_list.append(d)
+        depth = np.stack(depth_list, axis=0)
+        while depth.ndim > 3:
+            depth = depth.squeeze(1) if depth.shape[1] == 1 else depth.mean(axis=1)
+        # Depth-Pro returns metric depth (meters). Convert to relative [0,1].
+        depth = 1.0 / (1.0 + depth)
+        depth = self._normalize_per_frame(depth)
+        return depth.astype(np.float32)
+
+    # ---------- built-in MiDaS (self-contained depth) ----------
+    _midas_cache = {"model": None, "transform": None, "device": None}
+
+    @classmethod
+    def _infer_midas_small(cls, images_np):
+        """MiDaS small via torch.hub. Self-contained depth fallback.
+
+        First call downloads ~80MB to torch hub cache (HOME/.cache/torch/hub/).
+        Subsequent calls reuse the cached model. Returns (B,H,W) float32 [0,1].
+        """
+        try:
+            try:
+                import comfy.model_management as mm
+                device = mm.get_torch_device()
+            except Exception:
+                device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+            if cls._midas_cache["model"] is None or cls._midas_cache["device"] != device:
+                midas = torch.hub.load("intel-isl/MiDaS", "MiDaS_small", trust_repo=True)
+                midas.to(device).eval()
+                transforms = torch.hub.load("intel-isl/MiDaS", "transforms", trust_repo=True)
+                cls._midas_cache["model"] = midas
+                cls._midas_cache["transform"] = transforms.small_transform
+                cls._midas_cache["device"] = device
+
+            midas = cls._midas_cache["model"]
+            transform = cls._midas_cache["transform"]
+
+            B, H, W, _ = images_np.shape
+            out = np.zeros((B, H, W), dtype=np.float32)
+            with torch.inference_mode():
+                for i in range(B):
+                    u8 = (np.clip(images_np[i], 0.0, 1.0) * 255.0).astype(np.uint8)
+                    inp = transform(u8).to(device)
+                    pred = midas(inp)
+                    pred = torch.nn.functional.interpolate(
+                        pred.unsqueeze(1), size=(H, W), mode="bicubic", align_corners=False
+                    ).squeeze(1)
+                    d = pred[0].detach().float().cpu().numpy()
+                    dmin, dmax = float(d.min()), float(d.max())
+                    if dmax - dmin > 1e-6:
+                        d = (d - dmin) / (dmax - dmin)
+                    else:
+                        d = np.zeros_like(d)
+                    out[i] = d.astype(np.float32)
+            return out
+        except Exception as e:
+            raise RuntimeError(
+                "DepthPoseCannyCombinedV2 built_in_midas backend failed. "
+                "Cause: " + str(e) + "\n"
+                "Possible fixes: (a) ensure internet is reachable for first-time torch.hub download, "
+                "(b) install timm via pip (MiDaS small needs it), "
+                "(c) wire an external_depth_map instead and set depth_backend='external'."
+            )
+
+    # ---------- normal map (Sobel-from-depth, no extra model) ----------
+    @staticmethod
+    def _normal_from_depth(depth_2d, strength=1.0):
+        """Compute per-frame RGB normal map from grayscale depth.
+
+        depth_2d: (B,H,W) float32 [0,1]. Returns (B,H,W,3) float32 [0,1].
+        Encoding: R = (nx+1)/2, G = (ny+1)/2, B = (nz+1)/2 (standard tangent-space).
+        """
+        B, H, W = depth_2d.shape
+        out = np.zeros((B, H, W, 3), dtype=np.float32)
+        for i in range(B):
+            d = depth_2d[i].astype(np.float32)
+            # Scharr is more accurate than Sobel for small kernels
+            gx = cv2.Scharr(d, cv2.CV_32F, 1, 0) * float(strength)
+            gy = cv2.Scharr(d, cv2.CV_32F, 0, 1) * float(strength)
+            # Normal vector: (-dz/dx, -dz/dy, 1) then normalise
+            nx = -gx
+            ny = -gy
+            nz = np.ones_like(nx)
+            norm = np.sqrt(nx * nx + ny * ny + nz * nz) + 1e-8
+            nx /= norm
+            ny /= norm
+            nz /= norm
+            # Encode to [0,1]
+            out[i, ..., 0] = np.clip((nx + 1.0) * 0.5, 0.0, 1.0)
+            out[i, ..., 1] = np.clip((ny + 1.0) * 0.5, 0.0, 1.0)
+            out[i, ..., 2] = np.clip((nz + 1.0) * 0.5, 0.0, 1.0)
+        return out
+
+    def _normal_pass(self, depth_out, target_w, target_h, strength):
+        """Convert depth_out (B,H,W,3) RGB depth -> (B,H,W,3) normal map."""
+        # depth_out is RGB but for normals we need a scalar field — use channel mean.
+        depth_2d = depth_out.mean(axis=-1).astype(np.float32)
+        # Light blur to smooth normals (depth is noisy at edges)
+        for i in range(depth_2d.shape[0]):
+            depth_2d[i] = cv2.GaussianBlur(depth_2d[i], (0, 0), sigmaX=1.2)
+        n = self._normal_from_depth(depth_2d, strength=float(strength))
+        if n.shape[1] != target_h or n.shape[2] != target_w:
+            out = np.zeros((n.shape[0], target_h, target_w, 3), dtype=np.float32)
+            for i in range(n.shape[0]):
+                out[i] = cv2.resize(n[i], (target_w, target_h), interpolation=cv2.INTER_LINEAR)
+            return out
+        return n
+
+    # ---------- blend (research-backed, Wikipedia/W3C Compositing 1.0) ----------
+    @staticmethod
+    def _blend_pass(depth, pose, canny, normal, mode, w_depth, w_pose, w_canny, w_normal):
+        """Combine per-channel maps. All inputs (B,H,W,3) float32 [0,1]."""
+        d = (depth * float(w_depth))
+        p = (pose * float(w_pose))
+        c = (canny * float(w_canny))
+        n = (normal * float(w_normal))
+        eps = 1e-6
+        m = (mode or "weighted_avg").lower()
+
+        if m == "none":
+            return depth.astype(np.float32)
+        if m == "channel_split":
+            # Fun-Control style: R=depth(gray), G=canny(gray), B=pose(gray)
+            out = np.zeros_like(depth, dtype=np.float32)
+            out[..., 0] = np.clip(depth.mean(axis=-1) * float(w_depth), 0.0, 1.0)
+            out[..., 1] = np.clip(canny.mean(axis=-1) * float(w_canny), 0.0, 1.0)
+            out[..., 2] = np.clip(pose.mean(axis=-1) * float(w_pose), 0.0, 1.0)
+            return out
+        if m == "linear_dodge":
+            return np.clip(d + p + c + n, 0.0, 1.0).astype(np.float32)
+        if m == "max":
+            return np.maximum.reduce([
+                np.clip(d, 0.0, 1.0),
+                np.clip(p, 0.0, 1.0),
+                np.clip(c, 0.0, 1.0),
+                np.clip(n, 0.0, 1.0),
+            ]).astype(np.float32)
+        if m == "screen":
+            # 1 - prod(1 - x_i)
+            inv = (1.0 - np.clip(d, 0.0, 1.0)) \
+                * (1.0 - np.clip(p, 0.0, 1.0)) \
+                * (1.0 - np.clip(c, 0.0, 1.0)) \
+                * (1.0 - np.clip(n, 0.0, 1.0))
+            return np.clip(1.0 - inv, 0.0, 1.0).astype(np.float32)
+        if m == "multiply":
+            # Use weights as exponents: x^w
+            r = (np.clip(depth, eps, 1.0) ** float(w_depth)) \
+              * (np.clip(pose,  eps, 1.0) ** float(w_pose)) \
+              * (np.clip(canny, eps, 1.0) ** float(w_canny)) \
+              * (np.clip(normal,eps, 1.0) ** float(w_normal))
+            return np.clip(r, 0.0, 1.0).astype(np.float32)
+        if m == "overlay":
+            # Base = weighted_avg of (depth, pose, canny); top = normal
+            base_w = max(eps, float(w_depth) + float(w_pose) + float(w_canny))
+            base = np.clip((d + p + c) / base_w, 0.0, 1.0)
+            top = np.clip(normal, 0.0, 1.0)
+            lo = 2.0 * base * top
+            hi = 1.0 - 2.0 * (1.0 - base) * (1.0 - top)
+            r = np.where(base < 0.5, lo, hi)
+            # Mix in normal weight as opacity
+            alpha = float(np.clip(w_normal, 0.0, 1.0))
+            r = (1.0 - alpha) * base + alpha * r
+            return np.clip(r, 0.0, 1.0).astype(np.float32)
+        # default: weighted_avg
+        total = max(eps, float(w_depth) + float(w_pose) + float(w_canny) + float(w_normal))
+        return np.clip((d + p + c + n) / total, 0.0, 1.0).astype(np.float32)
+
+    def _canny_pass(self, images_np, target_w, target_h, t1, t2, aperture):
+        B = images_np.shape[0]
+        out = np.zeros((B, target_h, target_w, 3), dtype=np.float32)
+        for i in range(B):
+            u8 = (np.clip(images_np[i], 0.0, 1.0) * 255.0).astype(np.uint8)
+            gray = cv2.cvtColor(u8, cv2.COLOR_RGB2GRAY)
+            edges = cv2.Canny(gray, int(t1), int(t2), apertureSize=int(aperture))
+            edges_rgb = np.repeat(edges[..., None], 3, axis=-1)
+            if edges_rgb.shape[:2] != (target_h, target_w):
+                edges_rgb = cv2.resize(
+                    edges_rgb, (target_w, target_h), interpolation=cv2.INTER_NEAREST
+                )
+            out[i] = edges_rgb.astype(np.float32) / 255.0
+        return out
+
+    def _pose_pass(self, images_np, posemodel, target_w, target_h,
+                   detection_threshold, draw_threshold, external_pose_map):
+        B, H, W, _ = images_np.shape
+        # External pose map takes priority.
+        if external_pose_map is not None:
+            ext_np = self._to_np(external_pose_map)
+            return self._resize_batch(ext_np, target_w, target_h)
+
+        if posemodel is None:
+            # Return a black canvas — caller already validated enable_pose.
+            return np.zeros((B, target_h, target_w, 3), dtype=np.float32)
+
+        # Render pose using YOLO + ViTPose, then draw onto target canvas.
+        detector = posemodel["yolo"]
+        pose_model = posemodel["vitpose"]
+        if hasattr(detector, "threshold_conf"):
+            detector.threshold_conf = float(detection_threshold)
+
+        IMG_NORM_MEAN = np.array([0.485, 0.456, 0.406])
+        IMG_NORM_STD = np.array([0.229, 0.224, 0.225])
+        input_resolution = (256, 192)
+        rescale = 1.25
+        shape = np.array([H, W])[None]
+
+        pose_canvases = []
+        for img in _IC.track(
+            images_np, B, "DepthPoseCannyCombined: pose render"
+        ):
+            detections = detector(
+                cv2.resize(img, (640, 640)).transpose(2, 0, 1)[None], shape
+            )[0]
+            if isinstance(detections, list) and len(detections) > 0 and isinstance(detections[0], dict):
+                bbox = detections[0]["bbox"]
+            else:
+                bbox = None
+            if bbox is None or len(bbox) < 5 or bbox[4] <= 0:
+                bbox_use = np.array([0, 0, W, H, 1.0], dtype=np.float32)
+            else:
+                bbox_use = bbox
+
+            center, scale = bbox_from_detector(bbox_use, input_resolution, rescale=rescale)
+            img_crop = crop(img, center, scale, (input_resolution[0], input_resolution[1]))[0]
+            img_norm = (img_crop - IMG_NORM_MEAN) / IMG_NORM_STD
+            img_norm = img_norm.transpose(2, 0, 1).astype(np.float32)
+            kp2ds = pose_model(
+                img_norm[None], np.array(center)[None], np.array(scale)[None]
+            )
+
+            metas = load_pose_metas_from_kp2ds_seq(kp2ds, width=W, height=H)
+            meta = metas[0]
+            aa = AAPoseMeta.from_humanapi_meta(meta)
+            canvas = np.zeros((target_h, target_w, 3), dtype=np.uint8)
+            try:
+                draw_aapose_by_meta_new(
+                    canvas, aa,
+                    body_stick_width=-1, hand_stick_width=-1,
+                    draw_head=True,
+                    pose_draw_threshold=float(draw_threshold),
+                )
+            except TypeError:
+                # Older signature without pose_draw_threshold
+                draw_aapose_by_meta_new(
+                    canvas, aa,
+                    body_stick_width=-1, hand_stick_width=-1,
+                    draw_head=True,
+                )
+            pose_canvases.append(canvas.astype(np.float32) / 255.0)
+
+        try:
+            detector.cleanup()
+        except Exception:
+            pass
+        try:
+            pose_model.cleanup()
+        except Exception:
+            pass
+
+        return np.stack(pose_canvases, 0)
+
+    def _compose(self, depth, pose, canny, original, layout, target_w, target_h):
+        B = original.shape[0]
+        zeros = np.zeros((B, target_h, target_w, 3), dtype=np.float32)
+        d = depth if depth is not None else zeros
+        p = pose if pose is not None else zeros
+        c = canny if canny is not None else zeros
+
+        if layout == "depth_only":
+            return d
+        if layout == "pose_only":
+            return p
+        if layout == "canny_only":
+            return c
+        if layout == "horizontal_3":
+            return np.concatenate([d, p, c], axis=2)
+        if layout == "vertical_3":
+            return np.concatenate([d, p, c], axis=1)
+        if layout == "grid_2x2":
+            top = np.concatenate([d, p], axis=2)
+            bot = np.concatenate([c, original], axis=2)
+            return np.concatenate([top, bot], axis=1)
+        return d
+
+    def process(
+        self, images, width, height,
+        enable_depth, enable_pose, enable_canny,
+        canny_threshold1, canny_threshold2, canny_aperture,
+        depth_colorize, depth_invert,
+        pose_detection_threshold, pose_draw_threshold,
+        combined_layout,
+        depth_backend="auto", enable_normal=True, normal_strength=1.0,
+        blend_mode="weighted_avg",
+        depth_weight=1.0, pose_weight=1.0, canny_weight=1.0, normal_weight=0.5,
+        external_depth_map=None,
+        damodel_v2=None, da3_model=None,
+        depthcrafter_model=None, depth_pro_model=None,
+        posemodel=None, external_pose_map=None,
+        depthcrafter_steps=5, depthcrafter_guidance=1.0,
+        depthcrafter_window=110, depthcrafter_overlap=25,
+    ):
+        images_np = self._to_np(images)
+        if images_np.ndim != 4 or images_np.shape[-1] != 3:
+            raise ValueError(
+                f"DepthPoseCannyCombinedV2: expected (B,H,W,3); got {images_np.shape}"
+            )
+        B = images_np.shape[0]
+        target_w, target_h = int(width), int(height)
+        original_resized = self._resize_batch(images_np, target_w, target_h)
+
+        depth_out = (
+            self._depth_pass(
+                images_np, target_w, target_h,
+                bool(depth_colorize), bool(depth_invert),
+                external_depth_map, damodel_v2, da3_model,
+                depthcrafter_model, depth_pro_model,
+                depthcrafter_steps, depthcrafter_guidance,
+                depthcrafter_window, depthcrafter_overlap,
+                depth_backend=str(depth_backend),
+            ) if enable_depth else
+            np.zeros((B, target_h, target_w, 3), dtype=np.float32)
+        )
+        pose_out = (
+            self._pose_pass(
+                images_np, posemodel, target_w, target_h,
+                pose_detection_threshold, pose_draw_threshold, external_pose_map,
+            ) if enable_pose else
+            np.zeros((B, target_h, target_w, 3), dtype=np.float32)
+        )
+        canny_out = (
+            self._canny_pass(
+                images_np, target_w, target_h,
+                canny_threshold1, canny_threshold2, canny_aperture,
+            ) if enable_canny else
+            np.zeros((B, target_h, target_w, 3), dtype=np.float32)
+        )
+        normal_out = (
+            self._normal_pass(depth_out, target_w, target_h, float(normal_strength))
+            if (enable_normal and enable_depth) else
+            np.zeros((B, target_h, target_w, 3), dtype=np.float32)
+        )
+
+        combined = self._compose(
+            depth_out, pose_out, canny_out, original_resized,
+            combined_layout, target_w, target_h,
+        )
+
+        blended = self._blend_pass(
+            depth_out, pose_out, canny_out, normal_out,
+            str(blend_mode),
+            float(depth_weight), float(pose_weight),
+            float(canny_weight), float(normal_weight),
+        )
+
+        return (
+            torch.from_numpy(depth_out.astype(np.float32)),
+            torch.from_numpy(pose_out.astype(np.float32)),
+            torch.from_numpy(canny_out.astype(np.float32)),
+            torch.from_numpy(normal_out.astype(np.float32)),
+            torch.from_numpy(combined.astype(np.float32)),
+            torch.from_numpy(blended.astype(np.float32)),
+        )
+
+
+try:
+    from .nodes_extras import (
+        EXTRA_NODE_CLASS_MAPPINGS as _EXTRA_NODE_CLASS_MAPPINGS,
+        EXTRA_NODE_DISPLAY_NAME_MAPPINGS as _EXTRA_NODE_DISPLAY_NAME_MAPPINGS,
+    )
+except Exception as _e:  # pragma: no cover
+    import logging as _logging
+    _logging.getLogger(__name__).warning(
+        "WanAnimatePreprocessV2: failed to import nodes_extras: %s", _e
+    )
+    _EXTRA_NODE_CLASS_MAPPINGS = {}
+    _EXTRA_NODE_DISPLAY_NAME_MAPPINGS = {}
+
+
 NODE_CLASS_MAPPINGS = {
     "OnnxDetectionModelLoaderV2": OnnxDetectionModelLoaderV2,
     "PoseAndFaceDetectionV2": PoseAndFaceDetectionV2,
     "DrawViTPoseV2": DrawViTPoseV2,
+    "WanAnimateFaceQualityCheckV2": WanAnimateFaceQualityCheckV2,
+    "DepthPoseCannyCombinedV2": DepthPoseCannyCombinedV2,
+    # Self-contained alias (Task 2): same class, friendlier name highlighting bundled MiDaS + Normal + Blend modes
+    "SelfContainedControlNetPreprocessorV2": DepthPoseCannyCombinedV2,
+    **_EXTRA_NODE_CLASS_MAPPINGS,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "OnnxDetectionModelLoaderV2": "ONNX Detection Model Loader (V2)",
     "PoseAndFaceDetectionV2": "Pose and Face Detection (V2)",
     "DrawViTPoseV2": "Draw ViT Pose (V2)",
+    "WanAnimateFaceQualityCheckV2": "Wan-Animate Face Quality Check (V2)",
+    "DepthPoseCannyCombinedV2": "Depth + Pose + Canny Combined (V2)",
+    "SelfContainedControlNetPreprocessorV2": "Self-Contained ControlNet Preprocessor (V2)",
+    **_EXTRA_NODE_DISPLAY_NAME_MAPPINGS,
 }

@@ -315,3 +315,120 @@ def get_face_bboxes(kp2ds, scale, image_shape):
     expanded_max_y = min(max_y + delta_height, h)
 
     return [int(expanded_min_x), int(expanded_max_x), int(expanded_min_y), int(expanded_max_y)]
+
+
+# ============================================================
+# Wan-Animate paper-driven face preprocessing helpers
+# ============================================================
+# These helpers implement the four levers identified in the
+# Wan-Animate paper (arXiv:2509.14055) for improving gaze
+# reenactment fidelity:
+#   1. Eye-centred face crop  (place eyes in upper third)
+#   2. Stabilised crop position across frames
+#   3. CFG on face conditioning (passthrough output, see nodes.py)
+#   4. Quality gating (blur / brightness on the eye region)
+
+
+def adjust_bbox_eye_upper_third(face_bbox, eye_xy_pixel, frame_w, frame_h,
+                                 eye_y_fraction=0.30):
+    """Vertically shift a face bbox so eye landmarks fall at ``eye_y_fraction``
+    of the crop height (measured from the top).
+
+    Args:
+        face_bbox:        (x1, x2, y1, y2) in pixel space.
+        eye_xy_pixel:     (eye_cx, eye_cy) midpoint of both eye centres in
+                          full-frame pixel space.
+        frame_w, frame_h: full frame dimensions.
+        eye_y_fraction:   target normalised eye row inside the crop
+                          (default 0.30 = upper third).
+
+    Returns:
+        New (x1, x2, y1, y2) bbox of identical width/height, vertically
+        shifted (and clamped to image bounds). Width/height never change.
+    """
+    x1, x2, y1, y2 = face_bbox
+    crop_h = int(y2 - y1)
+    if crop_h <= 0 or eye_xy_pixel is None:
+        return (int(x1), int(x2), int(y1), int(y2))
+    _eye_cx, eye_cy = eye_xy_pixel
+    desired_y1 = float(eye_cy) - float(eye_y_fraction) * float(crop_h)
+    new_y1 = int(np.clip(desired_y1, 0, max(0, frame_h - crop_h)))
+    new_y2 = new_y1 + crop_h
+    return (int(x1), int(x2), int(new_y1), int(new_y2))
+
+
+def compute_eye_midpoint_from_face_kps(face_kps_norm, frame_w, frame_h):
+    """Return the pixel-space midpoint of both eyes from a normalised
+    dlib-68 face landmark array (the layout used by
+    ``pose_metas[i]['keypoints_face']``).
+
+    Right-eye contour: dlib 36-41 -> array indices 37-42.
+    Left-eye contour:  dlib 42-47 -> array indices 43-48.
+    Index 0 is the body-anchored face anchor (skipped).
+
+    Returns:
+        (eye_cx, eye_cy) in pixel space, or ``None`` if landmarks
+        are missing/invalid.
+    """
+    if face_kps_norm is None:
+        return None
+    arr = np.asarray(face_kps_norm)
+    if arr.ndim != 2 or arr.shape[0] < 49 or arr.shape[1] < 2:
+        return None
+    eye_idx = list(range(37, 49))
+    eye_pts = arr[eye_idx, :2]
+    if not np.isfinite(eye_pts).all():
+        return None
+    if arr.shape[1] >= 3:
+        conf = arr[eye_idx, 2]
+        if float(np.mean(conf)) < 0.05:
+            return None
+    eye_norm = np.mean(eye_pts, axis=0)
+    return (float(eye_norm[0]) * float(frame_w),
+            float(eye_norm[1]) * float(frame_h))
+
+
+def compute_frame_blur_score(frame_rgb):
+    """Laplacian variance -- higher = sharper.
+
+    Args:
+        frame_rgb: (H, W, 3) array, float32 [0,1] or uint8.
+    Returns:
+        float Laplacian variance.
+    """
+    arr = frame_rgb
+    if arr.dtype != np.uint8:
+        arr = (np.clip(arr, 0.0, 1.0) * 255.0).astype(np.uint8)
+    if arr.ndim == 3:
+        gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
+    else:
+        gray = arr
+    return float(cv2.Laplacian(gray, cv2.CV_64F).var())
+
+
+def compute_eye_region_brightness(frame_rgb, top_frac=0.30, bottom_frac=0.55):
+    """Mean luma of a horizontal strip across the eye region of a face crop.
+
+    With eye-upper-third alignment, eyes fall around 25-35% of the crop
+    height. A strip from ``top_frac`` to ``bottom_frac`` covers the eye
+    sockets safely.
+
+    Returns:
+        Mean luma in [0, 1].
+    """
+    arr = frame_rgb
+    if arr.dtype == np.uint8:
+        arr = arr.astype(np.float32) / 255.0
+    arr = np.clip(arr, 0.0, 1.0)
+    h = arr.shape[0]
+    y0 = int(max(0, top_frac * h))
+    y1 = int(min(h, bottom_frac * h))
+    if y1 <= y0:
+        return 0.0
+    strip = arr[y0:y1]
+    if strip.ndim == 3:
+        luma = 0.2126 * strip[..., 0] + 0.7152 * strip[..., 1] + 0.0722 * strip[..., 2]
+    else:
+        luma = strip
+    return float(np.mean(luma))
+
