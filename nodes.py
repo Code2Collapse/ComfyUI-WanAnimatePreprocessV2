@@ -1599,19 +1599,45 @@ class PoseAndFaceDetectionV2:
                     # so divide by them and remultiply by the new max).
                     base_yaw = _gaze_bs.MAX_GAZE_YAW_RAD if _gaze_bs else 1.0
                     base_pitch = _gaze_bs.MAX_GAZE_PITCH_RAD if _gaze_bs else 1.0
+                    # Gaze-arrow screen-space convention (FIX, May 2026):
+                    # The renderer in draw_debug_overlay() draws the arrow as
+                    #   ex = ix + dx*L;  ey = iy + dy*L
+                    # so dx/dy MUST be in image-pixel direction (right=+x,
+                    # down=+y). The legacy 2D-offset path correctly derives
+                    # dx/dy from the iris pixel offset to the eye centroid;
+                    # we replicate the same screen-space derivation here so
+                    # both gaze paths agree. Synthesising dx from
+                    # ``-sin(yaw_rad)`` (anatomical-camera convention) made
+                    # the arrow point opposite to the iris in the rendered
+                    # debug view — that was the user-reported bug.
+                    kps_px_for_gaze = meta['keypoints_face'][:, :2] * np.array([W, H])
+                    iris_pix = {
+                        'right': (float(rix), float(riy)),
+                        'left':  (float(lix), float(liy)),
+                    }
+                    eye_idx_map = {
+                        'right': _RIGHT_EYE_IDX,
+                        'left':  _LEFT_EYE_IDX,
+                    }
                     for eye_name in ('right', 'left'):
                         e = dict(gaze_bs[eye_name])
                         e['yaw_rad'] = float(e['yaw_rad']) / max(base_yaw, 1e-6) * max_yaw_rad
                         e['pitch_rad'] = float(e['pitch_rad']) / max(base_pitch, 1e-6) * max_pitch_rad
                         e['source'] = 'blendshape'
-                        # Recompute dx/dy from the rescaled angles so the
-                        # debug arrow length scales with actual rotation.
-                        dx = -math.sin(e['yaw_rad'])
-                        dy = -math.sin(e['pitch_rad'])
-                        n = math.hypot(dx, dy)
-                        if n > 1e-6:
-                            e['dx'] = round(dx / n, 4)
-                            e['dy'] = round(dy / n, 4)
+                        # Screen-space dx/dy = unit vector from eye centroid
+                        # to detected iris pixel. Matches path A exactly and
+                        # is automatically correct for both mirrored
+                        # (selfie) and unmirrored camera inputs because the
+                        # iris position is sampled from the same image
+                        # frame as the eye centroid.
+                        ipx, ipy = iris_pix[eye_name]
+                        geo = np.mean(kps_px_for_gaze[eye_idx_map[eye_name]], axis=0)
+                        ddx = ipx - float(geo[0])
+                        ddy = ipy - float(geo[1])
+                        nrm = float(math.hypot(ddx, ddy))
+                        if nrm > 1e-6:
+                            e['dx'] = round(ddx / nrm, 4)
+                            e['dy'] = round(ddy / nrm, 4)
                         else:
                             e['dx'] = 0.0
                             e['dy'] = 0.0
