@@ -43,6 +43,7 @@ import cv2
 import json
 import logging
 import math
+from typing import Any, Dict, List, Optional, Tuple
 
 from . import _interrupt_check as _IC
 script_directory = os.path.dirname(os.path.abspath(__file__))
@@ -2880,6 +2881,517 @@ class DepthPoseCannyCombinedV2:
         )
 
 
+# =====================================================================
+# KANIBUS gap nodes — derived eye-feature series from PoseAndFaceDetectionV2.
+# All three consume the POSEDATA bundle (`pose_metas_original` carries
+# normalized 91-pt face keypoints; `iris_data` carries per-frame iris dicts
+# already in screen-space). Outputs are JSON-encoded so downstream graph
+# nodes can consume them with ordinary STRING ports.
+# =====================================================================
+
+
+def _eye_aspect_ratio(face_kps_norm: np.ndarray, eye_idx: List[int],
+                      W: int, H: int) -> float:
+    """Standard Soukupová & Cech (2016) Eye-Aspect-Ratio over a 6-point eye
+    contour. Returns NaN if any landmark is missing/zero-confidence (the
+    pose_threshold gate in PoseAndFaceDetectionV2 may zero out kps).
+
+    face_kps_norm : (91, 2 or 3) normalized array in [0,1].
+    eye_idx       : 6 indices in the same order used elsewhere
+                    (outer, upper_outer, upper_inner, inner,
+                     lower_inner, lower_outer).
+    """
+    if face_kps_norm is None or face_kps_norm.ndim < 2:
+        return float('nan')
+    pts = face_kps_norm[eye_idx, :2].astype(np.float64)
+    # Convert to pixels so EAR is a unit-less ratio robust to image AR.
+    pts[:, 0] *= float(W)
+    pts[:, 1] *= float(H)
+    if (pts == 0).all(axis=1).any():
+        return float('nan')
+    p1, p2, p3, p4, p5, p6 = pts
+    v1 = float(np.linalg.norm(p2 - p6))
+    v2 = float(np.linalg.norm(p3 - p5))
+    h  = float(np.linalg.norm(p1 - p4))
+    if h < 1e-6:
+        return float('nan')
+    return (v1 + v2) / (2.0 * h)
+
+
+def _one_euro_filter(series: List[float], freq_hz: float,
+                     min_cutoff: float = 1.0, beta: float = 0.05,
+                     d_cutoff: float = 1.0) -> List[float]:
+    """OneEuro filter (Casiez, Roussel & Vogel, 2012). Adaptive low-pass:
+    higher cutoff under fast motion (preserves saccade peaks), lower cutoff
+    when still (kills jitter). Implemented inline so KANIBUS nodes don't
+    drag in an extra dependency.
+
+    NaN inputs are passed through unchanged so that downstream blink/saccade
+    masks reflect the same missing-data periods.
+    """
+    if not series:
+        return []
+    out: List[float] = [float('nan')] * len(series)
+    last_x: Optional[float] = None
+    last_dx: float = 0.0
+    last_t: float = 0.0
+    if freq_hz <= 0:
+        freq_hz = 30.0
+    dt = 1.0 / float(freq_hz)
+    for i, x in enumerate(series):
+        if x is None or (isinstance(x, float) and math.isnan(x)):
+            out[i] = float('nan')
+            continue
+        if last_x is None:
+            out[i] = float(x)
+            last_x = float(x)
+            last_dx = 0.0
+            last_t = i * dt
+            continue
+        t = i * dt
+        d = (float(x) - last_x) / max(dt, 1e-6)
+        # Smooth derivative
+        alpha_d = 1.0 / (1.0 + (1.0 / (2.0 * math.pi * d_cutoff)) / max(dt, 1e-6))
+        last_dx = alpha_d * d + (1.0 - alpha_d) * last_dx
+        cutoff = min_cutoff + beta * abs(last_dx)
+        alpha = 1.0 / (1.0 + (1.0 / (2.0 * math.pi * cutoff)) / max(dt, 1e-6))
+        smoothed = alpha * float(x) + (1.0 - alpha) * last_x
+        out[i] = smoothed
+        last_x = smoothed
+        last_t = t
+    return out
+
+
+def _coerce_pose_data(pose_data: Any) -> Tuple[List[Dict[str, Any]],
+                                                List[Dict[str, Any]],
+                                                Tuple[int, int]]:
+    """Pull the (face_metas, iris_seq, source_size) triple from a POSEDATA
+    bundle as emitted by PoseAndFaceDetectionV2. Accepts the dict form
+    only; raises a clear error otherwise so users see exactly which port
+    they wired wrong instead of an opaque KeyError downstream.
+    """
+    if not isinstance(pose_data, dict):
+        raise ValueError(
+            "KANIBUS nodes expect the POSEDATA dict from "
+            "PoseAndFaceDetectionV2; got %s." % type(pose_data).__name__
+        )
+    metas = pose_data.get('pose_metas_original') or pose_data.get('pose_metas')
+    if not metas:
+        raise ValueError("POSEDATA has no 'pose_metas_original' / 'pose_metas'.")
+    iris_seq = pose_data.get('iris_data', []) or []
+    src = pose_data.get('source_size') or pose_data.get('target_size') or (1, 1)
+    H, W = int(src[0]), int(src[1])
+    return list(metas), list(iris_seq), (H, W)
+
+
+class EARBlinkDetectorC2C:
+    """Detect blinks per frame using the Eye-Aspect-Ratio (EAR) of the
+    6-point eye contour produced by PoseAndFaceDetectionV2.
+
+    A blink is reported when *both* eyes' EAR drops below ``threshold`` for
+    at least ``min_consecutive_frames`` consecutive frames (after a small
+    causal median smoothing pass). Output JSON includes the raw EAR series,
+    a per-frame blink mask, and aggregate stats.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "pose_data": ("POSEDATA",),
+                "threshold": ("FLOAT", {"default": 0.21, "min": 0.05,
+                                         "max": 0.5, "step": 0.005}),
+                "min_consecutive_frames": ("INT", {"default": 2, "min": 1,
+                                                    "max": 30}),
+                "fps": ("FLOAT", {"default": 30.0, "min": 1.0, "max": 240.0,
+                                   "step": 0.5}),
+                "smooth_window": ("INT", {"default": 3, "min": 1, "max": 9}),
+            },
+        }
+
+    RETURN_TYPES = ("STRING", "STRING", "INT", "FLOAT")
+    RETURN_NAMES = ("blink_report_json", "ear_series_json",
+                    "blink_count", "blink_rate_hz")
+    FUNCTION = "detect"
+    CATEGORY = "WanAnimatePreprocess_V2/KANIBUS"
+
+    def detect(self, pose_data, threshold, min_consecutive_frames, fps,
+               smooth_window):
+        metas, _iris, (H, W) = _coerce_pose_data(pose_data)
+        ear_r: List[float] = []
+        ear_l: List[float] = []
+        for m in metas:
+            face_kps = m.get('keypoints_face')
+            ear_r.append(_eye_aspect_ratio(face_kps, _RIGHT_EYE_IDX, W, H))
+            ear_l.append(_eye_aspect_ratio(face_kps, _LEFT_EYE_IDX,  W, H))
+
+        # Mean of both eyes per frame (NaN-aware)
+        ear_mean: List[float] = []
+        for r, l in zip(ear_r, ear_l):
+            vals = [v for v in (r, l) if v == v]  # filter NaN
+            ear_mean.append(float(np.mean(vals)) if vals else float('nan'))
+
+        # Causal median smoothing (odd window only)
+        win = max(1, int(smooth_window) | 1)
+        ear_smooth = list(ear_mean)
+        if win > 1:
+            half = win // 2
+            for i in range(len(ear_smooth)):
+                lo = max(0, i - half)
+                hi = i + 1  # causal
+                chunk = [v for v in ear_mean[lo:hi] if v == v]
+                if chunk:
+                    ear_smooth[i] = float(np.median(chunk))
+
+        # Threshold + run-length consolidation
+        below = [(v == v) and (v < float(threshold)) for v in ear_smooth]
+        blink_mask = [False] * len(below)
+        run_start = None
+        for i, b in enumerate(below + [False]):
+            if b and run_start is None:
+                run_start = i
+            elif (not b) and run_start is not None:
+                if (i - run_start) >= int(min_consecutive_frames):
+                    for j in range(run_start, i):
+                        blink_mask[j] = True
+                run_start = None
+
+        # Count blinks by counting rising edges in the mask
+        blink_count = 0
+        prev = False
+        for b in blink_mask:
+            if b and not prev:
+                blink_count += 1
+            prev = b
+        duration_s = len(blink_mask) / max(float(fps), 1e-6)
+        blink_rate_hz = (blink_count / duration_s) if duration_s > 0 else 0.0
+
+        report = {
+            "num_frames": len(blink_mask),
+            "fps": float(fps),
+            "threshold": float(threshold),
+            "min_consecutive_frames": int(min_consecutive_frames),
+            "blink_count": int(blink_count),
+            "blink_rate_hz": round(blink_rate_hz, 4),
+            "blink_mask": [bool(b) for b in blink_mask],
+        }
+        ear_series = {
+            "right": [None if v != v else round(v, 5) for v in ear_r],
+            "left":  [None if v != v else round(v, 5) for v in ear_l],
+            "mean_smoothed": [None if v != v else round(v, 5) for v in ear_smooth],
+        }
+        return (
+            json.dumps(report),
+            json.dumps(ear_series),
+            int(blink_count),
+            float(blink_rate_hz),
+        )
+
+
+class SaccadeClassifierC2C:
+    """Classify per-frame saccades from the gaze (yaw, pitch) time series.
+
+    Computes angular velocity ω(t) = ||Δ(yaw,pitch)|| / Δt, smooths the
+    yaw/pitch independently with a OneEuro low-pass, then thresholds at
+    ``velocity_threshold_deg_s`` (300°/s by default — the classical
+    physiological saccade boundary).
+
+    Tracks the user's stricter intent: 'saccade' only when the velocity
+    is sustained above threshold for at least ``min_consecutive_frames``
+    frames (kills single-frame noise spikes).
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "pose_data": ("POSEDATA",),
+                "fps": ("FLOAT", {"default": 30.0, "min": 1.0, "max": 240.0,
+                                   "step": 0.5}),
+                "velocity_threshold_deg_s": ("FLOAT", {"default": 300.0,
+                                                        "min": 30.0,
+                                                        "max": 1000.0,
+                                                        "step": 5.0}),
+                "min_consecutive_frames": ("INT", {"default": 1, "min": 1,
+                                                    "max": 30}),
+                "one_euro_min_cutoff": ("FLOAT", {"default": 1.0, "min": 0.1,
+                                                   "max": 10.0, "step": 0.1}),
+                "one_euro_beta": ("FLOAT", {"default": 0.05, "min": 0.0,
+                                             "max": 1.0, "step": 0.01}),
+            },
+        }
+
+    RETURN_TYPES = ("STRING", "STRING", "INT", "FLOAT")
+    RETURN_NAMES = ("saccade_report_json", "velocity_series_json",
+                    "saccade_count", "saccade_rate_hz")
+    FUNCTION = "classify"
+    CATEGORY = "WanAnimatePreprocess_V2/KANIBUS"
+
+    def classify(self, pose_data, fps, velocity_threshold_deg_s,
+                 min_consecutive_frames, one_euro_min_cutoff, one_euro_beta):
+        _metas, iris_seq, _ = _coerce_pose_data(pose_data)
+        if not iris_seq:
+            empty = {"num_frames": 0, "saccade_count": 0,
+                     "saccade_rate_hz": 0.0, "saccade_mask": []}
+            return (json.dumps(empty), json.dumps({"velocity_deg_s": []}),
+                    0, 0.0)
+
+        # Mean of both eyes per frame (radians). Missing gaze → NaN.
+        yaw_series: List[float] = []
+        pitch_series: List[float] = []
+        for entry in iris_seq:
+            r = entry.get('right_gaze') or {}
+            l = entry.get('left_gaze')  or {}
+            ys = [v for v in (r.get('yaw_rad'), l.get('yaw_rad'))
+                  if v is not None]
+            ps = [v for v in (r.get('pitch_rad'), l.get('pitch_rad'))
+                  if v is not None]
+            yaw_series.append(float(np.mean(ys)) if ys else float('nan'))
+            pitch_series.append(float(np.mean(ps)) if ps else float('nan'))
+
+        yaw_f = _one_euro_filter(yaw_series,   freq_hz=float(fps),
+                                  min_cutoff=float(one_euro_min_cutoff),
+                                  beta=float(one_euro_beta))
+        pitch_f = _one_euro_filter(pitch_series, freq_hz=float(fps),
+                                    min_cutoff=float(one_euro_min_cutoff),
+                                    beta=float(one_euro_beta))
+
+        dt = 1.0 / max(float(fps), 1e-6)
+        vel_deg_s: List[float] = [0.0]
+        for i in range(1, len(yaw_f)):
+            y0, y1 = yaw_f[i - 1], yaw_f[i]
+            p0, p1 = pitch_f[i - 1], pitch_f[i]
+            if any(v != v for v in (y0, y1, p0, p1)):
+                vel_deg_s.append(float('nan'))
+                continue
+            dy = y1 - y0
+            dp = p1 - p0
+            omega_rad_s = math.hypot(dy, dp) / dt
+            vel_deg_s.append(math.degrees(omega_rad_s))
+
+        # Threshold + min-consecutive-frames run filter
+        above = [(v == v) and (v >= float(velocity_threshold_deg_s))
+                 for v in vel_deg_s]
+        sacc_mask = [False] * len(above)
+        run_start = None
+        for i, b in enumerate(above + [False]):
+            if b and run_start is None:
+                run_start = i
+            elif (not b) and run_start is not None:
+                if (i - run_start) >= int(min_consecutive_frames):
+                    for j in range(run_start, i):
+                        sacc_mask[j] = True
+                run_start = None
+
+        saccade_count = 0
+        prev = False
+        for b in sacc_mask:
+            if b and not prev:
+                saccade_count += 1
+            prev = b
+        duration_s = len(sacc_mask) / max(float(fps), 1e-6)
+        saccade_rate_hz = (saccade_count / duration_s) if duration_s > 0 else 0.0
+
+        report = {
+            "num_frames": len(sacc_mask),
+            "fps": float(fps),
+            "velocity_threshold_deg_s": float(velocity_threshold_deg_s),
+            "min_consecutive_frames": int(min_consecutive_frames),
+            "saccade_count": int(saccade_count),
+            "saccade_rate_hz": round(saccade_rate_hz, 4),
+            "saccade_mask": [bool(b) for b in sacc_mask],
+        }
+        vel_payload = {
+            "velocity_deg_s": [None if v != v else round(v, 3) for v in vel_deg_s],
+            "yaw_smoothed_rad":   [None if v != v else round(v, 5) for v in yaw_f],
+            "pitch_smoothed_rad": [None if v != v else round(v, 5) for v in pitch_f],
+        }
+        return (
+            json.dumps(report),
+            json.dumps(vel_payload),
+            int(saccade_count),
+            float(saccade_rate_hz),
+        )
+
+
+class PupilDilationTrackerC2C:
+    """Track per-frame pupil dilation, normalized against an invariant
+    scale to be robust against the subject moving towards/away from the
+    camera.
+
+    Normaliser options:
+      * 'eye_width' (default) — horizontal distance between outer/inner
+        eye corners (landmark indices 37↔40 for the right eye, 43↔46 for
+        the left). This is the canonical KANIBUS choice.
+      * 'face_bbox_diag' — diagonal of the per-frame face bbox.
+      * 'first_frame_radius' — pupil radius itself measured on the first
+        non-NaN frame. Useful for relative ('% of baseline') reporting.
+
+    A 'dilation event' is reported when the normalized radius rises above
+    ``event_threshold`` (relative units) for at least ``min_consecutive_frames``.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "pose_data": ("POSEDATA",),
+                "normaliser": (["eye_width", "face_bbox_diag",
+                                 "first_frame_radius"],
+                                {"default": "eye_width"}),
+                "event_threshold": ("FLOAT", {"default": 1.25, "min": 1.0,
+                                               "max": 3.0, "step": 0.01}),
+                "min_consecutive_frames": ("INT", {"default": 3, "min": 1,
+                                                    "max": 60}),
+                "smooth_window": ("INT", {"default": 5, "min": 1, "max": 31}),
+                "fps": ("FLOAT", {"default": 30.0, "min": 1.0, "max": 240.0,
+                                   "step": 0.5}),
+            },
+            "optional": {
+                "face_bboxes": ("BBOX",),
+            },
+        }
+
+    RETURN_TYPES = ("STRING", "STRING", "FLOAT", "FLOAT")
+    RETURN_NAMES = ("dilation_report_json", "radius_series_json",
+                    "mean_normalized", "stddev_normalized")
+    FUNCTION = "track"
+    CATEGORY = "WanAnimatePreprocess_V2/KANIBUS"
+
+    def _scale_eye_width(self, face_kps, W, H) -> float:
+        if face_kps is None or face_kps.ndim < 2:
+            return float('nan')
+        try:
+            r_outer = face_kps[_RIGHT_EYE_IDX[0], :2]
+            r_inner = face_kps[_RIGHT_EYE_IDX[3], :2]
+            l_inner = face_kps[_LEFT_EYE_IDX[0],  :2]
+            l_outer = face_kps[_LEFT_EYE_IDX[3],  :2]
+        except Exception:
+            return float('nan')
+        widths = []
+        for a, b in ((r_outer, r_inner), (l_inner, l_outer)):
+            if not ((a == 0).all() or (b == 0).all()):
+                widths.append(math.hypot((a[0] - b[0]) * W,
+                                          (a[1] - b[1]) * H))
+        if not widths:
+            return float('nan')
+        return float(np.mean(widths))
+
+    def track(self, pose_data, normaliser, event_threshold,
+              min_consecutive_frames, smooth_window, fps,
+              face_bboxes=None):
+        metas, iris_seq, (H, W) = _coerce_pose_data(pose_data)
+        n = min(len(metas), len(iris_seq)) if iris_seq else len(metas)
+        if n == 0:
+            empty = {"num_frames": 0, "event_count": 0}
+            return (json.dumps(empty), json.dumps({"r_px": [], "l_px": [],
+                    "normaliser": []}), 0.0, 0.0)
+
+        r_px: List[float] = []
+        l_px: List[float] = []
+        scale: List[float] = []
+        for i in range(n):
+            entry = iris_seq[i] if i < len(iris_seq) else {}
+            ri = (entry.get('right_iris') or {}).get('radius')
+            li = (entry.get('left_iris')  or {}).get('radius')
+            r_px.append(float(ri) if ri is not None else float('nan'))
+            l_px.append(float(li) if li is not None else float('nan'))
+            if normaliser == "eye_width":
+                scale.append(self._scale_eye_width(
+                    metas[i].get('keypoints_face'), W, H))
+            elif normaliser == "face_bbox_diag":
+                if face_bboxes and i < len(face_bboxes) and face_bboxes[i] is not None:
+                    try:
+                        x1, x2, y1, y2 = face_bboxes[i]
+                        scale.append(math.hypot(x2 - x1, y2 - y1))
+                    except Exception:
+                        scale.append(float('nan'))
+                else:
+                    scale.append(float('nan'))
+            else:  # first_frame_radius — fill below
+                scale.append(float('nan'))
+
+        if normaliser == "first_frame_radius":
+            # Find the first frame where at least one eye has a valid radius.
+            baseline: Optional[float] = None
+            for i in range(n):
+                vals = [v for v in (r_px[i], l_px[i]) if v == v and v > 0]
+                if vals:
+                    baseline = float(np.mean(vals))
+                    break
+            scale = [baseline if (baseline is not None) else float('nan')
+                     for _ in range(n)]
+
+        # Per-frame normalized radius (mean of both eyes / scale)
+        norm: List[float] = []
+        for ri, li, s in zip(r_px, l_px, scale):
+            if not (s == s) or s <= 1e-6:
+                norm.append(float('nan'))
+                continue
+            vals = [v for v in (ri, li) if v == v and v > 0]
+            if not vals:
+                norm.append(float('nan'))
+                continue
+            norm.append(float(np.mean(vals)) / s)
+
+        # Causal median smoothing
+        win = max(1, int(smooth_window) | 1)
+        smooth = list(norm)
+        if win > 1:
+            half = win // 2
+            for i in range(n):
+                lo = max(0, i - half)
+                hi = i + 1
+                chunk = [v for v in norm[lo:hi] if v == v]
+                if chunk:
+                    smooth[i] = float(np.median(chunk))
+
+        valid = [v for v in smooth if v == v]
+        mean_n = float(np.mean(valid)) if valid else 0.0
+        std_n  = float(np.std(valid))  if valid else 0.0
+
+        # Event detection (above mean_n * event_threshold for min_frames)
+        ref = mean_n if mean_n > 0 else 1.0
+        ev_thr = ref * float(event_threshold)
+        above = [(v == v) and (v >= ev_thr) for v in smooth]
+        event_count = 0
+        run_start = None
+        events: List[Tuple[int, int]] = []
+        for i, b in enumerate(above + [False]):
+            if b and run_start is None:
+                run_start = i
+            elif (not b) and run_start is not None:
+                if (i - run_start) >= int(min_consecutive_frames):
+                    events.append((int(run_start), int(i - 1)))
+                    event_count += 1
+                run_start = None
+
+        report = {
+            "num_frames": n,
+            "fps": float(fps),
+            "normaliser": normaliser,
+            "event_threshold": float(event_threshold),
+            "min_consecutive_frames": int(min_consecutive_frames),
+            "mean_normalized": round(mean_n, 5),
+            "stddev_normalized": round(std_n, 5),
+            "event_count": int(event_count),
+            "events": [{"start": s, "end": e} for s, e in events],
+        }
+        series = {
+            "r_px":              [None if v != v else round(v, 3) for v in r_px],
+            "l_px":              [None if v != v else round(v, 3) for v in l_px],
+            "normaliser":        [None if v != v else round(v, 4) for v in scale],
+            "normalized":        [None if v != v else round(v, 5) for v in norm],
+            "normalized_smooth": [None if v != v else round(v, 5) for v in smooth],
+        }
+        return (
+            json.dumps(report),
+            json.dumps(series),
+            float(mean_n),
+            float(std_n),
+        )
+
+
 try:
     from .nodes_extras import (
         EXTRA_NODE_CLASS_MAPPINGS as _EXTRA_NODE_CLASS_MAPPINGS,
@@ -2902,6 +3414,10 @@ NODE_CLASS_MAPPINGS = {
     "DepthPoseCannyCombinedV2": DepthPoseCannyCombinedV2,
     # Self-contained alias (Task 2): same class, friendlier name highlighting bundled MiDaS + Normal + Blend modes
     "SelfContainedControlNetPreprocessorV2": DepthPoseCannyCombinedV2,
+    # KANIBUS gap nodes (May 2026): derived eye-feature series.
+    "EARBlinkDetectorC2C": EARBlinkDetectorC2C,
+    "SaccadeClassifierC2C": SaccadeClassifierC2C,
+    "PupilDilationTrackerC2C": PupilDilationTrackerC2C,
     **_EXTRA_NODE_CLASS_MAPPINGS,
 }
 
@@ -2912,5 +3428,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "WanAnimateFaceQualityCheckV2": "Wan-Animate Face Quality Check (V2)",
     "DepthPoseCannyCombinedV2": "Depth + Pose + Canny Combined (V2)",
     "SelfContainedControlNetPreprocessorV2": "Self-Contained ControlNet Preprocessor (V2)",
+    "EARBlinkDetectorC2C": "EAR Blink Detector",
+    "SaccadeClassifierC2C": "Saccade Classifier (300\u00b0/s)",
+    "PupilDilationTrackerC2C": "Pupil Dilation Tracker",
     **_EXTRA_NODE_DISPLAY_NAME_MAPPINGS,
 }
