@@ -3,3 +3,8 @@ onnxruntime-gpu
 opencv-python
 mediapipe
 ai-edge-litert
+
+# Optional — enable L2CS-Net gaze engine (gaze_engine = l2cs_gaze360 / l2cs_mpiigaze).
+# Install manually if you want CNN-based gaze (extreme-pose-robust, MIT licence):
+#   pip install git+https://github.com/edavalosanaya/L2CS-Net.git@main
+# Weights auto-download from HF tianfxc/l2cs into ComfyUI/models/gaze/.

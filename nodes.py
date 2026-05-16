@@ -1819,8 +1819,29 @@ class PoseAndFaceDetectionV2:
                                     'radius': mp_result['left_iris_radius_px']},
                     'source': mp_result.get('source', 'face_mesh'),
                 }
+                # Optional L2CS-Net per-frame inference (Stage 2). Runs
+                # once per face crop and produces a single world-frame
+                # (yaw, pitch). Both eyes share that estimate. Falls
+                # silently back to blendshape on per-frame failure.
+                _l2cs_per_eye = None
+                if l2cs_enabled and _l2cs_pipeline is not None and crop_rgb is not None:
+                    try:
+                        _l2cs_out = _gaze_l2cs.infer_frame(_l2cs_pipeline, crop_rgb)
+                    except Exception as exc:  # noqa: BLE001
+                        logging.getLogger(__name__).debug(
+                            "[L2CS] infer_frame failed: %s", exc)
+                        _l2cs_out = None
+                    if _l2cs_out is not None:
+                        _y_l, _p_l, _c_l = _l2cs_out
+                        _l2cs_per_eye = {
+                            'right': {'yaw_rad': _y_l, 'pitch_rad': _p_l,
+                                       'blink': 0.0, 'confidence': _c_l},
+                            'left':  {'yaw_rad': _y_l, 'pitch_rad': _p_l,
+                                       'blink': 0.0, 'confidence': _c_l},
+                        }
+                        l2cs_used_count += 1
                 gaze_bs = mp_result.get('gaze_blendshape')
-                if gaze_bs is not None:
+                if gaze_bs is not None or _l2cs_per_eye is not None:
                     # Blend-shape path: rescale yaw/pitch to user-tuned max
                     # angles (defaults already factor in MAX_GAZE_*_RAD,
                     # so divide by them and remultiply by the new max).
@@ -1866,10 +1887,19 @@ class PoseAndFaceDetectionV2:
                         'left':  (float(lix), float(liy)),
                     }
                     for eye_name in ('right', 'left'):
-                        e = dict(gaze_bs[eye_name])
-                        e['yaw_rad'] = float(e['yaw_rad']) / max(base_yaw, 1e-6) * max_yaw_rad
-                        e['pitch_rad'] = float(e['pitch_rad']) / max(base_pitch, 1e-6) * max_pitch_rad
-                        e['source'] = 'blendshape'
+                        if _l2cs_per_eye is not None:
+                            # L2CS path: yaw/pitch already in world frame
+                            # (radians, our sign convention), no rescale,
+                            # no head composition. Still Kalman-smoothed.
+                            e = dict(_l2cs_per_eye[eye_name])
+                            e['source'] = 'l2cs_' + (
+                                "gaze360" if _engine == "l2cs_gaze360" else "mpiigaze"
+                            )
+                        else:
+                            e = dict(gaze_bs[eye_name])
+                            e['yaw_rad'] = float(e['yaw_rad']) / max(base_yaw, 1e-6) * max_yaw_rad
+                            e['pitch_rad'] = float(e['pitch_rad']) / max(base_pitch, 1e-6) * max_pitch_rad
+                            e['source'] = 'blendshape'
                         _yaw = float(e['yaw_rad'])
                         _pitch = float(e['pitch_rad'])
                         # Engine branch: optionally compose eye-in-head
@@ -1877,8 +1907,14 @@ class PoseAndFaceDetectionV2:
                         # (solvePnP) so the rendered arrow tracks rotated
                         # heads, and run a 4-state Kalman temporal
                         # smoother on the resulting world-frame angles.
-                        R_head_frame = mp_result.get('R_head') if head_correct else None
-                        if head_correct and _GAZE_3D_IMPORTED and _gaze_3d is not None:
+                        # L2CS already gives world-frame gaze, so skip
+                        # head composition for it.
+                        R_head_frame = (
+                            mp_result.get('R_head')
+                            if (head_correct and _l2cs_per_eye is None)
+                            else None
+                        )
+                        if (head_correct or _l2cs_per_eye is not None) and _GAZE_3D_IMPORTED and _gaze_3d is not None:
                             _dx, _dy, _yaw_w, _pitch_w = _gaze_3d.world_gaze_from_eye_in_head(
                                 _yaw, _pitch, R_head_frame,
                             )
@@ -1893,7 +1929,9 @@ class PoseAndFaceDetectionV2:
                                 _dx, _dy = _dx2, _dy2
                             e['yaw_rad'] = float(_yaw_w)
                             e['pitch_rad'] = float(_pitch_w)
-                            e['source'] = 'blendshape_head_corrected'
+                            if _l2cs_per_eye is None:
+                                e['source'] = 'blendshape_head_corrected'
+                            # else: keep 'l2cs_<variant>' source set above
                             _yaw = float(_yaw_w)
                             _pitch = float(_pitch_w)
                         else:
