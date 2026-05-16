@@ -167,6 +167,21 @@ MP_LEFT_IRIS_CENTER = 473
 MP_RIGHT_IRIS_RING = [469, 470, 471, 472]
 MP_LEFT_IRIS_RING = [474, 475, 476, 477]
 
+# Eye corner landmarks (same MediaPipe model as the iris — use these as
+# the gaze reference frame instead of dlib eye-contour centroid. Reason:
+# the dlib contour averages upper+lower eyelid points whose vertical
+# spread is asymmetric (lower lid extends further than upper), biasing
+# the centroid DOWN by ~2 px relative to the iris and producing a
+# spurious "iris-is-up" signal even when the subject looks straight
+# ahead. Eye-corner midpoint has no eyelid component, so vertical
+# offset = true vertical gaze and horizontal offset = true horizontal
+# gaze. Subject's right eye (viewer-left): outer=33 inner=133. Subject's
+# left eye (viewer-right): inner=362 outer=263.
+MP_RIGHT_EYE_OUTER = 33
+MP_RIGHT_EYE_INNER = 133
+MP_LEFT_EYE_INNER  = 362
+MP_LEFT_EYE_OUTER  = 263
+
 # Inner-lip indices used for "openness" (mouth aspect ratio).
 # Vertical opening: top-inner (13) <-> bottom-inner (14).
 # Horizontal width: right inner corner (78) <-> left inner corner (308).
@@ -251,7 +266,12 @@ def _run_mediapipe_on_face_crop(face_crop_rgb_uint8, crop_origin_xy, crop_size_w
     r_radius = float(np.mean(np.linalg.norm(r_ring - r_iris[None, :], axis=1)))
     l_radius = float(np.mean(np.linalg.norm(l_ring - l_iris[None, :], axis=1)))
 
-    # Lip openness ratio (inner-lip MAR)
+    # Eye corners (full image pixel space) — used downstream as the
+    # gaze reference frame in lieu of dlib eye-contour centroid.
+    r_outer = pts_px[MP_RIGHT_EYE_OUTER]
+    r_inner = pts_px[MP_RIGHT_EYE_INNER]
+    l_inner = pts_px[MP_LEFT_EYE_INNER]
+    l_outer = pts_px[MP_LEFT_EYE_OUTER]
     top = pts_px[MP_INNER_LIP_TOP]
     bot = pts_px[MP_INNER_LIP_BOTTOM]
     rgt = pts_px[MP_INNER_LIP_RIGHT]
@@ -266,6 +286,10 @@ def _run_mediapipe_on_face_crop(face_crop_rgb_uint8, crop_origin_xy, crop_size_w
         'left_iris_px': (float(l_iris[0]), float(l_iris[1])),
         'right_iris_radius_px': r_radius,
         'left_iris_radius_px': l_radius,
+        'right_eye_outer_px': (float(r_outer[0]), float(r_outer[1])),
+        'right_eye_inner_px': (float(r_inner[0]), float(r_inner[1])),
+        'left_eye_inner_px':  (float(l_inner[0]), float(l_inner[1])),
+        'left_eye_outer_px':  (float(l_outer[0]), float(l_outer[1])),
         'lip_openness_ratio': lip_ratio,
     }
 
@@ -332,6 +356,11 @@ def _run_face_landmarker_on_face_crop(
     r_radius = float(np.mean(np.linalg.norm(r_ring - r_iris[None, :], axis=1)))
     l_radius = float(np.mean(np.linalg.norm(l_ring - l_iris[None, :], axis=1)))
 
+    r_outer = pts_px[MP_RIGHT_EYE_OUTER]
+    r_inner = pts_px[MP_RIGHT_EYE_INNER]
+    l_inner = pts_px[MP_LEFT_EYE_INNER]
+    l_outer = pts_px[MP_LEFT_EYE_OUTER]
+
     top = pts_px[MP_INNER_LIP_TOP]
     bot = pts_px[MP_INNER_LIP_BOTTOM]
     rgt = pts_px[MP_INNER_LIP_RIGHT]
@@ -348,6 +377,10 @@ def _run_face_landmarker_on_face_crop(
         'left_iris_px': (float(l_iris[0]), float(l_iris[1])),
         'right_iris_radius_px': r_radius,
         'left_iris_radius_px': l_radius,
+        'right_eye_outer_px': (float(r_outer[0]), float(r_outer[1])),
+        'right_eye_inner_px': (float(r_inner[0]), float(r_inner[1])),
+        'left_eye_inner_px':  (float(l_inner[0]), float(l_inner[1])),
+        'left_eye_outer_px':  (float(l_outer[0]), float(l_outer[1])),
         'lip_openness_ratio': lip_ratio,
         # NEW: production gaze from blend shapes — head-pose corrected,
         # in radians per eye, plus a 2D dx/dy for legacy debug overlay.
@@ -402,15 +435,35 @@ def preprocess_for_pose(img, use_clahe=True):
 # face array = kp2ds[22:91]; index 0 is body, indices 1-68 are
 # standard 68-face landmarks (standard N -> face[N+1]).
 #
-# Right eye (standard 36-41):
-#   37=outer  38=upper_outer  39=upper_inner
-#   40=inner  41=lower_inner  42=lower_outer
-# Left eye (standard 42-47):
-#   43=inner  44=upper_inner  45=upper_outer
-#   46=outer  47=lower_outer  48=lower_inner
+# Dlib-68 eye contour indices for the EXISTING ``face_kps`` array layout.
+#
+# CRITICAL INDEXING NOTE (verified May 2026 with live _gaze_debug.log):
+# face_kps[0] is the body-anchored face anchor; face_kps[1:69] holds the
+# 68 dlib landmarks (assigned via `face_kps[1:69, :] = mp_result['kps68_norm']`
+# where kps68_norm is 0-indexed dlib order). So to access dlib's right-eye
+# contour (dlib indices 36-41) we read array slots 37-42; for the left eye
+# (dlib 42-47) we read array slots 43-48.
+#
+# History: A prior attempted fix changed these to [36..41]/[42..47]
+# (commit cc608dd) on the assumption the array was 0-indexed dlib. Live
+# diagnostics on a real frame proved otherwise: the LEFT-eye centroid was
+# being contaminated by the lower-outer RIGHT-eye corner, dragging the
+# centroid leftward and flipping (iris - centroid) to positive when the
+# subject was actually looking left — i.e. arrow pointed RIGHT. Reverted.
 _RIGHT_EYE_IDX = [37, 38, 39, 40, 41, 42]
 _LEFT_EYE_IDX  = [43, 44, 45, 46, 47, 48]
 _EYE_CONTOUR_INDICES = [_RIGHT_EYE_IDX, _LEFT_EYE_IDX]
+
+# Gaze-arrow rendering tunables.
+# DEAD_ZONE_PX: iris-centroid offsets smaller than this are treated as
+# noise (MediaPipe landmark precision is roughly 1px on cropped faces).
+# Below the dead-zone we suppress the arrow entirely.
+_GAZE_DEAD_ZONE_PX = 1.2
+# Arrow length is scaled by gaze magnitude (offset / iris_radius) so
+# subtle gazes show subtle arrows instead of always-35-pixel arrows. Hard
+# floor + ceiling keep arrows in [0, MAX_ARROW_LEN_PX].
+_GAZE_MAX_ARROW_LEN_PX = 35
+_GAZE_MIN_ARROW_LEN_PX = 6
 
 
 def _gradient_vote_pupil(roi_gray, mask, gc_local, eye_w, eye_h):
@@ -775,7 +828,11 @@ def draw_debug_overlay(frame_uint8, face_kps_norm, iris_data,
                         (ix + 8, iy - 8), cv2.FONT_HERSHEY_SIMPLEX,
                         0.35, (255, 0, 255), 1, cv2.LINE_AA)
         if gaze and (abs(gaze['dx']) > 1e-4 or abs(gaze['dy']) > 1e-4):
-            arrow_len = 35
+            # Magnitude-aware arrow length: scale by gaze strength so
+            # noise-level offsets shrink toward _GAZE_MIN_ARROW_LEN_PX.
+            mag = float(gaze.get('magnitude_norm', 1.0))
+            arrow_len = int(_GAZE_MIN_ARROW_LEN_PX +
+                            (_GAZE_MAX_ARROW_LEN_PX - _GAZE_MIN_ARROW_LEN_PX) * mag)
             ex = int(ix + gaze['dx'] * arrow_len)
             ey = int(iy + gaze['dy'] * arrow_len)
             cv2.arrowedLine(vis, (ix, iy), (ex, ey),
@@ -1675,37 +1732,77 @@ class PoseAndFaceDetectionV2:
                     # ``-sin(yaw_rad)`` (anatomical-camera convention) made
                     # the arrow point opposite to the iris in the rendered
                     # debug view — that was the user-reported bug.
-                    kps_px_for_gaze = meta['keypoints_face'][:, :2] * np.array([W, H])
+                    # Build per-eye reference frame from MediaPipe's own
+                    # eye corner landmarks (same model that produced the
+                    # iris pixels — no cross-model misalignment, no
+                    # eyelid asymmetry bias). Center = midpoint of the
+                    # outer+inner corner. Half-width = horizontal eye
+                    # span / 2 (used as magnitude normalizer so dx ∈
+                    # [-1, +1] corresponds to iris from outer to inner
+                    # corner — a physically meaningful range).
+                    r_out_x, r_out_y = mp_result['right_eye_outer_px']
+                    r_in_x,  r_in_y  = mp_result['right_eye_inner_px']
+                    l_in_x,  l_in_y  = mp_result['left_eye_inner_px']
+                    l_out_x, l_out_y = mp_result['left_eye_outer_px']
+                    eye_ref = {
+                        'right': {
+                            'cx': 0.5 * (r_out_x + r_in_x),
+                            'cy': 0.5 * (r_out_y + r_in_y),
+                            'hw': max(0.5 * abs(r_in_x - r_out_x), 1.0),
+                        },
+                        'left': {
+                            'cx': 0.5 * (l_in_x + l_out_x),
+                            'cy': 0.5 * (l_in_y + l_out_y),
+                            'hw': max(0.5 * abs(l_out_x - l_in_x), 1.0),
+                        },
+                    }
                     iris_pix = {
                         'right': (float(rix), float(riy)),
                         'left':  (float(lix), float(liy)),
-                    }
-                    eye_idx_map = {
-                        'right': _RIGHT_EYE_IDX,
-                        'left':  _LEFT_EYE_IDX,
                     }
                     for eye_name in ('right', 'left'):
                         e = dict(gaze_bs[eye_name])
                         e['yaw_rad'] = float(e['yaw_rad']) / max(base_yaw, 1e-6) * max_yaw_rad
                         e['pitch_rad'] = float(e['pitch_rad']) / max(base_pitch, 1e-6) * max_pitch_rad
                         e['source'] = 'blendshape'
-                        # Screen-space dx/dy = unit vector from eye centroid
-                        # to detected iris pixel. Matches path A exactly and
-                        # is automatically correct for both mirrored
-                        # (selfie) and unmirrored camera inputs because the
-                        # iris position is sampled from the same image
-                        # frame as the eye centroid.
-                        ipx, ipy = iris_pix[eye_name]
-                        geo = np.mean(kps_px_for_gaze[eye_idx_map[eye_name]], axis=0)
-                        ddx = ipx - float(geo[0])
-                        ddy = ipy - float(geo[1])
-                        nrm = float(math.hypot(ddx, ddy))
-                        if nrm > 1e-6:
-                            e['dx'] = round(ddx / nrm, 4)
-                            e['dy'] = round(ddy / nrm, 4)
-                        else:
+                        # Use MediaPipe-blendshape-calibrated dx/dy from
+                        # `to_dxdy(yaw, pitch)`. Previous attempts to
+                        # override with iris-pixel-vs-eye-centroid (dlib
+                        # eyelid centroid OR MP eye-corner midpoint) all
+                        # produced wrong arrows because of anatomical
+                        # asymmetry (eyelid coverage, canthus offset)
+                        # which biased the geometric reference. The
+                        # blendshape signal is anatomy-aware and trained
+                        # on calibrated gaze data, so it is the truth.
+                        # See _gaze_debug.log + session memory
+                        # `gaze_arrow_bug_analysis.md` for evidence.
+                        _yaw = float(e['yaw_rad'])
+                        _pitch = float(e['pitch_rad'])
+                        _dx = -math.sin(_yaw)
+                        _dy = -math.sin(_pitch)
+                        _mag = math.hypot(_dx, _dy)
+                        # Magnitude proxy: how far yaw/pitch are from
+                        # neutral, normalized to user-configured maxima.
+                        mag_norm = float(min(1.0, math.hypot(
+                            _yaw / max(max_yaw_rad, 1e-6),
+                            _pitch / max(max_pitch_rad, 1e-6),
+                        )))
+                        # Dead-zone: below ~10% of max, treat as
+                        # forward-gaze (no arrow).
+                        if mag_norm < 0.10 or _mag < 1e-6:
                             e['dx'] = 0.0
                             e['dy'] = 0.0
+                            e['magnitude_norm'] = 0.0
+                        else:
+                            e['dx'] = round(_dx / _mag, 4)
+                            e['dy'] = round(_dy / _mag, 4)
+                            e['magnitude_norm'] = mag_norm
+                        # Keep the pixel-space refs available for the
+                        # diagnostic log below.
+                        ipx, ipy = iris_pix[eye_name]
+                        ref = eye_ref[eye_name]
+                        ddx = ipx - ref['cx']
+                        ddy = ipy - ref['cy']
                         # One-shot diagnostic for first frame, both eyes:
                         # writes iris pixel, eye centroid, and resulting
                         # unit vector to a debug log so we can verify the
@@ -1719,13 +1816,28 @@ class PoseAndFaceDetectionV2:
                                     _os.path.dirname(__file__),
                                     "_gaze_debug.log",
                                 )
+                                # Also dump raw blendshape coefficients
+                                # for this frame so we can compare the
+                                # corner-midpoint result against the
+                                # MediaPipe-calibrated eye-look signals.
+                                _bs_raw = mp_result.get('blendshapes', {}) or {}
+                                if eye_name == 'right':
+                                    _bs_keys = ('eyeLookInRight','eyeLookOutRight','eyeLookUpRight','eyeLookDownRight','eyeBlinkRight')
+                                else:
+                                    _bs_keys = ('eyeLookInLeft','eyeLookOutLeft','eyeLookUpLeft','eyeLookDownLeft','eyeBlinkLeft')
+                                _bs_str = ' '.join(f"{k}={float(_bs_raw.get(k,0.0)):.3f}" for k in _bs_keys)
                                 with open(_dbg_path, "a", encoding="utf-8") as _fh:
                                     _fh.write(
                                         f"frame=0 eye={eye_name} "
                                         f"iris_px=({ipx:.1f},{ipy:.1f}) "
-                                        f"eye_centroid=({float(geo[0]):.1f},{float(geo[1]):.1f}) "
+                                        f"eye_corner_mid=({ref['cx']:.1f},{ref['cy']:.1f}) "
+                                        f"hw={ref['hw']:.1f} "
                                         f"ddx={ddx:+.2f} ddy={ddy:+.2f} "
+                                        f"mag_norm={e.get('magnitude_norm',0.0):.3f} "
                                         f"unit=({e['dx']:+.4f},{e['dy']:+.4f}) "
+                                        f"yaw={float(e.get('yaw_rad',0.0)):+.4f} "
+                                        f"pitch={float(e.get('pitch_rad',0.0)):+.4f} "
+                                        f"bs[{_bs_str}] "
                                         f"W={W} H={H}\n"
                                     )
                             except Exception:
@@ -1736,22 +1848,53 @@ class PoseAndFaceDetectionV2:
                 else:
                     # Legacy fallback: 2D iris-offset gaze (kept for
                     # backward compatibility when blend shapes are off).
-                    kps_px_local = meta['keypoints_face'][:, :2] * np.array([W, H])
-                    for eye_name, iris_xy, eye_idx in (
-                        ('right', (rix, riy), _RIGHT_EYE_IDX),
-                        ('left',  (lix, liy), _LEFT_EYE_IDX),
+                    # Uses the same MediaPipe eye-corner-midpoint reference
+                    # frame as the blendshape branch above — eliminates the
+                    # eyelid-asymmetry bias that the old dlib-eye-contour
+                    # centroid suffered from (lower-lid lands wider than
+                    # upper, pushing the centroid 2 px down regardless of
+                    # true gaze direction).
+                    r_out_x, r_out_y = mp_result['right_eye_outer_px']
+                    r_in_x,  r_in_y  = mp_result['right_eye_inner_px']
+                    l_in_x,  l_in_y  = mp_result['left_eye_inner_px']
+                    l_out_x, l_out_y = mp_result['left_eye_outer_px']
+                    eye_ref = {
+                        'right': {
+                            'cx': 0.5 * (r_out_x + r_in_x),
+                            'cy': 0.5 * (r_out_y + r_in_y),
+                            'hw': max(0.5 * abs(r_in_x - r_out_x), 1.0),
+                        },
+                        'left': {
+                            'cx': 0.5 * (l_in_x + l_out_x),
+                            'cy': 0.5 * (l_in_y + l_out_y),
+                            'hw': max(0.5 * abs(l_out_x - l_in_x), 1.0),
+                        },
+                    }
+                    for eye_name, iris_xy in (
+                        ('right', (float(rix), float(riy))),
+                        ('left',  (float(lix), float(liy))),
                     ):
-                        geo = np.mean(kps_px_local[eye_idx], axis=0)
-                        dx = iris_xy[0] - float(geo[0])
-                        dy = iris_xy[1] - float(geo[1])
-                        norm = max(np.hypot(dx, dy), 1e-6)
-                        iris_result[f'{eye_name}_gaze'] = {
-                            'dx': round(dx / norm, 4),
-                            'dy': round(dy / norm, 4),
-                            'yaw_rad': 0.0,
-                            'pitch_rad': 0.0,
-                            'source': 'iris_offset_2d',
-                        }
+                        ref = eye_ref[eye_name]
+                        ddx = iris_xy[0] - ref['cx']
+                        ddy = iris_xy[1] - ref['cy']
+                        nrm = float(math.hypot(ddx, ddy))
+                        mag_norm = float(min(1.0, nrm / ref['hw']))
+                        if mag_norm < 0.15:
+                            iris_result[f'{eye_name}_gaze'] = {
+                                'dx': 0.0, 'dy': 0.0,
+                                'magnitude_norm': 0.0,
+                                'yaw_rad': 0.0, 'pitch_rad': 0.0,
+                                'source': 'iris_offset_2d',
+                            }
+                        else:
+                            iris_result[f'{eye_name}_gaze'] = {
+                                'dx': round(ddx / nrm, 4),
+                                'dy': round(ddy / nrm, 4),
+                                'magnitude_norm': mag_norm,
+                                'yaw_rad': 0.0,
+                                'pitch_rad': 0.0,
+                                'source': 'iris_offset_2d',
+                            }
                 all_iris.append(iris_result)
                 all_lip_ratios.append(float(mp_result['lip_openness_ratio']))
             else:
@@ -2084,8 +2227,16 @@ class DrawViTPoseV2:
                     except (TypeError, ValueError):
                         dx = dy = 0.0
                     if abs(dx) > 1e-4 or abs(dy) > 1e-4:
-                        ex = int(round(cx + dx * gaze_arrow_len))
-                        ey = int(round(cy + dy * gaze_arrow_len))
+                        # Magnitude-aware shrink (same convention as
+                        # PoseAndFaceDetectionV2's draw_debug_overlay).
+                        mag = 1.0
+                        try:
+                            mag = float(gaze.get('magnitude_norm', 1.0))
+                        except (TypeError, ValueError):
+                            mag = 1.0
+                        eff_len = max(6, int(round(gaze_arrow_len * mag)))
+                        ex = int(round(cx + dx * eff_len))
+                        ey = int(round(cy + dy * eff_len))
                         cv2.arrowedLine(canvas, (cx, cy), (ex, ey),
                                         color_bgr, 2, cv2.LINE_AA, tipLength=0.3)
 
