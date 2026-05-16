@@ -313,6 +313,34 @@ except Exception as _exc:  # noqa: BLE001
         _exc,
     )
 
+# Stage-1 gaze upgrade: solvePnP head pose + Kalman temporal smoother.
+# Pure numpy + cv2, no extra downloads. Powers the
+# `gaze_engine='blendshape_head_corrected'` widget option.
+try:
+    from . import gaze_3d as _gaze_3d  # type: ignore
+    _GAZE_3D_IMPORTED = True
+except Exception as _exc:  # noqa: BLE001
+    _gaze_3d = None
+    _GAZE_3D_IMPORTED = False
+    logging.getLogger(__name__).info(
+        "gaze_3d module unavailable (%s); head-pose gaze correction disabled.",
+        _exc,
+    )
+
+# Stage-2 gaze upgrade: L2CS-Net (MIT license, ~3.9 deg MPIIGaze MAE,
+# ~10.4 deg Gaze360 MAE — robust to extreme head poses). Optional; only
+# imported when the user explicitly selects an `l2cs_*` engine.
+try:
+    from . import gaze_l2cs as _gaze_l2cs  # type: ignore
+    _GAZE_L2CS_IMPORTED = True
+except Exception as _exc:  # noqa: BLE001
+    _gaze_l2cs = None
+    _GAZE_L2CS_IMPORTED = False
+    logging.getLogger(__name__).debug(
+        "gaze_l2cs module unavailable (%s); L2CS-Net engine disabled.",
+        _exc,
+    )
+
 
 def _run_face_landmarker_on_face_crop(
     face_crop_rgb_uint8, crop_origin_xy, crop_size_wh, full_w, full_h,
@@ -371,6 +399,20 @@ def _run_face_landmarker_on_face_crop(
 
     gaze = _gaze_bs.blendshapes_to_gaze(res.get("blendshapes") or {})
 
+    # Stage-1: solvePnP head rotation from full-frame MediaPipe pixel
+    # landmarks. Used downstream to compose eye-in-head gaze with the
+    # head pose so the rendered arrow tracks rotated heads correctly.
+    R_head = None
+    if _GAZE_3D_IMPORTED and _gaze_3d is not None:
+        try:
+            hp = _gaze_3d.estimate_head_pose_from_pixels(
+                pts_px, (int(full_w), int(full_h)),
+            )
+            if hp is not None:
+                R_head = hp[0]
+        except Exception:  # noqa: BLE001
+            R_head = None
+
     return {
         'kps68_norm': kps68_norm,
         'right_iris_px': (float(r_iris[0]), float(r_iris[1])),
@@ -387,6 +429,7 @@ def _run_face_landmarker_on_face_crop(
         'gaze_blendshape': gaze,
         'blendshapes': res.get("blendshapes") or {},
         'face_transform': res.get("transform"),
+        'R_head': R_head,
         'source': 'face_landmarker',
     }
 
@@ -1193,6 +1236,11 @@ class PoseAndFaceDetectionV2:
                 "eye_align_mode": (["default", "eye_upper_third"], {"default": "default", "tooltip": "Wan-Animate paper recommendation #1: 'eye_upper_third' vertically shifts the face crop so eyes land at the upper third of the 512x512 face encoder input. The encoder reads holistic face appearance, so consistent eye placement directly improves gaze fidelity. 'default' keeps legacy bbox center."}),
                 "eye_y_fraction": ("FLOAT", {"default": 0.30, "min": 0.10, "max": 0.60, "step": 0.01, "tooltip": "Target eye row as a fraction of crop height (0.30 = upper third). Only used when eye_align_mode = 'eye_upper_third'."}),
                 "face_cfg_scale": ("FLOAT", {"default": 1.0, "min": 1.0, "max": 10.0, "step": 0.1, "tooltip": "Wan-Animate paper recommendation #3 (paper section 4.3): CFG on the face conditioning input gives finer control over expression / gaze when finer reenactment is desired. This widget is a passthrough -- wire the FLOAT output 'face_cfg_scale' into your Wan-Animate sampler's face CFG input. 1.0 = CFG disabled (default, fastest). 2.0-4.0 = stronger expression adherence. >5.0 may over-saturate."}),
+                # ---- Gaze engine selector + Kalman tuning (appended at end for back-compat with saved workflows) ----
+                "gaze_engine": (["blendshape_head_corrected", "blendshape_only", "l2cs_gaze360", "l2cs_mpiigaze"], {"default": "blendshape_head_corrected", "tooltip": "Per-eye gaze yaw/pitch engine.\n\n* blendshape_head_corrected (DEFAULT, recommended): MediaPipe ARKit blend shapes + solvePnP head pose + Kalman temporal smoother. Eye-in-head rotation is composed with the head rotation so the rendered arrow tracks rotated heads. Pure numpy + cv2, no downloads.\n* blendshape_only: legacy May-2026 shipped behavior; eye-in-head only, no head composition.\n* l2cs_gaze360: L2CS-Net (MIT) ResNet50 trained on Gaze360. ~10.4\u00b0 MAE but robust to extreme poses (recommended for Wan-Animate character scenes). One-time ~100MB weight download to ComfyUI/models/gaze/.\n* l2cs_mpiigaze: L2CS-Net MPIIGaze variant. ~3.9\u00b0 MAE but calibrated only for near-portrait subjects.\n\nETH-XGaze intentionally not offered: CC BY-NC-SA 4.0 license blocks commercial use."}),
+                "gaze_kalman_meas_std_deg": ("FLOAT", {"default": 3.0, "min": 0.1, "max": 20.0, "step": 0.1, "tooltip": "Kalman measurement noise (degrees). Higher = trust the model less and lean on the velocity model more — smoother. Used by blendshape_head_corrected and l2cs_* engines."}),
+                "gaze_kalman_process_std": ("FLOAT", {"default": 0.8, "min": 0.05, "max": 5.0, "step": 0.05, "tooltip": "Kalman process noise (rad/s). Roughly the expected saccade velocity scale. Higher = filter reacts faster to genuine motion but jitters more."}),
+                "gaze_fps": ("FLOAT", {"default": 30.0, "min": 1.0, "max": 240.0, "step": 1.0, "tooltip": "Video fps used by the Kalman dt. Set to match your source clip; affects velocity coupling, not absolute angles."}),
             },
             "optional": {
                 "bbox_override": ("BBOX", {"tooltip": "Optional external BBOX for the frame-0 anchor. Highest priority; overrides frame0_cx/cy/size widgets."}),
@@ -1243,6 +1291,10 @@ class PoseAndFaceDetectionV2:
         gaze_lock_strength=0.7,
         use_mediapipe_face=True,
         use_blendshape_gaze=True,
+        gaze_engine="blendshape_head_corrected",
+        gaze_kalman_meas_std_deg=3.0,
+        gaze_kalman_process_std=0.8,
+        gaze_fps=30.0,
         gaze_one_euro_min_cutoff=1.7,
         gaze_one_euro_beta=0.3,
         gaze_max_yaw_deg=30.0,
@@ -1643,13 +1695,66 @@ class PoseAndFaceDetectionV2:
         all_iris = []
         all_lip_ratios = []
         mp_enabled = bool(use_mediapipe_face) and _MP_AVAILABLE
-        bs_enabled = bool(use_blendshape_gaze) and _GAZE_BS_IMPORTED and (
-            _gaze_bs is not None and _gaze_bs.is_available()
-        )
+        # Resolve the gaze engine. `use_blendshape_gaze=False` forces the
+        # legacy iris-offset path regardless of `gaze_engine`.
+        _engine = str(gaze_engine or "blendshape_head_corrected").strip()
+        if not bool(use_blendshape_gaze):
+            _engine = "legacy_iris_offset"
+        if _engine.startswith("l2cs") and not (
+            _GAZE_L2CS_IMPORTED and _gaze_l2cs is not None
+        ):
+            logging.getLogger(__name__).warning(
+                "gaze_engine=%s requested but gaze_l2cs unavailable; "
+                "falling back to blendshape_head_corrected.",
+                _engine,
+            )
+            _engine = "blendshape_head_corrected"
+        if _engine == "blendshape_head_corrected" and not (
+            _GAZE_3D_IMPORTED and _gaze_3d is not None
+        ):
+            logging.getLogger(__name__).warning(
+                "gaze_engine=blendshape_head_corrected requested but "
+                "gaze_3d unavailable; falling back to blendshape_only.",
+            )
+            _engine = "blendshape_only"
+        bs_enabled = (_engine in ("blendshape_head_corrected", "blendshape_only")
+                      and _GAZE_BS_IMPORTED
+                      and _gaze_bs is not None and _gaze_bs.is_available())
+        l2cs_enabled = _engine.startswith("l2cs")
+        head_correct = (_engine == "blendshape_head_corrected")
         max_yaw_rad = math.radians(float(gaze_max_yaw_deg))
         max_pitch_rad = math.radians(float(gaze_max_pitch_deg))
+        # Lazy-init L2CS pipeline and per-eye Kalman filters once per node call.
+        _l2cs_pipeline = None
+        if l2cs_enabled:
+            try:
+                _variant = "gaze360" if _engine == "l2cs_gaze360" else "mpiigaze"
+                _l2cs_pipeline = _gaze_l2cs.get_pipeline(variant=_variant)
+            except Exception as exc:  # noqa: BLE001
+                logging.getLogger(__name__).warning(
+                    "L2CS pipeline init failed (%s); falling back to "
+                    "blendshape_head_corrected.", exc,
+                )
+                l2cs_enabled = False
+                head_correct = True
+                bs_enabled = (_GAZE_BS_IMPORTED and _gaze_bs is not None
+                              and _gaze_bs.is_available())
+        _kalman_dt = 1.0 / max(float(gaze_fps), 1.0)
+        _kalman_meas = math.radians(float(gaze_kalman_meas_std_deg))
+        _kalman_proc = float(gaze_kalman_process_std)
+        _kalman = None
+        if _GAZE_3D_IMPORTED and _gaze_3d is not None and (head_correct or l2cs_enabled):
+            _kalman = {
+                'right': _gaze_3d.AngleKalman2D(
+                    dt=_kalman_dt, process_std=_kalman_proc, meas_std=_kalman_meas,
+                ),
+                'left': _gaze_3d.AngleKalman2D(
+                    dt=_kalman_dt, process_std=_kalman_proc, meas_std=_kalman_meas,
+                ),
+            }
         mp_used_count = 0
         bs_used_count = 0
+        l2cs_used_count = 0
         for idx, meta in _IC.track(
             list(enumerate(pose_metas)), len(pose_metas),
             "WanAnimateV2: face/gaze per-frame",
@@ -1765,21 +1870,35 @@ class PoseAndFaceDetectionV2:
                         e['yaw_rad'] = float(e['yaw_rad']) / max(base_yaw, 1e-6) * max_yaw_rad
                         e['pitch_rad'] = float(e['pitch_rad']) / max(base_pitch, 1e-6) * max_pitch_rad
                         e['source'] = 'blendshape'
-                        # Use MediaPipe-blendshape-calibrated dx/dy from
-                        # `to_dxdy(yaw, pitch)`. Previous attempts to
-                        # override with iris-pixel-vs-eye-centroid (dlib
-                        # eyelid centroid OR MP eye-corner midpoint) all
-                        # produced wrong arrows because of anatomical
-                        # asymmetry (eyelid coverage, canthus offset)
-                        # which biased the geometric reference. The
-                        # blendshape signal is anatomy-aware and trained
-                        # on calibrated gaze data, so it is the truth.
-                        # See _gaze_debug.log + session memory
-                        # `gaze_arrow_bug_analysis.md` for evidence.
                         _yaw = float(e['yaw_rad'])
                         _pitch = float(e['pitch_rad'])
-                        _dx = -math.sin(_yaw)
-                        _dy = -math.sin(_pitch)
+                        # Engine branch: optionally compose eye-in-head
+                        # rotation with the per-frame head rotation
+                        # (solvePnP) so the rendered arrow tracks rotated
+                        # heads, and run a 4-state Kalman temporal
+                        # smoother on the resulting world-frame angles.
+                        R_head_frame = mp_result.get('R_head') if head_correct else None
+                        if head_correct and _GAZE_3D_IMPORTED and _gaze_3d is not None:
+                            _dx, _dy, _yaw_w, _pitch_w = _gaze_3d.world_gaze_from_eye_in_head(
+                                _yaw, _pitch, R_head_frame,
+                            )
+                            if _kalman is not None:
+                                _yaw_w, _pitch_w = _kalman[eye_name].step(_yaw_w, _pitch_w)
+                                # Re-project smoothed world angles to the
+                                # screen plane so dx/dy match the
+                                # filtered numbers.
+                                _dx2, _dy2, _, _ = _gaze_3d.world_gaze_from_eye_in_head(
+                                    _yaw_w, _pitch_w, None,
+                                )
+                                _dx, _dy = _dx2, _dy2
+                            e['yaw_rad'] = float(_yaw_w)
+                            e['pitch_rad'] = float(_pitch_w)
+                            e['source'] = 'blendshape_head_corrected'
+                            _yaw = float(_yaw_w)
+                            _pitch = float(_pitch_w)
+                        else:
+                            _dx = -math.sin(_yaw)
+                            _dy = -math.sin(_pitch)
                         _mag = math.hypot(_dx, _dy)
                         # Magnitude proxy: how far yaw/pitch are from
                         # neutral, normalized to user-configured maxima.
