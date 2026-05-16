@@ -421,15 +421,14 @@ class GazeStreamSmoother:
             entry["pitch_rad"] = self._filters[(eye, "pitch")](
                 entry["pitch_rad"], self._t,
             )
-            # Recompute derived dx/dy + magnitude after smoothing so the
-            # debug arrow + magnitude scalar stay consistent with the
-            # smoothed angles.
-            entry["dx"] = round(-math.sin(entry["yaw_rad"]), 4)
-            entry["dy"] = round(-math.sin(entry["pitch_rad"]), 4)
-            n = math.hypot(entry["dx"], entry["dy"])
-            if n > 1e-6:
-                entry["dx"] = round(entry["dx"] / n, 4)
-                entry["dy"] = round(entry["dy"] / n, 4)
+            # Bug-fix (May 2026): do NOT regenerate dx/dy from -sin(yaw).
+            # The iris-pixel-offset dx/dy assigned upstream in
+            # PoseAndFaceDetectionV2 (nodes.py around line 1620) is the
+            # screen-space ground truth and is what the renderer assumes.
+            # Overwriting it from smoothed yaw caused the gaze arrow to
+            # point opposite to the iris in debug images (user-reported).
+            # We still smooth yaw_rad / pitch_rad (used by downstream
+            # conditioning) but leave dx/dy intact.
             entry["magnitude"] = float(
                 math.hypot(entry["yaw_rad"], entry["pitch_rad"]),
             )

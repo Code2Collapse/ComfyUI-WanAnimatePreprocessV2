@@ -830,6 +830,70 @@ class OnnxDetectionModelLoaderV2:
     def loadmodel(self, vitpose_model, yolo_model, onnx_device):
         vitpose_model_path = folder_paths.get_full_path_or_raise("detection", vitpose_model)
         yolo_model_path = folder_paths.get_full_path_or_raise("detection", yolo_model)
+
+        # ─── Pre-flight: validate that each file has the expected input shape ──
+        # The detection pipeline hard-codes input sizes per role:
+        #   YOLO  → 640 × 640   (square person detector)
+        #   ViTPose → 256 × 192 (portrait pose-keypoint heatmap)
+        # When the user accidentally picks a ViTPose checkpoint for the YOLO
+        # slot (or vice-versa), onnxruntime raises a cryptic INVALID_ARGUMENT
+        # at first inference, several seconds into the workflow. We surface
+        # the mismatch up-front with a clear error, and auto-swap the picks
+        # if they look transposed.
+        import onnxruntime as _ort
+        import logging as _logging
+        _log = _logging.getLogger("WanAnimateV2.OnnxLoader")
+
+        def _peek_input_hw(path):
+            try:
+                sess = _ort.InferenceSession(path, providers=["CPUExecutionProvider"])
+                shp = sess.get_inputs()[0].shape
+                # ONNX shape is [N, C, H, W] — extract last two dims; cast str→None.
+                h = shp[-2] if isinstance(shp[-2], int) else None
+                w = shp[-1] if isinstance(shp[-1], int) else None
+                del sess
+                return h, w
+            except Exception as e:
+                _log.warning("Could not peek %s: %s", path, e)
+                return None, None
+
+        vp_h, vp_w = _peek_input_hw(vitpose_model_path)
+        yl_h, yl_w = _peek_input_hw(yolo_model_path)
+
+        looks_swapped = (
+            yl_h is not None and yl_w is not None
+            and (yl_h, yl_w) == (256, 192)
+            and (vp_h, vp_w) == (640, 640)
+        )
+        if looks_swapped:
+            _log.warning(
+                "Detection model picks look swapped: "
+                "vitpose_model=%r is 640x640 (YOLO shape), "
+                "yolo_model=%r is 256x192 (ViTPose shape). Auto-swapping.",
+                vitpose_model, yolo_model,
+            )
+            vitpose_model_path, yolo_model_path = yolo_model_path, vitpose_model_path
+            vp_h, vp_w, yl_h, yl_w = yl_h, yl_w, vp_h, vp_w
+
+        if yl_h is not None and yl_w is not None and (yl_h, yl_w) != (640, 640):
+            raise RuntimeError(
+                f"yolo_model {yolo_model!r} has ONNX input shape "
+                f"[N,C,{yl_h},{yl_w}], but the YOLO detection path expects "
+                f"[N,C,640,640]. Pick a real YOLO person-detector ONNX "
+                f"(e.g. yolov8n.onnx / yoloxpose-s.onnx). The file you "
+                f"selected looks like a pose model "
+                f"({'ViTPose' if (yl_h, yl_w) == (256, 192) else 'unknown'})."
+            )
+        if vp_h is not None and vp_w is not None and (vp_h, vp_w) != (256, 192):
+            raise RuntimeError(
+                f"vitpose_model {vitpose_model!r} has ONNX input shape "
+                f"[N,C,{vp_h},{vp_w}], but the ViTPose path expects "
+                f"[N,C,256,192]. Pick a real ViTPose ONNX "
+                f"(e.g. vitpose-h.onnx / vitpose-l.onnx). The file you "
+                f"selected looks like a "
+                f"{'YOLO detector' if (vp_h, vp_w) == (640, 640) else 'different model'}."
+            )
+
         vitpose = ViTPose(vitpose_model_path, onnx_device)
         yolo = Yolo(yolo_model_path, onnx_device)
         return ({"vitpose": vitpose, "yolo": yolo},)
@@ -1642,6 +1706,30 @@ class PoseAndFaceDetectionV2:
                         else:
                             e['dx'] = 0.0
                             e['dy'] = 0.0
+                        # One-shot diagnostic for first frame, both eyes:
+                        # writes iris pixel, eye centroid, and resulting
+                        # unit vector to a debug log so we can verify the
+                        # screen-space convention end-to-end. Tracked in
+                        # user memory `comfyui_workflow_rules.md` ("gaze
+                        # arrow direction" investigation, May 2026).
+                        if idx == 0:
+                            try:
+                                import os as _os
+                                _dbg_path = _os.path.join(
+                                    _os.path.dirname(__file__),
+                                    "_gaze_debug.log",
+                                )
+                                with open(_dbg_path, "a", encoding="utf-8") as _fh:
+                                    _fh.write(
+                                        f"frame=0 eye={eye_name} "
+                                        f"iris_px=({ipx:.1f},{ipy:.1f}) "
+                                        f"eye_centroid=({float(geo[0]):.1f},{float(geo[1]):.1f}) "
+                                        f"ddx={ddx:+.2f} ddy={ddy:+.2f} "
+                                        f"unit=({e['dx']:+.4f},{e['dy']:+.4f}) "
+                                        f"W={W} H={H}\n"
+                                    )
+                            except Exception:
+                                pass
                         e['magnitude'] = float(math.hypot(e['yaw_rad'], e['pitch_rad']))
                         iris_result[f'{eye_name}_gaze'] = e
                     iris_result['blendshapes'] = mp_result.get('blendshapes', {})
@@ -1757,8 +1845,11 @@ class PoseAndFaceDetectionV2:
                         e = fr[key]
                         e['yaw_rad'] = smoothed[side]['yaw_rad']
                         e['pitch_rad'] = smoothed[side]['pitch_rad']
-                        e['dx'] = smoothed[side]['dx']
-                        e['dy'] = smoothed[side]['dy']
+                        # Dead-code cleanup (May 2026): the smoother does
+                        # NOT touch dx/dy (see gaze_blendshape.step), so
+                        # reading smoothed[side]['dx'] used to KeyError
+                        # and silently fall into the outer except. Keep
+                        # dx/dy as set by the iris-pixel-offset path.
                         e['magnitude'] = smoothed[side]['magnitude']
             except Exception as _exc:
                 logging.getLogger(__name__).warning(
@@ -1782,18 +1873,15 @@ class PoseAndFaceDetectionV2:
                         continue
                     avg_yaw = 0.5 * (float(rg['yaw_rad']) + float(lg['yaw_rad']))
                     avg_pitch = 0.5 * (float(rg['pitch_rad']) + float(lg['pitch_rad']))
+                    # Bug-fix (May 2026): cross-eye yaw/pitch lock affects
+                    # downstream conditioning but MUST NOT touch dx/dy.
+                    # dx/dy were already set from real iris-pixel offset to
+                    # eye-centroid (screen-space ground truth); regenerating
+                    # them from -sin(blended_yaw) produced arrows pointing
+                    # opposite to the iris in debug overlays.
                     for e in (rg, lg):
                         e['yaw_rad']   = (1.0 - lock) * float(e['yaw_rad'])   + lock * avg_yaw
                         e['pitch_rad'] = (1.0 - lock) * float(e['pitch_rad']) + lock * avg_pitch
-                        dx = -math.sin(e['yaw_rad'])
-                        dy = -math.sin(e['pitch_rad'])
-                        n = math.hypot(dx, dy)
-                        if n > 1e-6:
-                            e['dx'] = round(dx / n, 4)
-                            e['dy'] = round(dy / n, 4)
-                        else:
-                            e['dx'] = 0.0
-                            e['dy'] = 0.0
                         e['magnitude'] = float(math.hypot(e['yaw_rad'], e['pitch_rad']))
 
         # Build per-frame iris output
