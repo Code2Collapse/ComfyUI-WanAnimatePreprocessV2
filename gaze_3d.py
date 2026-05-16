@@ -166,6 +166,34 @@ def estimate_head_pose_from_pixels(
     return R.astype(np.float64), tvec.astype(np.float64)
 
 
+def screen_dx_dy_from_camera_yaw_pitch(
+    yaw_rad: float, pitch_rad: float,
+) -> Tuple[float, float]:
+    """Render a CAMERA-frame (yaw, pitch) directly to screen-space dx/dy.
+
+    This is what L2CS-Net does in its own visualizer. The output gaze
+    vector in camera frame (OpenCV: +X right, +Y down, +Z into scene)
+    is:
+
+        vx = -sin(yaw)*cos(pitch)
+        vy = -sin(pitch)
+        vz = -cos(yaw)*cos(pitch)
+
+    so the in-plane projection is ``dx = vx, dy = vy``. Returns a unit
+    vector (``hypot(dx, dy) == 1``) unless the gaze is exactly along
+    the optical axis, in which case ``(0, 0)`` is returned.
+    """
+    cp = math.cos(pitch_rad)
+    sp = math.sin(pitch_rad)
+    sy = math.sin(yaw_rad)
+    dx = -sy * cp
+    dy = -sp
+    nrm = math.hypot(dx, dy)
+    if nrm < 1e-9:
+        return 0.0, 0.0
+    return dx / nrm, dy / nrm
+
+
 def world_gaze_from_eye_in_head(
     yaw_eye_rad: float,
     pitch_eye_rad: float,
@@ -174,51 +202,60 @@ def world_gaze_from_eye_in_head(
     """Compose an eye-in-head rotation with the head rotation and return
     both the world-frame yaw/pitch and the screen-space (dx, dy).
 
-    The eye direction in head frame. MediaPipe canonical face model has
-    +X to subject's LEFT, +Y UP, +Z OUT OF THE FACE (toward viewer when
-    the subject is facing the camera). Our sign convention is yaw>0 =
-    subject's right, pitch>0 = up. So:
+    MediaPipe canonical face model frame: +X to subject's LEFT, +Y UP,
+    +Z OUT OF THE FACE (toward the viewer when the subject is facing
+    the camera). Our sign convention is yaw>0 = subject's right and
+    pitch>0 = up. In the MODEL frame the eye gaze vector is therefore:
 
-        v_head = ( -sin(yaw), -sin(pitch), +cos(yaw)*cos(pitch) )
+        v_model = ( -sin(yaw)*cos(pitch),     # yaw>0 -> subject's right
+                    +sin(pitch),              # pitch>0 -> +Y_model (up)
+                    +cos(yaw)*cos(pitch) )    # forward -> +Z_model
 
-    Component-by-component: yaw>0 -> subject's right -> -X in model
-    (since +X is subject's LEFT). pitch>0 -> up in head -> +Y in model,
-    but we want pitch>0 to make dy<0 (arrow up in image, where +Y is
-    down), and ``R_head`` is a camera-frame matrix where +Y is image
-    DOWN, so flipping pitch sign here keeps everything consistent.
+    ``R_head`` from cv2.solvePnP maps model points to OpenCV CAMERA
+    frame (+X right, +Y down, +Z into scene). For a forward-facing
+    subject R_head ~ diag(1, -1, -1), which flips the Y and Z signs so
+    the camera-frame vector becomes
+    ``(-sin(yaw)*cos(pitch), -sin(pitch), -cos(yaw)*cos(pitch))``,
+    matching L2CS-Net's direct rendering formula. When ``R_head`` is
+    None we still want the SAME camera-frame output (so the function is
+    consistent with the L2CS direct path), so we apply that flip
+    explicitly.
 
     Returns
     -------
     ``(dx_screen, dy_screen, yaw_world_rad, pitch_world_rad)``
         ``dx``>0 = arrow tip drawn to image right, ``dy``>0 = drawn
         below the iris (OpenCV image-y convention).
+        ``yaw_world > 0`` = subject's right (== screen dx < 0).
+        ``pitch_world > 0`` = up (== screen dy < 0).
     """
     cy = math.cos(yaw_eye_rad)
     sy = math.sin(yaw_eye_rad)
     cp = math.cos(pitch_eye_rad)
     sp = math.sin(pitch_eye_rad)
-    v_head = np.asarray([-sy * cp, -sp, cy * cp], dtype=np.float64)
+    # MODEL frame: +Y up, +Z out of face. yaw>0 -> subject's right.
+    v_model = np.asarray([-sy * cp, sp, cy * cp], dtype=np.float64)
 
     if R_head is None:
-        v_cam = v_head
+        # Default "facing camera" rotation: model +X -> cam +X (subject's
+        # left = image right), model +Y -> cam -Y (up -> image up),
+        # model +Z -> cam -Z (out of face -> toward camera).
+        v_cam = np.asarray([v_model[0], -v_model[1], -v_model[2]], dtype=np.float64)
     else:
-        v_cam = R_head @ v_head
+        v_cam = R_head @ v_model
 
-    # Project onto image plane: positive image x = right, positive image
-    # y = down (OpenCV convention). v_cam already lives in that frame.
-    nrm = float(np.linalg.norm(v_cam[:2]))
-    if nrm < 1e-6:
+    # Project onto image plane (OpenCV: +x right, +y down).
+    nrm_xy = float(math.hypot(v_cam[0], v_cam[1]))
+    if nrm_xy < 1e-6:
         dx, dy = 0.0, 0.0
     else:
-        dx = float(v_cam[0] / nrm)
-        dy = float(v_cam[1] / nrm)
+        dx = float(v_cam[0] / nrm_xy)
+        dy = float(v_cam[1] / nrm_xy)
 
-    # World-frame yaw/pitch (useful for downstream consumers + Kalman).
-    # For a forward-facing subject with R_head = identity-ish, v_cam[2]
-    # is NEGATIVE (face-forward direction in camera frame points toward
-    # the camera = -Z). yaw>0 = subject's right; subject's right
-    # corresponds to image-left = -X in camera frame, so flip the sign
-    # on v_cam[0].
+    # World-frame yaw/pitch. Camera-frame forward gaze is -Z_cam, so a
+    # subject looking straight at the camera has v_cam ~ (0,0,-1) and
+    # yaw_world=pitch_world=0. yaw>0 (subject's right) gives
+    # v_cam[0]<0, so atan2(-vx, -vz) returns +yaw.
     xz = math.hypot(v_cam[0], v_cam[2])
     yaw_world = math.atan2(-v_cam[0], -v_cam[2])
     pitch_world = -math.atan2(v_cam[1], xz) if xz > 1e-9 else 0.0
@@ -313,6 +350,7 @@ __all__ = [
     "estimate_head_pose",
     "estimate_head_pose_from_pixels",
     "world_gaze_from_eye_in_head",
+    "screen_dx_dy_from_camera_yaw_pitch",
     "AngleKalman2D",
     "MP_PNP_INDICES",
 ]

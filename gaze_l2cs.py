@@ -80,32 +80,75 @@ def get_pipeline(variant: str = "gaze360"):
     try:
         from l2cs import Pipeline  # type: ignore
     except Exception as exc:  # noqa: BLE001
-        raise RuntimeError(
-            "l2cs python package not installed. Run:\n"
+        msg = (
+            "[gaze_l2cs] FAILED: l2cs python package not installed. Run:\n"
             "  pip install git+https://github.com/edavalosanaya/L2CS-Net.git@main"
-        ) from exc
+        )
+        print(msg, flush=True)
+        logger.error(msg)
+        raise RuntimeError(msg) from exc
 
     import torch  # type: ignore
 
     repo, fname = _WEIGHTS_HF[variant]
     weight_path = os.path.join(_gaze_dir(), fname)
     if not os.path.exists(weight_path):
+        print(
+            f"[gaze_l2cs] Weights NOT found at {weight_path} -- "
+            f"downloading from huggingface.co/{repo}/{fname} ...",
+            flush=True,
+        )
         try:
             from huggingface_hub import hf_hub_download  # type: ignore
         except Exception as exc:  # noqa: BLE001
-            raise RuntimeError(
-                "huggingface_hub not available; cannot auto-download L2CS "
-                f"weights. Place {fname} manually at {weight_path}."
-            ) from exc
-        logger.info("[gaze_l2cs] downloading %s/%s -> %s", repo, fname, weight_path)
-        weight_path = hf_hub_download(
-            repo_id=repo, filename=fname, local_dir=_gaze_dir(),
+            msg = (
+                "[gaze_l2cs] FAILED: huggingface_hub not available; cannot "
+                f"auto-download L2CS weights. Place {fname} manually at "
+                f"{weight_path}."
+            )
+            print(msg, flush=True)
+            logger.error(msg)
+            raise RuntimeError(msg) from exc
+        try:
+            weight_path = hf_hub_download(
+                repo_id=repo, filename=fname, local_dir=_gaze_dir(),
+            )
+        except Exception as exc:  # noqa: BLE001
+            msg = (
+                f"[gaze_l2cs] DOWNLOAD FAILED for {repo}/{fname}: {exc!r}. "
+                f"Check internet / HF_TOKEN / disk space. Falling back to "
+                f"blendshape_head_corrected engine."
+            )
+            print(msg, flush=True)
+            logger.error(msg)
+            raise RuntimeError(msg) from exc
+        try:
+            size_mb = os.path.getsize(weight_path) / (1024 * 1024)
+        except Exception:  # noqa: BLE001
+            size_mb = -1.0
+        print(
+            f"[gaze_l2cs] Downloaded OK ({size_mb:.1f} MB) -> {weight_path}",
+            flush=True,
         )
+    else:
+        print(f"[gaze_l2cs] Using cached weights: {weight_path}", flush=True)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    logger.info("[gaze_l2cs] init Pipeline(variant=%s, device=%s, weights=%s)",
-                variant, device, weight_path)
-    pipeline = Pipeline(weights=weight_path, arch="ResNet50", device=device)
+    print(
+        f"[gaze_l2cs] Initialising L2CS-Net pipeline "
+        f"(variant={variant}, device={device})",
+        flush=True,
+    )
+    try:
+        pipeline = Pipeline(weights=weight_path, arch="ResNet50", device=device)
+    except Exception as exc:  # noqa: BLE001
+        msg = (
+            f"[gaze_l2cs] PIPELINE INIT FAILED ({exc!r}); falling back to "
+            f"blendshape_head_corrected."
+        )
+        print(msg, flush=True)
+        logger.error(msg)
+        raise
     _PIPELINE_CACHE[variant] = pipeline
     return pipeline
 
@@ -117,21 +160,23 @@ def infer_frame(
 ) -> Optional[Tuple[float, float, float]]:
     """Run L2CS on a single RGB frame and return ``(yaw, pitch, conf)``.
 
-    The L2CS-Net ``Pipeline.step(frame)`` API runs a YOLOv8 face
-    detector and then estimates gaze for each detected face. We return
-    the primary (largest-bbox) face. Output ``yaw``/``pitch`` are in
-    radians. Returns ``None`` if no face was detected.
+    The L2CS-Net ``Pipeline.step(frame)`` API runs a RetinaFace detector
+    internally and then estimates gaze for each detected face. We
+    convert RGB->BGR (L2CS's internal detector expects OpenCV BGR), run
+    detection on the FULL frame (much more robust than feeding a tight
+    crop), and route to the primary face. If ``face_bbox`` is given,
+    pick the L2CS detection whose centre is closest to that bbox; else
+    pick the largest. Returns ``None`` if no face is detected.
 
     Parameters
     ----------
     pipeline
         From :func:`get_pipeline`.
     rgb_uint8
-        ``(H, W, 3)`` uint8 image (RGB).
+        ``(H, W, 3)`` uint8 image in RGB order (ComfyUI convention).
     face_bbox
-        Optional ``(x1, y1, x2, y2)`` in ``rgb_uint8`` coords. Unused
-        right now (L2CS pipeline detects faces itself), kept for
-        future per-face routing.
+        Optional ``(x1, y1, x2, y2)`` in ``rgb_uint8`` coords. If given,
+        used to route to the matching face when multiple are detected.
 
     Returns
     -------
@@ -140,27 +185,39 @@ def infer_frame(
     if rgb_uint8 is None or rgb_uint8.size == 0:
         return None
     try:
-        # L2CS step() returns a GazeResultContainer with arrays of
-        # per-face yaw/pitch/score/bbox.
-        results = pipeline.step(rgb_uint8)
+        import cv2  # type: ignore
+        bgr = cv2.cvtColor(rgb_uint8, cv2.COLOR_RGB2BGR)
+    except Exception:  # noqa: BLE001
+        bgr = rgb_uint8[..., ::-1].copy()
+    try:
+        results = pipeline.step(bgr)
     except Exception as exc:  # noqa: BLE001
         logger.debug("[gaze_l2cs] pipeline.step failed: %s", exc)
         return None
     if results is None:
         return None
-    yaws = getattr(results, "pitch", None)  # placeholder check; real attrs below
     yaws = getattr(results, "yaw", None)
     pitches = getattr(results, "pitch", None)
     if yaws is None or pitches is None or len(yaws) == 0:
         return None
 
-    # Pick the primary face: largest bbox if available, else first.
+    # Route to primary face.
     bboxes = getattr(results, "bboxes", None)
     idx = 0
     if bboxes is not None and len(bboxes) == len(yaws) and len(bboxes) > 1:
         try:
-            areas = [max(0, (b[2] - b[0])) * max(0, (b[3] - b[1])) for b in bboxes]
-            idx = int(np.argmax(areas))
+            if face_bbox is not None:
+                tx = 0.5 * (float(face_bbox[0]) + float(face_bbox[2]))
+                ty = 0.5 * (float(face_bbox[1]) + float(face_bbox[3]))
+                dists = []
+                for b in bboxes:
+                    bx = 0.5 * (float(b[0]) + float(b[2]))
+                    by = 0.5 * (float(b[1]) + float(b[3]))
+                    dists.append((bx - tx) ** 2 + (by - ty) ** 2)
+                idx = int(np.argmin(dists))
+            else:
+                areas = [max(0, (b[2] - b[0])) * max(0, (b[3] - b[1])) for b in bboxes]
+                idx = int(np.argmax(areas))
         except Exception:  # noqa: BLE001
             idx = 0
 
@@ -170,9 +227,10 @@ def infer_frame(
     except Exception:  # noqa: BLE001
         return None
 
-    # L2CS outputs are already in radians. Sign convention matches our
-    # spec: yaw>0 = subject's right, pitch>0 = up — verified against
-    # the upstream renderer in `l2cs.render`.
+    # L2CS-Net sign convention (verified against l2cs.utils.draw_gaze):
+    #   yaw  > 0 -> arrow drawn image-LEFT  (== subject's RIGHT gaze)
+    #   pitch> 0 -> arrow drawn image-UP    (== looking UP)
+    # which matches this package's convention exactly.
     scores = getattr(results, "scores", None)
     conf = 1.0
     if scores is not None and len(scores) > idx:
