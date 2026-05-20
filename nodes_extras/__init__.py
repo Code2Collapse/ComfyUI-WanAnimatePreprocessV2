@@ -15,6 +15,8 @@ from .iris_controlnet import WanIrisControlNetV2
 from .sh_lighting import WanSHLightingTransferV2
 from .expression_coeffs import WanExpressionCoefficientsV2
 from .quality_scorer_jitter import WanQualityScorerJitterV2
+from .face_expression_editor import WanFaceExpressionEditorV2
+from .face_expression_editor_ui import WanFaceExpressionEditorUI
 
 
 EXTRA_NODE_CLASS_MAPPINGS = {
@@ -23,6 +25,8 @@ EXTRA_NODE_CLASS_MAPPINGS = {
     "WanSHLightingTransferV2": WanSHLightingTransferV2,
     "WanExpressionCoefficientsV2": WanExpressionCoefficientsV2,
     "WanQualityScorerJitterV2": WanQualityScorerJitterV2,
+    "WanFaceExpressionEditorV2": WanFaceExpressionEditorV2,
+    "WanFaceExpressionEditorUI": WanFaceExpressionEditorUI,
 }
 
 EXTRA_NODE_DISPLAY_NAME_MAPPINGS = {
@@ -31,4 +35,6 @@ EXTRA_NODE_DISPLAY_NAME_MAPPINGS = {
     "WanSHLightingTransferV2": "Wan SH Lighting Transfer (V2)",
     "WanExpressionCoefficientsV2": "Wan Expression Coefficients (V2)",
     "WanQualityScorerJitterV2": "Wan Quality Scorer — Temporal Jitter (V2)",
+    "WanFaceExpressionEditorV2": "Wan Face Expression Editor — iBUG-68 Blend (V2, legacy LERP)",
+    "WanFaceExpressionEditorUI": "Wan Face Expression Editor — Delta + UI Overlay",
 }
