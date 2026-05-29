@@ -638,12 +638,21 @@ function buildOverlay(node) {
             "border-radius:3px;padding:1px 6px;cursor:pointer;font:11px ui-sans-serif;";
         return b;
     };
+    const btnPropagate  = _mkTlBtn("Δ off", "Δ propagate: when ON, dragging a face landmark or pose joint applies that edit as a DELTA to every frame in the selected range (or all frames if none selected). Lets you pose/express once and broadcast it.");
     const btnClearRange = _mkTlBtn("clear range", "Clear all overrides in the highlighted range (shift-click to set range).");
-    const btnClearAll   = _mkTlBtn("clear all",   "Clear ALL overrides (face / pose / gaze) across every frame.");
+    const btnClearAll   = _mkTlBtn("clear all",   "Clear ALL overrides (face / pose / gaze / Δ) across every frame.");
     const btnSelClear   = _mkTlBtn("✕", "Drop the current range selection.");
     btnSelClear.style.padding = "1px 5px";
-    tlBar.append(tlLegend, btnClearRange, btnClearAll, btnSelClear, tlInfo);
+    tlBar.append(tlLegend, btnPropagate, btnClearRange, btnClearAll, btnSelClear, tlInfo);
     root.appendChild(tlBar);
+
+    // ── Δ-propagation state (edit one frame → broadcast delta to a range) ─
+    // When `propagateMode` is on, a face/pose drag does NOT write a per-frame
+    // absolute override; instead it accumulates a DELTA into a `ranges`
+    // entry of the override JSON, which the python node applies across every
+    // frame in [start,end] (end = -1 ⇒ to last frame).  Mirrors the existing
+    // coefficient `ranges` contract but for raw landmark/joint XY.
+    let propagateMode = false;
 
     // Timeline state (Slice 3).
     let _tlRafPending = false;
@@ -668,6 +677,39 @@ function buildOverlay(node) {
         const n = Math.max(1, _frameCount());
         const t = (x - 2) / Math.max(1, W - 4);
         return Math.max(0, Math.min(n - 1, Math.round(t * Math.max(1, n - 1))));
+    }
+    // ── Δ-propagation helpers ──────────────────────────────────────────
+    // Active broadcast range: the timeline selection if present, else
+    // [0, -1] meaning "every frame" (python resolves -1 → last frame).
+    function _propRange() {
+        const r = _tlRange();
+        return r ? [r[0], r[1]] : [0, -1];
+    }
+    // Find (or create) the ranges[] entry matching [s,e]; returns its delta map.
+    function _ensureRangeEntry(ov, s, e) {
+        if (!Array.isArray(ov.ranges)) ov.ranges = [];
+        let entry = ov.ranges.find(en => en && Number(en.start) === s && Number(en.end) === e);
+        if (!entry) { entry = { start: s, end: e, delta: {} }; ov.ranges.push(entry); }
+        if (!entry.delta || typeof entry.delta !== "object") entry.delta = {};
+        return entry;
+    }
+    // Accumulated Δ for landmark/joint `idx` on frame `f` across all ranges
+    // that cover it.  Used by the renderers so the propagated edit is shown
+    // on every covered frame (incl. the one being dragged).
+    function _accumRangeDelta(ov, idx, f) {
+        let dx = 0, dy = 0;
+        const N = _frameCount();
+        const ranges = Array.isArray(ov.ranges) ? ov.ranges : [];
+        for (const en of ranges) {
+            if (!en || !en.delta) continue;
+            const s = Math.max(0, Number(en.start) || 0);
+            let e = Number(en.end);
+            if (!(e >= 0)) e = Math.max(0, N - 1);
+            if (f < s || f > e) continue;
+            const d = en.delta[String(idx)];
+            if (Array.isArray(d) && d.length === 2) { dx += Number(d[0]) || 0; dy += Number(d[1]) || 0; }
+        }
+        return [dx, dy];
     }
     function _editFlagsForFrame(f) {
         // Returns {face, pose, gaze} booleans for frame f.
@@ -767,6 +809,7 @@ function buildOverlay(node) {
         state.frame = f;
         slider.value = String(f);
         frameLbl.textContent = `frame ${f} / ${slider.max}`;
+        _refreshPropBtn();
         draw(); drawPose(); drawTimeline();
     });
     tl.addEventListener("mousemove", (ev) => {
@@ -802,10 +845,29 @@ function buildOverlay(node) {
         if (o3.frames?.[k]) { delete o3.frames[k]; writeGazeOverrides(node, o3); touched = true; }
         return touched;
     }
+    // Drop any ranges[] entries whose [start,end] intersects [a,b].
+    function _stripRangesIntersecting(ov, a, b) {
+        if (!Array.isArray(ov.ranges) || !ov.ranges.length) return false;
+        const N = _frameCount();
+        const before = ov.ranges.length;
+        ov.ranges = ov.ranges.filter(en => {
+            if (!en) return false;
+            const s = Math.max(0, Number(en.start) || 0);
+            let e = Number(en.end);
+            if (!(e >= 0)) e = Math.max(0, N - 1);
+            return e < a || s > b;   // keep only entries that do NOT overlap
+        });
+        return ov.ranges.length !== before;
+    }
     btnClearRange.addEventListener("click", () => {
         const range = _tlRange();
         if (!range) { tlInfo.textContent = "select a range first (shift-click)"; return; }
         for (let f = range[0]; f <= range[1]; f++) _clearFrame(f);
+        // Also drop Δ-propagation entries that overlap the cleared range.
+        const ofa = parseOverrides(node);
+        if (_stripRangesIntersecting(ofa, range[0], range[1])) writeOverrides(node, ofa);
+        const opo = parsePoseOverrides(node);
+        if (_stripRangesIntersecting(opo, range[0], range[1])) writePoseOverrides(node, opo);
         draw(); drawPose(); drawTimeline();
     });
     btnClearAll.addEventListener("click", () => {
@@ -817,7 +879,30 @@ function buildOverlay(node) {
     });
     btnSelClear.addEventListener("click", () => {
         tlstate.selA = tlstate.selB = -1;
+        _refreshPropBtn();
         drawTimeline();
+    });
+
+    function _refreshPropBtn() {
+        const r = _tlRange();
+        if (!propagateMode) {
+            btnPropagate.textContent = "Δ off";
+            btnPropagate.style.background = "#2a2a35";
+            btnPropagate.style.color = C.text;
+            btnPropagate.style.fontWeight = "normal";
+        } else {
+            btnPropagate.textContent = r ? `Δ sel[${r[0]}..${r[1]}]` : "Δ all";
+            btnPropagate.style.background = C.accent;
+            btnPropagate.style.color = "#11111a";
+            btnPropagate.style.fontWeight = "bold";
+        }
+    }
+    btnPropagate.addEventListener("click", () => {
+        propagateMode = !propagateMode;
+        _refreshPropBtn();
+        statusEl.textContent = propagateMode
+            ? "Δ propagate ON — drag a point to broadcast that edit across the active range"
+            : "Δ propagate OFF — drags edit only the current frame";
     });
 
     // ── Pose canvas (Slice 1) ─────────────────────────────────────────
@@ -898,6 +983,19 @@ function buildOverlay(node) {
         if (!fr || !fr.ok || !Array.isArray(fr.kps)) return null;
         const out = fr.kps.map(p => Array.isArray(p) ? [p[0], p[1]] : null);
         const ov = parsePoseOverrides(node);
+        // Δ-propagation: add range deltas (image-norm) BEFORE per-frame pins.
+        if (Array.isArray(ov.ranges) && ov.ranges.length) {
+            for (let i = 0; i < out.length; i++) {
+                if (!out[i]) continue;
+                const [dx, dy] = _accumRangeDelta(ov, i, f);
+                if (dx || dy) {
+                    out[i] = [
+                        Math.max(0, Math.min(1, out[i][0] + dx)),
+                        Math.max(0, Math.min(1, out[i][1] + dy)),
+                    ];
+                }
+            }
+        }
         const f_ov = ov.frames?.[String(f)];
         if (f_ov) {
             for (const [k, v] of Object.entries(f_ov)) {
@@ -1056,6 +1154,17 @@ function buildOverlay(node) {
         const [mx, my] = _poseClientToCanvas(ev);
         pstate.dragJ = _pickJoint(mx, my);
         if (pstate.dragJ >= 0) {
+            if (propagateMode) {
+                const ref = _bodyKpsForFrame(state.frame)[pstate.dragJ] || [0, 0];
+                pstate._dragRef = [ref[0], ref[1]];
+                const [s, e] = _propRange();
+                pstate._dragRange = [s, e];
+                const ov = parsePoseOverrides(node);
+                const entry = _ensureRangeEntry(ov, s, e);
+                const cur = entry.delta[String(pstate.dragJ)];
+                pstate._dragBase = (Array.isArray(cur) && cur.length === 2)
+                    ? [Number(cur[0]) || 0, Number(cur[1]) || 0] : [0, 0];
+            }
             ev.stopPropagation(); ev.preventDefault();
             drawPose();
         }
@@ -1065,6 +1174,20 @@ function buildOverlay(node) {
         if (pstate.dragJ >= 0) {
             const [xn, yn] = _poseCanvasToNorm(mx, my);
             const ov = parsePoseOverrides(node);
+            if (propagateMode) {
+                const [s, e] = pstate._dragRange || _propRange();
+                const ref = pstate._dragRef || [xn, yn];
+                const base = pstate._dragBase || [0, 0];
+                const entry = _ensureRangeEntry(ov, s, e);
+                entry.delta[String(pstate.dragJ)] = [
+                    Number((base[0] + (xn - ref[0])).toFixed(5)),
+                    Number((base[1] + (yn - ref[1])).toFixed(5)),
+                ];
+                writePoseOverrides(node, ov);
+                drawPose();
+                ev.stopPropagation();
+                return;
+            }
             const key = String(state.frame);
             if (!ov.frames[key]) ov.frames[key] = {};
             ov.frames[key][String(pstate.dragJ)] = [
@@ -1154,6 +1277,14 @@ function buildOverlay(node) {
         }
         // Apply existing overrides for this frame.
         const ov = parseOverrides(node);
+        // Δ-propagation: add range deltas (bbox-norm) BEFORE per-frame pins
+        // so an explicit per-frame edit always wins (matches python order).
+        if (Array.isArray(ov.ranges) && ov.ranges.length) {
+            for (let i = 0; i < lms.length; i++) {
+                const [dx, dy] = _accumRangeDelta(ov, i, f);
+                if (dx || dy) { lms[i][0] += dx; lms[i][1] += dy; }
+            }
+        }
         const fr = ov.frames?.[String(f)];
         if (fr) {
             for (const [k, v] of Object.entries(fr)) {
@@ -1393,6 +1524,19 @@ function buildOverlay(node) {
         }
         state.dragLm = pickLandmark(mx, my);
         if (state.dragLm >= 0) {
+            if (propagateMode) {
+                // Capture the displayed reference position + the active range
+                // entry's current delta so we can broadcast cursor motion as Δ.
+                const ref = landmarksForFrame(state.frame)[state.dragLm];
+                state._dragRef = [ref[0], ref[1]];
+                const [s, e] = _propRange();
+                state._dragRange = [s, e];
+                const ov = parseOverrides(node);
+                const entry = _ensureRangeEntry(ov, s, e);
+                const cur = entry.delta[String(state.dragLm)];
+                state._dragBase = (Array.isArray(cur) && cur.length === 2)
+                    ? [Number(cur[0]) || 0, Number(cur[1]) || 0] : [0, 0];
+            }
             ev.stopPropagation();
             ev.preventDefault();
         }
@@ -1415,6 +1559,22 @@ function buildOverlay(node) {
         if (state.dragLm >= 0) {
             const [xn, yn] = canvasToNorm(mx, my, cvs.width, cvs.height);
             const ov = parseOverrides(node);
+            if (propagateMode) {
+                // Broadcast: write a Δ into the active range entry so the
+                // dragged point tracks the cursor on every covered frame.
+                const [s, e] = state._dragRange || _propRange();
+                const ref = state._dragRef || [xn, yn];
+                const base = state._dragBase || [0, 0];
+                const entry = _ensureRangeEntry(ov, s, e);
+                entry.delta[String(state.dragLm)] = [
+                    Number((base[0] + (xn - ref[0])).toFixed(4)),
+                    Number((base[1] + (yn - ref[1])).toFixed(4)),
+                ];
+                writeOverrides(node, ov);
+                draw();
+                ev.stopPropagation();
+                return;
+            }
             const key = String(state.frame);
             if (!ov.frames[key]) ov.frames[key] = {};
             ov.frames[key][String(state.dragLm)] = [
