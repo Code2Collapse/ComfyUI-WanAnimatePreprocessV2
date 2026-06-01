@@ -1277,6 +1277,8 @@ class PoseAndFaceDetectionV2:
                 "gaze_kalman_meas_std_deg": ("FLOAT", {"default": 3.0, "min": 0.1, "max": 20.0, "step": 0.1, "tooltip": "Kalman measurement noise (degrees). Higher = trust the model less and lean on the velocity model more — smoother. Used by blendshape_head_corrected and l2cs_* engines."}),
                 "gaze_kalman_process_std": ("FLOAT", {"default": 0.8, "min": 0.05, "max": 5.0, "step": 0.05, "tooltip": "Kalman process noise (rad/s). Roughly the expected saccade velocity scale. Higher = filter reacts faster to genuine motion but jitters more."}),
                 "gaze_fps": ("FLOAT", {"default": 30.0, "min": 1.0, "max": 240.0, "step": 1.0, "tooltip": "Video fps used by the Kalman dt. Set to match your source clip; affects velocity coupling, not absolute angles."}),
+                # C0.1 — per-frame iris repaint at gaze-corrected position.
+                "apply_gaze_to_face_image": (["off", "overlay", "replace"], {"default": "off", "tooltip": "C0.1: After gaze is computed, optionally stamp a synthetic iris disk into each 512x512 face crop at the gaze-corrected position so the face-encoder input visually matches the gaze the sampler will follow. 'off' = leave face_images untouched (default). 'overlay' = draw a dark iris disk at the new position WITHOUT erasing the original iris (cheap, useful when blending). 'replace' = paint over the original iris with eye-white first, then draw the new dark iris. Shift magnitude scales with the per-eye iris radius and the engine's magnitude_norm. Failures are non-fatal: a warning is logged and face_images is preserved."}),
             },
             "optional": {
                 "bbox_override": ("BBOX", {"tooltip": "Optional external BBOX for the frame-0 anchor. Highest priority; overrides frame0_cx/cy/size widgets."}),
@@ -1348,6 +1350,7 @@ class PoseAndFaceDetectionV2:
         eye_align_mode="default",
         eye_y_fraction=0.30,
         face_cfg_scale=1.0,
+        apply_gaze_to_face_image="off",
         bbox_override=None,
     ):
         detector = model["yolo"]
@@ -2374,6 +2377,65 @@ class PoseAndFaceDetectionV2:
                 logging.getLogger(__name__).warning(
                     "gaze_engine=ethxgaze post-process failed (%s); "
                     "keeping previous engine output.", _exc,
+                )
+
+        # C0.1: Per-frame iris repaint at gaze-corrected position.
+        # When apply_gaze_to_face_image != "off", stamp a synthetic iris
+        # disk into each 512x512 face crop at the position implied by the
+        # corrected gaze unit vector. Mutates face_images_np in place
+        # (face_images_tensor shares memory). Failures are non-fatal.
+        _gaze_paint_mode = str(apply_gaze_to_face_image or "off").strip().lower()
+        if _gaze_paint_mode in ("overlay", "replace") and face_images_np.size > 0:
+            try:
+                _is_float = np.issubdtype(face_images_np.dtype, np.floating)
+                _IRIS_COLOR = (0.16, 0.16, 0.16) if _is_float else (40, 40, 40)
+                _EYE_WHITE  = (0.92, 0.91, 0.88) if _is_float else (235, 232, 225)
+                _GAIN = 3.0   # multiples of iris radius per unit magnitude_norm
+                _n = min(face_images_np.shape[0], len(all_iris), len(face_bboxes))
+                for _idx in range(_n):
+                    _bb = face_bboxes[_idx]
+                    if _bb is None:
+                        continue
+                    _x1, _x2, _y1, _y2 = _bb
+                    _cw = max(1, int(_x2) - int(_x1))
+                    _ch = max(1, int(_y2) - int(_y1))
+                    _sx = 512.0 / float(_cw)
+                    _sy = 512.0 / float(_ch)
+                    _crop = face_images_np[_idx]   # view (512,512,C)
+                    _it = all_iris[_idx]
+                    for _eye in ("right", "left"):
+                        _iris = _it.get(f"{_eye}_iris") if isinstance(_it, dict) else None
+                        _gaze = _it.get(f"{_eye}_gaze") if isinstance(_it, dict) else None
+                        if not _iris or not _gaze:
+                            continue
+                        _ipx = float(_iris.get("x", 0.0))
+                        _ipy = float(_iris.get("y", 0.0))
+                        _ir  = float(_iris.get("radius", 4.0))
+                        _dx  = float(_gaze.get("dx", 0.0))
+                        _dy  = float(_gaze.get("dy", 0.0))
+                        _mn  = float(_gaze.get("magnitude_norm", 0.0))
+                        _cx0 = int(round((_ipx - float(_x1)) * _sx))
+                        _cy0 = int(round((_ipy - float(_y1)) * _sy))
+                        _cr  = max(2, int(round(_ir * 0.5 * (_sx + _sy))))
+                        _shift = _cr * _GAIN * _mn
+                        _cx1 = int(round(_cx0 + _dx * _shift))
+                        _cy1 = int(round(_cy0 + _dy * _shift))
+                        # Clamp to crop interior.
+                        _cx0 = max(_cr, min(511 - _cr, _cx0))
+                        _cy0 = max(_cr, min(511 - _cr, _cy0))
+                        _cx1 = max(_cr, min(511 - _cr, _cx1))
+                        _cy1 = max(_cr, min(511 - _cr, _cy1))
+                        if _gaze_paint_mode == "replace":
+                            cv2.circle(_crop, (_cx0, _cy0), _cr, _EYE_WHITE, -1, lineType=cv2.LINE_AA)
+                        cv2.circle(_crop, (_cx1, _cy1), _cr, _IRIS_COLOR, -1, lineType=cv2.LINE_AA)
+                # face_images_tensor shares memory with face_images_np;
+                # rebind defensively in case cv2 returned a new array.
+                face_images_tensor = torch.from_numpy(face_images_np)
+            except Exception as _exc:                                    # noqa: BLE001
+                logging.getLogger(__name__).warning(
+                    "apply_gaze_to_face_image=%s failed (%s); "
+                    "leaving face_images unmodified.",
+                    _gaze_paint_mode, _exc,
                 )
 
         # --- Debug visualisation ---
