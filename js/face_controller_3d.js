@@ -1037,6 +1037,11 @@ function buildOverlay(node) {
                     tx:    _wRead("head_tx"),
                     ty:    _wRead("head_ty"),
                     tz:    _wRead("head_tz"),
+                    // Phase 1.A extra DOF — Face Director real-time editor.
+                    scale:      _wRead("head_scale"),
+                    jaw:        _wRead("jaw_rot_deg"),
+                    neck_yaw:   _wRead("neck_yaw_deg"),
+                    neck_pitch: _wRead("neck_pitch_deg"),
                 }),
                 setHeadPose: (partial) => {
                     if (partial.yaw   !== undefined) _wWrite("head_yaw_deg",   partial.yaw);
@@ -1045,6 +1050,10 @@ function buildOverlay(node) {
                     if (partial.tx    !== undefined) _wWrite("head_tx",   partial.tx);
                     if (partial.ty    !== undefined) _wWrite("head_ty",   partial.ty);
                     if (partial.tz    !== undefined) _wWrite("head_tz",   partial.tz);
+                    if (partial.scale      !== undefined) _wWrite("head_scale",     partial.scale);
+                    if (partial.jaw        !== undefined) _wWrite("jaw_rot_deg",    partial.jaw);
+                    if (partial.neck_yaw   !== undefined) _wWrite("neck_yaw_deg",   partial.neck_yaw);
+                    if (partial.neck_pitch !== undefined) _wWrite("neck_pitch_deg", partial.neck_pitch);
                 },
                 onClose: () => {
                     _fc3dEditor = null;

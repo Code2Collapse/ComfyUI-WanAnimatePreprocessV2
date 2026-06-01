@@ -352,6 +352,138 @@ def _apply_head_translation(
     return out
 
 
+# ----------------------------------------------------------------------
+# Additional rigid-edit helpers (head_scale, jaw rotation, neck rotation)
+# Plan ref: Phase 1.A — 4 new DOF for Face Director real-time editor.
+# ----------------------------------------------------------------------
+def _apply_head_scale(xy_norm: np.ndarray, scale: float) -> np.ndarray:
+    """Uniformly scale the 68 landmarks around the face centroid.
+
+    Distinct from `head_tz` which uses a perspective-style ``1/(1+tz)``
+    factor; `head_scale` is a direct linear multiplier (1.0 = no-op,
+    >1.0 = bigger face, <1.0 = smaller face). Clamped to [0.25, 4.0] so
+    the face never collapses to a point or explodes.
+    """
+    if abs(scale - 1.0) < 1e-4:
+        return xy_norm
+    s = float(np.clip(scale, 0.25, 4.0))
+    cx = float(xy_norm[:, 0].mean())
+    cy = float(xy_norm[:, 1].mean())
+    out = xy_norm.copy()
+    out[:, 0] = (out[:, 0] - cx) * s + cx
+    out[:, 1] = (out[:, 1] - cy) * s + cy
+    return out
+
+
+# iBUG-68 jaw region is landmarks 0..16 (the chin contour). The jaw
+# "hinge" sits roughly at the two outermost jaw points (0 and 16). We
+# rotate jaw landmarks 5..11 (the lower-chin arc) about the midpoint of
+# 0-16 to simulate jaw open/close. Positive jaw_rot_deg = open (chin
+# down in image), negative = close.
+_JAW_HINGE_LEFT_IDX  = 0
+_JAW_HINGE_RIGHT_IDX = 16
+_JAW_LOWER_IDX       = tuple(range(5, 12))   # 5..11 — the bottom arc
+# Mouth lower also follows the jaw a bit (50% weight) so closing the
+# jaw closes the lips realistically. Indices 56..58 = lower-lip outer,
+# 65..67 = lower-lip inner.
+_JAW_FOLLOW_MOUTH_IDX = (56, 57, 58, 65, 66, 67)
+
+
+def _apply_jaw_rotation(xy_norm: np.ndarray, jaw_deg: float) -> np.ndarray:
+    """Rotate the lower-jaw landmarks about the ear-to-ear hinge.
+
+    Models jaw open/close as a 2D rotation in image space (since the
+    hinge axis is essentially the line through the two ears, and we
+    don't have separate 3D depth for the jaw region beyond the canonical
+    model). Positive = open. Clamped to ±25° (anatomical limit for a
+    healthy adult ~45° max, we cap at 25 to stay visually plausible).
+    """
+    if abs(jaw_deg) < 1e-3:
+        return xy_norm
+    deg = float(np.clip(jaw_deg, -25.0, 25.0))
+    rad = math.radians(deg)
+    cos_t = math.cos(rad)
+    sin_t = math.sin(rad)
+    hx = 0.5 * float(xy_norm[_JAW_HINGE_LEFT_IDX, 0] + xy_norm[_JAW_HINGE_RIGHT_IDX, 0])
+    hy = 0.5 * float(xy_norm[_JAW_HINGE_LEFT_IDX, 1] + xy_norm[_JAW_HINGE_RIGHT_IDX, 1])
+    out = xy_norm.copy()
+    for idx in _JAW_LOWER_IDX:
+        dx = float(out[idx, 0]) - hx
+        dy = float(out[idx, 1]) - hy
+        out[idx, 0] = hx + dx * cos_t - dy * sin_t
+        out[idx, 1] = hy + dx * sin_t + dy * cos_t
+    # Lower-lip points follow the jaw at half weight so mouth tracks.
+    half = 0.5
+    for idx in _JAW_FOLLOW_MOUTH_IDX:
+        dx = float(out[idx, 0]) - hx
+        dy = float(out[idx, 1]) - hy
+        rx = hx + dx * cos_t - dy * sin_t
+        ry = hy + dx * sin_t + dy * cos_t
+        out[idx, 0] = float(out[idx, 0]) * (1.0 - half) + rx * half
+        out[idx, 1] = float(out[idx, 1]) * (1.0 - half) + ry * half
+    return out
+
+
+def _apply_neck_rotation_body(
+    body_xy: np.ndarray,
+    yaw_deg: float,
+    pitch_deg: float,
+) -> np.ndarray:
+    """Rotate the head-cluster body keypoints about the neck joint.
+
+    Operates on the OpenPose-18 keypoint layout (see _POSE18_JOINT_NAMES_UI):
+      neck         = idx 1  (rotation pivot)
+      nose         = idx 0
+      reye/leye    = idx 14, 15
+      rear/lear    = idx 16, 17
+
+    Positive yaw   → subject turns head to their LEFT (image right).
+    Positive pitch → subject looks UP (chin lifts; head-cluster Y
+                     decreases in image coords).
+    Clamped to ±60° yaw / ±45° pitch (anatomical comfort range).
+
+    Returns a NEW (18, 2) array (NaN values for missing joints are
+    preserved unchanged). Skips the rotation if both inputs are ~0.
+    """
+    if abs(yaw_deg) < 1e-3 and abs(pitch_deg) < 1e-3:
+        return body_xy
+    if body_xy is None or body_xy.shape[0] < 18:
+        return body_xy
+    yaw   = math.radians(float(np.clip(yaw_deg,   -60.0,  60.0)))
+    pitch = math.radians(float(np.clip(pitch_deg, -45.0,  45.0)))
+    # 2D approximation: yaw shrinks horizontal offset by cos(yaw);
+    # pitch shifts vertical offset by sin(pitch) * neck-to-joint distance.
+    # This is the same orthographic-projection trick as _apply_head_rotation
+    # but with NO canonical z (the head cluster has no per-joint z map),
+    # so yaw becomes a pure horizontal scale about the neck and pitch
+    # becomes a vertical translation proportional to the distance from
+    # the neck. Visually identical to a small head rotation for the
+    # range we allow.
+    neck = body_xy[1]
+    if np.isnan(neck[0]) or np.isnan(neck[1]):
+        return body_xy
+    nx, ny = float(neck[0]), float(neck[1])
+    out = body_xy.copy()
+    head_cluster = (0, 14, 15, 16, 17)
+    cos_y = math.cos(yaw)
+    sin_p = math.sin(pitch)
+    cos_p = math.cos(pitch)
+    for idx in head_cluster:
+        x, y = float(out[idx, 0]), float(out[idx, 1])
+        if np.isnan(x) or np.isnan(y):
+            continue
+        dx = x - nx
+        dy = y - ny
+        # Yaw scales x about neck; pitch rotates dy upward (subject looks
+        # up = chin lifts = head-cluster Y decreases since image Y grows
+        # downward, so we subtract sin_p * (-dy) ≈ +sin_p * dy).
+        new_dx = dx * cos_y
+        new_dy = dy * cos_p - sin_p * abs(dy)  # pitch lifts head up
+        out[idx, 0] = nx + new_dx
+        out[idx, 1] = ny + new_dy
+    return out
+
+
 def _propagate_head_overrides(
     base: Dict[int, Dict[str, float]],
     n_frames: int,
@@ -488,7 +620,11 @@ def _apply_head_rotation(
 # ----------------------------------------------------------------------
 # Pose-JSON parsing
 # ----------------------------------------------------------------------
-_POSE_KEYS = ("yaw", "pitch", "roll", "tx", "ty", "tz")
+# Plan ref: Phase 1.A — added "scale" (head_scale), "jaw" (jaw_rot_deg),
+# "nyaw"/"npitch" (neck yaw/pitch) so per-frame JSON pins can drive
+# every DOF the widgets expose.
+_POSE_KEYS = ("yaw", "pitch", "roll", "tx", "ty", "tz",
+              "scale", "jaw", "nyaw", "npitch")
 _GAZE_KEYS = ("yaw", "pitch")
 
 
@@ -777,6 +913,32 @@ class WanFaceController3DV2:
                     "default": 0.0, "min": -0.75, "max": 3.0, "step": 0.01,
                     "tooltip": "Depth shift: + pushes the face away (smaller), - brings it forward (larger).",
                 }),
+                # ── (3d) Extra DOF for Face Director real-time editor (Phase 1.A) ──
+                # head_scale is a direct uniform multiplier around the face
+                # centroid (distinct from tz which simulates depth via
+                # 1/(1+tz)). 1.0 = no-op. Clamped to [0.25, 4.0].
+                "head_scale": ("FLOAT", {
+                    "default": 1.0, "min": 0.25, "max": 4.0, "step": 0.01,
+                    "tooltip": "Uniform face scale around centroid (1.0 = no-op). Distinct from head_tz which is perspective-style.",
+                }),
+                # jaw_rot_deg rotates the lower-jaw landmarks (5..11) +
+                # follows the lower lip about the ear-to-ear hinge.
+                # Positive = mouth opens. Clamped ±25°.
+                "jaw_rot_deg": ("FLOAT", {
+                    "default": 0.0, "min": -25.0, "max": 25.0, "step": 0.25,
+                    "tooltip": "Jaw rotation about the ear-to-ear hinge (+ opens mouth, - closes).",
+                }),
+                # Neck rotation operates on the body keypoints (OpenPose-18),
+                # not the face landmarks — rotates the head cluster
+                # (nose+eyes+ears) about the neck joint.
+                "neck_yaw_deg": ("FLOAT", {
+                    "default": 0.0, "min": -60.0, "max": 60.0, "step": 0.5,
+                    "tooltip": "Neck yaw applied to body keypoints (head cluster rotates about neck). + = subject's left.",
+                }),
+                "neck_pitch_deg": ("FLOAT", {
+                    "default": 0.0, "min": -45.0, "max": 45.0, "step": 0.5,
+                    "tooltip": "Neck pitch applied to body keypoints (+ = chin up).",
+                }),
                 # ── (3c) Rigid-pose propagation across the timeline ──
                 "propagate_head": (["off", "hold_last", "interpolate", "broadcast_first"], {
                     "default": "off",
@@ -864,6 +1026,10 @@ class WanFaceController3DV2:
             head_tx: float = 0.0,
             head_ty: float = 0.0,
             head_tz: float = 0.0,
+            head_scale: float = 1.0,
+            jaw_rot_deg: float = 0.0,
+            neck_yaw_deg: float = 0.0,
+            neck_pitch_deg: float = 0.0,
             propagate_head: str = "off",
             propagate_gaze: str = "off",
             gaze_json: str = "",
@@ -1007,9 +1173,39 @@ class WanFaceController3DV2:
                 n_rotated += 1  # counted under rigid edits
                 changed = True
 
+            # (3c) Head uniform scale around face centroid (linear,
+            # non-perspective). Distinct from tz.
+            hs = float(head_scale) * float(h_entry.get("scale", 1.0)) \
+                if "scale" in h_entry else float(head_scale)
+            if abs(hs - 1.0) > 1e-4:
+                xy_norm = _apply_head_scale(xy_norm, hs)
+                n_rotated += 1
+                changed = True
+
+            # (3d) Jaw rotation about ear-to-ear hinge.
+            jaw = float(jaw_rot_deg) + float(h_entry.get("jaw", 0.0))
+            if abs(jaw) > 1e-3:
+                xy_norm = _apply_jaw_rotation(xy_norm, jaw)
+                n_rotated += 1
+                changed = True
+
             if changed:
                 _write_face_normalised(meta, xy_norm.astype(np.float32))
                 affected += 1
+
+            # (3e) Neck rotation — affects BODY keypoints, not face
+            # landmarks. Applied AFTER the face write so that
+            # subsequent overlay rendering picks up both edits. Per-frame
+            # additive overrides under "nyaw"/"npitch" in head_pose_json
+            # are honoured.
+            nyaw = float(neck_yaw_deg)   + float(h_entry.get("nyaw",   0.0))
+            npitch = float(neck_pitch_deg) + float(h_entry.get("npitch", 0.0))
+            if abs(nyaw) > 1e-3 or abs(npitch) > 1e-3:
+                body_xy = _get_body_kps(meta)
+                if body_xy is not None:
+                    body_new = _apply_neck_rotation_body(body_xy, nyaw, npitch)
+                    _set_body_kps(meta, body_new)
+                    n_rotated += 1
 
             # (4) Gaze — operates on iris_data, independent of landmark
             # writes. Compute eye dimensions from the (potentially updated)
@@ -1043,6 +1239,10 @@ class WanFaceController3DV2:
             "constant_translation": {"tx": float(head_tx),
                                       "ty": float(head_ty),
                                       "tz": float(head_tz)},
+            "constant_extras": {"head_scale":   float(head_scale),
+                                 "jaw_rot_deg":  float(jaw_rot_deg),
+                                 "neck_yaw_deg": float(neck_yaw_deg),
+                                 "neck_pitch_deg": float(neck_pitch_deg)},
             "propagate_mode": str(propagate_head),
             "per_frame": {str(k): v for k, v in head_overrides.items()},
         }
