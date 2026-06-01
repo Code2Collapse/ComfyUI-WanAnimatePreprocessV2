@@ -1273,7 +1273,7 @@ class PoseAndFaceDetectionV2:
                 "eye_y_fraction": ("FLOAT", {"default": 0.30, "min": 0.10, "max": 0.60, "step": 0.01, "tooltip": "Target eye row as a fraction of crop height (0.30 = upper third). Only used when eye_align_mode = 'eye_upper_third'."}),
                 "face_cfg_scale": ("FLOAT", {"default": 1.0, "min": 1.0, "max": 10.0, "step": 0.1, "tooltip": "Wan-Animate paper recommendation #3 (paper section 4.3): CFG on the face conditioning input gives finer control over expression / gaze when finer reenactment is desired. This widget is a passthrough -- wire the FLOAT output 'face_cfg_scale' into your Wan-Animate sampler's face CFG input. 1.0 = CFG disabled (default, fastest). 2.0-4.0 = stronger expression adherence. >5.0 may over-saturate."}),
                 # ---- Gaze engine selector + Kalman tuning (appended at end for back-compat with saved workflows) ----
-                "gaze_engine": (["blendshape_head_corrected", "blendshape_only", "l2cs_gaze360", "l2cs_mpiigaze", "pose_normalized_resnet50"], {"default": "blendshape_head_corrected", "tooltip": "Per-eye gaze yaw/pitch engine.\n\n* blendshape_head_corrected (DEFAULT, recommended): MediaPipe ARKit blend shapes + solvePnP head pose + Kalman temporal smoother. Eye-in-head rotation is composed with the head rotation so the rendered arrow tracks rotated heads. Pure numpy + cv2, no downloads.\n* blendshape_only: legacy May-2026 shipped behavior; eye-in-head only, no head composition.\n* l2cs_gaze360: L2CS-Net (MIT) ResNet50 trained on Gaze360. ~10.4\u00b0 MAE but robust to extreme poses (recommended for Wan-Animate character scenes). One-time ~100MB weight download to ComfyUI/models/gaze/.\n* l2cs_mpiigaze: L2CS-Net MPIIGaze variant. ~3.9\u00b0 MAE but calibrated only for near-portrait subjects.\n* pose_normalized_resnet50: Highest-accuracy path. Pipeline = solvePnP head pose -> analytical pose-normalized 224x224 face warp (head roll removed, camera distance fixed at 600 mm) -> ResNet50+Linear(2048,2) gaze regressor -> de-rotate output back to camera frame. Major accuracy gain on tilted / off-axis heads. The normalization warp is a clean-room implementation of the 2018 ETRA paper's published equations and ships with this pack (Apache-2.0). The ResNet50 checkpoint is NOT bundled \u2014 place a community-released gaze-trained ResNet50 weight file at <ComfyUI>/models/gaze/pose_normalized_resnet50.pth.tar to enable this engine. Note: those community checkpoints are typically released under CC BY-NC-SA 4.0 (non-commercial); you are responsible for confirming the licence of any weights you install matches your use case. If the file is missing the node automatically falls back to l2cs_gaze360."}),
+                "gaze_engine": (["blendshape_head_corrected", "blendshape_only", "l2cs_gaze360", "l2cs_mpiigaze", "pose_normalized_resnet50", "ethxgaze"], {"default": "blendshape_head_corrected", "tooltip": "Per-eye gaze yaw/pitch engine.\n\n* blendshape_head_corrected (DEFAULT, recommended): MediaPipe ARKit blend shapes + solvePnP head pose + Kalman temporal smoother. Eye-in-head rotation is composed with the head rotation so the rendered arrow tracks rotated heads. Pure numpy + cv2, no downloads.\n* blendshape_only: legacy May-2026 shipped behavior; eye-in-head only, no head composition.\n* l2cs_gaze360: L2CS-Net (MIT) ResNet50 trained on Gaze360. ~10.4\u00b0 MAE but robust to extreme poses (recommended for Wan-Animate character scenes). One-time ~100MB weight download to ComfyUI/models/gaze/.\n* l2cs_mpiigaze: L2CS-Net MPIIGaze variant. ~3.9\u00b0 MAE but calibrated only for near-portrait subjects.\n* pose_normalized_resnet50: Highest-accuracy path. Pipeline = solvePnP head pose -> analytical pose-normalized 224x224 face warp (head roll removed, camera distance fixed at 600 mm) -> ResNet50+Linear(2048,2) gaze regressor -> de-rotate output back to camera frame. Major accuracy gain on tilted / off-axis heads. The normalization warp is a clean-room implementation of the 2018 ETRA paper's published equations and ships with this pack (Apache-2.0). The ResNet50 checkpoint is NOT bundled \u2014 place a community-released gaze-trained ResNet50 weight file at <ComfyUI>/models/gaze/pose_normalized_resnet50.pth.tar to enable this engine. Note: those community checkpoints are typically released under CC BY-NC-SA 4.0 (non-commercial); you are responsible for confirming the licence of any weights you install matches your use case. If the file is missing the node automatically falls back to l2cs_gaze360.\n* ethxgaze: ETH-XGaze ResNet-50 (ECCV 2020, ~2.5\u00b0 in-the-wild MAE). Post-processes iris_data using pose-normalised 224x224 face crops + the official gaze_network. Requires (a) the third_party/ETH-XGaze/ repo cloned for face_model.txt + model.py and (b) checkpoint `epoch_24_ckpt.pth.tar` placed in `ComfyUI/models/ethxgaze/`. On any missing prerequisite the engine silently keeps the previous engine's output."}),
                 "gaze_kalman_meas_std_deg": ("FLOAT", {"default": 3.0, "min": 0.1, "max": 20.0, "step": 0.1, "tooltip": "Kalman measurement noise (degrees). Higher = trust the model less and lean on the velocity model more — smoother. Used by blendshape_head_corrected and l2cs_* engines."}),
                 "gaze_kalman_process_std": ("FLOAT", {"default": 0.8, "min": 0.05, "max": 5.0, "step": 0.05, "tooltip": "Kalman process noise (rad/s). Roughly the expected saccade velocity scale. Higher = filter reacts faster to genuine motion but jitters more."}),
                 "gaze_fps": ("FLOAT", {"default": 30.0, "min": 1.0, "max": 240.0, "step": 1.0, "tooltip": "Video fps used by the Kalman dt. Set to match your source clip; affects velocity coupling, not absolute angles."}),
@@ -1737,6 +1737,13 @@ class PoseAndFaceDetectionV2:
         _engine = str(gaze_engine or "blendshape_head_corrected").strip()
         if not bool(use_blendshape_gaze):
             _engine = "legacy_iris_offset"
+        # C0.4: ethxgaze is a *post-process* over a base engine — the
+        # ResNet-50 face-level estimator only runs after iris_data has
+        # been populated. We swap to blendshape_head_corrected for the
+        # per-frame iris pass and remember to override at the end.
+        _ethxgaze_post = (_engine == "ethxgaze")
+        if _ethxgaze_post:
+            _engine = "blendshape_head_corrected"
         if _engine.startswith("l2cs") and not (
             _GAZE_L2CS_IMPORTED and _gaze_l2cs is not None
         ):
@@ -2346,6 +2353,28 @@ class PoseAndFaceDetectionV2:
             "source_size": (int(H), int(W)),
             "target_size": (int(height), int(width)),
         }
+
+        # C0.4: ETH-XGaze post-process override.
+        # Replace iris_data[*]['left_gaze'/'right_gaze'] with predictions
+        # from the ETH-XGaze ResNet-50 model. Requires the third_party
+        # repo + checkpoint; on any failure we keep the original engine's
+        # output and emit a warning.
+        if _ethxgaze_post:
+            try:
+                from .nodes_extras.gaze_ethxgaze import WanGazeETHXGazeV2 as _ETHX
+                _node = _ETHX()
+                _patched_bundle, _info = _node.run(
+                    pose_data, images, checkpoint="", checkpoint_path_override="",
+                    device="auto", blend=1.0, batch_size=8,
+                )
+                pose_data["iris_data"] = _patched_bundle.get("iris_data", pose_data["iris_data"])
+                all_iris = pose_data["iris_data"]
+                logging.getLogger(__name__).info("ethxgaze post-process: %s", _info)
+            except Exception as _exc:                                    # noqa: BLE001
+                logging.getLogger(__name__).warning(
+                    "gaze_engine=ethxgaze post-process failed (%s); "
+                    "keeping previous engine output.", _exc,
+                )
 
         # --- Debug visualisation ---
         debug_frames = []
