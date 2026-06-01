@@ -986,6 +986,7 @@ function buildOverlay(node) {
             _fc3dEditor = null;
             if (_fc3dHost) { try { _fc3dHost.remove(); } catch (_) {} _fc3dHost = null; }
             btn3D.style.background = C.btn_off_bg;
+            try { _persistSave?.(); } catch (_) {}
             return;
         }
         btn3D.style.background = C.btn_on_bg || C.accent;
@@ -1063,8 +1064,10 @@ function buildOverlay(node) {
                     _fc3dEditor = null;
                     if (_fc3dHost) { try { _fc3dHost.remove(); } catch (_) {} _fc3dHost = null; }
                     btn3D.style.background = C.btn_off_bg;
+                    try { _persistSave?.(); } catch (_) {}
                 },
             });
+            try { _persistSave?.(); } catch (_) {}
         } catch (err) {
             // Hard failure (network down, bad CDN, etc.) — leave a
             // readable note in the host and revert the toggle.
@@ -1124,6 +1127,7 @@ function buildOverlay(node) {
             b.style.color      = on ? C.fg_inverse : C.text;
         }
         drawPose();
+        try { _persistSave?.(); } catch (_) {}
     }
     btnFace.addEventListener("click", () => _setView("face"));
     btnPose.addEventListener("click", () => _setView("pose"));
@@ -1801,6 +1805,7 @@ function buildOverlay(node) {
         draw();
         drawPose();
         drawTimeline();
+        try { _persistSave?.(); } catch (_) {}
     });
 
     // Keyboard navigation on the focused canvas. Centralised here so the
@@ -1813,6 +1818,7 @@ function buildOverlay(node) {
         slider.value = String(next);
         frameLbl.textContent = `frame ${state.frame} / ${slider.max}`;
         draw(); drawPose(); drawTimeline();
+        try { _persistSave?.(); } catch (_) {}
     };
     const _gotoFrame = (idx) => {
         const max = parseInt(slider.max, 10) || 0;
@@ -1822,6 +1828,7 @@ function buildOverlay(node) {
         slider.value = String(next);
         frameLbl.textContent = `frame ${state.frame} / ${slider.max}`;
         draw(); drawPose(); drawTimeline();
+        try { _persistSave?.(); } catch (_) {}
     };
     cvs.addEventListener("keydown", (ev) => {
         // Don't fight with text inputs that may bubble keyboard events.
@@ -2242,8 +2249,50 @@ function buildOverlay(node) {
         },
     };
 
+    // ── (P1.E) Per-node UI persistence ─────────────────────────────
+    // Persist transient UI state (view mode, current frame, 3D-editor
+    // open/closed) keyed by node.id under localStorage, so reopening a
+    // workflow brings back the user's last layout without affecting
+    // ComfyUI's own widget-value persistence.
+    const _persistKey = () => `mec.fc3d.overlay.${node.id ?? "_"}`;
+    let _persistRaf = 0;
+    function _persistSave() {
+        if (_persistRaf) return;
+        _persistRaf = requestAnimationFrame(() => {
+            _persistRaf = 0;
+            try {
+                const snap = {
+                    view: pstate.view,
+                    frame: state.frame,
+                    editor3d: !!_fc3dEditor,
+                };
+                localStorage.setItem(_persistKey(), JSON.stringify(snap));
+            } catch (_) {}
+        });
+    }
+    function _persistLoad() {
+        try {
+            const raw = localStorage.getItem(_persistKey());
+            if (!raw) return null;
+            return JSON.parse(raw);
+        } catch (_) { return null; }
+    }
+
     // Default view = both, applied AFTER api is wired so _setView can call drawPose.
-    _setView("both");
+    const _saved = _persistLoad();
+    _setView(_saved?.view === "face" || _saved?.view === "pose" || _saved?.view === "both"
+        ? _saved.view : "both");
+    if (_saved && Number.isFinite(_saved.frame)) {
+        const f = Math.max(0, Number(_saved.frame) | 0);
+        state.frame = f;
+        try { slider.value = String(f); } catch (_) {}
+        frameLbl.textContent = `frame ${state.frame} / ${slider.max}`;
+    }
+    if (_saved?.editor3d) {
+        // Re-open the 3D editor a tick later so the host DOM + overlay
+        // are fully initialised first.
+        setTimeout(() => { try { btn3D.click(); } catch (_) {} }, 0);
+    }
 
     draw();
     drawTimeline();
