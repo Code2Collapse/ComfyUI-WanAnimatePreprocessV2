@@ -367,11 +367,12 @@ def _propagate_head_overrides(
         ``"off"``               — return ``base`` unchanged.
         ``"hold_last"``         — every gap holds the previous pin's
                                    value (step-function). Before the
-                                   first pin: no entry. Useful for
-                                   discrete pose changes.
+                                   first pin: flat-extrapolated to that
+                                   pin's value (no implicit gap).
+                                   Useful for discrete pose changes.
         ``"interpolate"``       — linearly interpolate each key between
-                                   adjacent pins; extrapolate flat at
-                                   the ends. Smooth, DAW-style automation.
+                                   adjacent pins; flat-extrapolate at
+                                   both ends. Smooth, DAW-style automation.
         ``"broadcast_first"``   — apply the first pin's values to every
                                    frame that has no explicit pin.
 
