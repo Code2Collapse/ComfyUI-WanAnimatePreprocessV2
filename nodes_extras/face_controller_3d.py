@@ -834,6 +834,154 @@ def _eye_box_norm(xy_norm: np.ndarray) -> Tuple[float, float]:
 
 
 # ----------------------------------------------------------------------
+# Preview outputs (P1.C): preview_image, overlay_video, keyframes_csv,
+# pose_diff_json. Built AFTER the per-frame edit loop runs so the
+# rendered overlay reflects the final edited bundle.
+# ----------------------------------------------------------------------
+def _build_preview_outputs(
+    *,
+    metas: list,
+    iris_data: list,
+    input_face_snap: dict,
+    input_body_snap: dict,
+    n_frames: int,
+    lo: int,
+    hi: int,
+    preview_frame_idx: int,
+    preview_size: int,
+    preview_max_video_frames: int,
+    edges,
+    constants: dict,
+    head_overrides: dict,
+    gaze_overrides: dict,
+):
+    """Return ``(preview_image, overlay_video, keyframes_csv, pose_diff_json)``.
+
+    Imported lazily to keep module load fast and to avoid pulling
+    Pillow/torch on environments that only need the headless node.
+    """
+    from . import _face_overlay_render as _r
+
+    # ── Frame-range selection for the video batch ───────────────────
+    start = max(0, min(n_frames - 1, int(lo)))
+    end   = max(start, min(n_frames - 1, int(hi)))
+    vid_frames = list(range(start, end + 1))
+    if len(vid_frames) > preview_max_video_frames:
+        # Uniform decimation to stay under the cap.
+        step = (len(vid_frames) + preview_max_video_frames - 1) // preview_max_video_frames
+        vid_frames = vid_frames[::max(1, step)][:preview_max_video_frames]
+
+    # ── Render each frame in the chosen range ───────────────────────
+    rendered: list = []
+    for f_idx in vid_frames:
+        if f_idx >= len(metas):
+            continue
+        meta = metas[f_idx]
+        face_xy = _read_face_normalised(meta)
+        body_xy = _get_body_kps(meta)
+        iris_entry = iris_data[f_idx] if (
+            isinstance(iris_data, list) and f_idx < len(iris_data)
+        ) else None
+        frame_u8 = _r.render_overlay_frame(
+            meta=meta,
+            iris_entry=iris_entry if isinstance(iris_entry, dict) else None,
+            body_xy=body_xy,
+            out_size=preview_size,
+            edges=edges,
+            face_norm=face_xy,
+            frame_idx=f_idx,
+            n_frames=n_frames,
+        )
+        rendered.append(frame_u8)
+
+    overlay_video = _r.stack_to_batch(rendered)
+
+    # ── Single preview frame ────────────────────────────────────────
+    pidx = max(0, min(n_frames - 1, int(preview_frame_idx)))
+    if pidx in vid_frames:
+        # Reuse the already-rendered tile to avoid double work.
+        prev_u8 = rendered[vid_frames.index(pidx)]
+    elif 0 <= pidx < len(metas):
+        meta = metas[pidx]
+        face_xy = _read_face_normalised(meta)
+        body_xy = _get_body_kps(meta)
+        iris_entry = iris_data[pidx] if (
+            isinstance(iris_data, list) and pidx < len(iris_data)
+        ) else None
+        prev_u8 = _r.render_overlay_frame(
+            meta=meta,
+            iris_entry=iris_entry if isinstance(iris_entry, dict) else None,
+            body_xy=body_xy,
+            out_size=preview_size,
+            edges=edges,
+            face_norm=face_xy,
+            frame_idx=pidx,
+            n_frames=n_frames,
+        )
+    else:
+        # Empty bundle — render a blank tile so downstream image
+        # consumers don't crash.
+        prev_u8 = np.zeros((preview_size, preview_size, 3), dtype=np.uint8)
+    preview_image = _r.render_to_tensor(prev_u8)
+
+    # ── keyframes_csv: per-frame resolved DOF values ────────────────
+    # Columns: frame, yaw, pitch, roll, scale, jaw, neck_yaw,
+    #          neck_pitch, tx, ty, tz, gaze_yaw, gaze_pitch.
+    csv_lines = ["frame,yaw,pitch,roll,scale,jaw,neck_yaw,neck_pitch,"
+                 "tx,ty,tz,gaze_yaw,gaze_pitch"]
+    for f_idx in range(n_frames):
+        h = head_overrides.get(f_idx, {}) if isinstance(head_overrides, dict) else {}
+        g = gaze_overrides.get(f_idx, {}) if isinstance(gaze_overrides, dict) else {}
+        # Constants + per-frame deltas (scale multiplies; others add).
+        yaw    = constants["yaw"]    + float(h.get("yaw",    0.0))
+        pitch  = constants["pitch"]  + float(h.get("pitch",  0.0))
+        roll   = constants["roll"]   + float(h.get("roll",   0.0))
+        scale  = constants["scale"]  * float(h.get("scale",  1.0))
+        jaw    = constants["jaw"]    + float(h.get("jaw",    0.0))
+        nyaw   = constants["nyaw"]   + float(h.get("nyaw",   0.0))
+        npitch = constants["npitch"] + float(h.get("npitch", 0.0))
+        tx     = constants["tx"]     + float(h.get("tx",     0.0))
+        ty     = constants["ty"]     + float(h.get("ty",     0.0))
+        tz     = constants["tz"]     + float(h.get("tz",     0.0))
+        gyaw   = constants["gyaw"]   + float(g.get("yaw",    0.0))
+        gpitch = constants["gpitch"] + float(g.get("pitch",  0.0))
+        csv_lines.append(
+            f"{f_idx},{yaw:.4f},{pitch:.4f},{roll:.4f},{scale:.4f},"
+            f"{jaw:.4f},{nyaw:.4f},{npitch:.4f},"
+            f"{tx:.4f},{ty:.4f},{tz:.4f},{gyaw:.4f},{gpitch:.4f}"
+        )
+    keyframes_csv = "\n".join(csv_lines) + "\n"
+
+    # ── pose_diff_json: per-frame edit magnitude vs input ──────────
+    diffs: list = []
+    for f_idx in range(n_frames):
+        meta = metas[f_idx] if f_idx < len(metas) else None
+        entry: dict = {"i": f_idx}
+        if meta is not None:
+            face_now = _read_face_normalised(meta)
+            face_in = input_face_snap.get(f_idx)
+            if face_now is not None and face_in is not None and face_now.shape == face_in.shape:
+                d = np.linalg.norm(face_now - face_in, axis=1)
+                entry["face_max"]  = round(float(d.max()),  6)
+                entry["face_mean"] = round(float(d.mean()), 6)
+            body_now = _get_body_kps(meta)
+            body_in  = input_body_snap.get(f_idx)
+            if body_now is not None and body_in is not None and body_now.shape == body_in.shape:
+                mask = ~(np.isnan(body_now[:, 0]) | np.isnan(body_now[:, 1])
+                         | np.isnan(body_in[:, 0]) | np.isnan(body_in[:, 1]))
+                if mask.any():
+                    d = np.linalg.norm(body_now[mask] - body_in[mask], axis=1)
+                    entry["body_max"]  = round(float(d.max()),  6)
+                    entry["body_mean"] = round(float(d.mean()), 6)
+        diffs.append(entry)
+    pose_diff_json = json.dumps(
+        {"n_frames": n_frames, "frames": diffs}, separators=(",", ":"),
+    )
+
+    return preview_image, overlay_video, keyframes_csv, pose_diff_json
+
+
+# ----------------------------------------------------------------------
 # Node
 # ----------------------------------------------------------------------
 class WanFaceController3DV2:
@@ -853,8 +1001,11 @@ class WanFaceController3DV2:
         "no-op, so the same node covers any subset.\n\n"
         "Schemas: see source file docstring."
     )
-    RETURN_TYPES = ("POSEDATA", "STRING", "STRING")
-    RETURN_NAMES = ("pose_data", "info", "coeff_time_series_json")
+    RETURN_TYPES = ("POSEDATA", "STRING", "STRING",
+                    "IMAGE", "IMAGE", "STRING", "STRING")
+    RETURN_NAMES = ("pose_data", "info", "coeff_time_series_json",
+                    "preview_image", "overlay_video",
+                    "keyframes_csv", "pose_diff_json")
     FUNCTION     = "run"
 
     @classmethod
@@ -989,6 +1140,23 @@ class WanFaceController3DV2:
                 "frame_end": ("INT", {
                     "default": -1, "min": -1, "max": 999999, "step": 1,
                 }),
+                # ── (Phase 1.C) Preview-output controls ──────────────
+                # preview_image renders one frame at this index; clamped
+                # to [0, n_frames-1] at runtime. overlay_video renders
+                # every frame within [frame_start..frame_end] up to
+                # preview_max_video_frames (perf guard for long shots).
+                "preview_frame_idx": ("INT", {
+                    "default": 0, "min": 0, "max": 999999, "step": 1,
+                    "tooltip": "Which frame to render as preview_image (single-frame IMAGE).",
+                }),
+                "preview_size": ("INT", {
+                    "default": 512, "min": 128, "max": 2048, "step": 32,
+                    "tooltip": "Square side length (px) of preview_image and overlay_video frames.",
+                }),
+                "preview_max_video_frames": ("INT", {
+                    "default": 120, "min": 1, "max": 1024, "step": 1,
+                    "tooltip": "Hard cap on overlay_video frame count (memory guard for long shots).",
+                }),
                 # ── Hidden override JSON inputs driven by the in-canvas
                 #    viewer UI (face landmark drags, body-joint drags,
                 #    gaze-handle drags). All face-bbox-normalised /
@@ -1055,6 +1223,9 @@ class WanFaceController3DV2:
             landmark_overrides_json: str = "",
             pose_overrides_json: str = "",
             gaze_overrides_json: str = "",
+            preview_frame_idx: int = 0,
+            preview_size: int = 512,
+            preview_max_video_frames: int = 120,
             unique_id: Optional[str] = None):
 
         if not isinstance(pose_data, dict):
@@ -1069,6 +1240,22 @@ class WanFaceController3DV2:
                 _fps.cache_put(str(unique_id), pose_data)
             except Exception as _exc:                                    # noqa: BLE001
                 log.debug("fc3d_preview cache_put skipped: %s", _exc)
+
+        # Snapshot input face landmarks + body kps per frame BEFORE
+        # editing — drives the pose_diff_json output (P1.C). Stored as
+        # plain numpy arrays so we don't deepcopy the whole bundle twice.
+        _input_face_snap: dict = {}
+        _input_body_snap: dict = {}
+        _src_metas_in = pose_data.get("pose_metas") or pose_data.get("pose_metas_original") or []
+        for _i, _m in enumerate(_src_metas_in):
+            if not isinstance(_m, dict):
+                continue
+            _fxy = _read_face_normalised(_m)
+            if _fxy is not None:
+                _input_face_snap[_i] = _fxy.astype(np.float32, copy=True)
+            _bxy = _get_body_kps(_m)
+            if _bxy is not None:
+                _input_body_snap[_i] = _bxy.astype(np.float32, copy=True)
 
         bundle = deepcopy(pose_data)
         key = "pose_metas" if use_metas == "edited" else "pose_metas_original"
@@ -1474,5 +1661,33 @@ class WanFaceController3DV2:
 
         return {
             "ui":     {"overlay_meta": [overlay_meta]},
-            "result": (bundle, info, ts_json),
+            "result": (bundle, info, ts_json,
+                       *_build_preview_outputs(
+                           metas=metas,
+                           iris_data=iris_data,
+                           input_face_snap=_input_face_snap,
+                           input_body_snap=_input_body_snap,
+                           n_frames=n_frames,
+                           lo=lo, hi=hi,
+                           preview_frame_idx=int(preview_frame_idx),
+                           preview_size=int(preview_size),
+                           preview_max_video_frames=int(preview_max_video_frames),
+                           edges=_POSE18_EDGES_UI,
+                           constants={
+                               "yaw":    float(head_yaw_deg),
+                               "pitch":  float(head_pitch_deg),
+                               "roll":   float(head_roll_deg),
+                               "tx":     float(head_tx),
+                               "ty":     float(head_ty),
+                               "tz":     float(head_tz),
+                               "scale":  float(head_scale),
+                               "jaw":    float(jaw_rot_deg),
+                               "nyaw":   float(neck_yaw_deg),
+                               "npitch": float(neck_pitch_deg),
+                               "gyaw":   float(gaze_yaw_deg),
+                               "gpitch": float(gaze_pitch_deg),
+                           },
+                           head_overrides=head_overrides,
+                           gaze_overrides=gaze_overrides,
+                       )),
         }
