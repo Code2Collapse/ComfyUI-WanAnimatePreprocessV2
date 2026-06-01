@@ -27,6 +27,19 @@ from .pose_format_convert import WanPoseFormatConvertV2
 from .pose_detect_vitpose import WanPoseDetectViTPoseV2
 from .face_controller_3d import WanFaceController3DV2
 
+# Phase 1.B — live preview route for the Face Director real-time editor.
+# Registers POST /c2c/fc3d_preview against ComfyUI's aiohttp server.
+# Failure is non-fatal: the node still works, only the live gizmo loses
+# its server-truth sync.
+try:
+    from . import _face_preview_server as _fps
+    _fps.try_register_routes_deferred()
+except Exception as _e:                                                  # noqa: BLE001
+    import logging as _logging
+    _logging.getLogger(__name__).info(
+        "fc3d_preview route registration skipped: %s", _e,
+    )
+
 # ETH-XGaze post-processor (optional; only loads if torch + checkpoint available).
 try:
     from .gaze_ethxgaze import WanGazeETHXGazeV2

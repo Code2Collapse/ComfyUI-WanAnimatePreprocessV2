@@ -1006,6 +1006,14 @@ class WanFaceController3DV2:
                     "tooltip": 'JSON {"frames":{"<idx>":{"l":[yaw_rad,pitch_rad],"r":[yaw_rad,pitch_rad]}}} from the in-canvas gaze handles.',
                 }),
             },
+            # ComfyUI standard hidden inputs. ``unique_id`` is the
+            # graph-side node id (string). Required by the
+            # ``/c2c/fc3d_preview`` route to key the bundle cache so
+            # the JS layer can request a live single-frame recompute
+            # without re-queueing the whole graph.
+            "hidden": {
+                "unique_id": "UNIQUE_ID",
+            },
         }
 
     @classmethod
@@ -1046,10 +1054,21 @@ class WanFaceController3DV2:
             frame_end: int = -1,
             landmark_overrides_json: str = "",
             pose_overrides_json: str = "",
-            gaze_overrides_json: str = ""):
+            gaze_overrides_json: str = "",
+            unique_id: Optional[str] = None):
 
         if not isinstance(pose_data, dict):
             raise ValueError("pose_data is not a POSEDATA bundle (expected dict).")
+
+        # Stash the RAW input bundle for the live-preview server route
+        # so the JS gizmo can request single-frame recomputes between
+        # full queues. Best-effort: import failures must never break run.
+        if unique_id is not None:
+            try:
+                from . import _face_preview_server as _fps
+                _fps.cache_put(str(unique_id), pose_data)
+            except Exception as _exc:                                    # noqa: BLE001
+                log.debug("fc3d_preview cache_put skipped: %s", _exc)
 
         bundle = deepcopy(pose_data)
         key = "pose_metas" if use_metas == "edited" else "pose_metas_original"
