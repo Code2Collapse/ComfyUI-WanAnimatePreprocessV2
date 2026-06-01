@@ -415,7 +415,7 @@ function buildOverlay(node) {
         b.textContent = label;
         b.title = title;
         b.style.cssText =
-            "background:" + (color || "#2a2a35") + ";color:" + C.text + ";" +
+            "background:" + (color || C.border) + ";color:" + C.text + ";" +
             "border:1px solid " + C.border + ";border-radius:3px;" +
             "padding:2px 8px;cursor:pointer;font:11px ui-sans-serif;";
         return b;

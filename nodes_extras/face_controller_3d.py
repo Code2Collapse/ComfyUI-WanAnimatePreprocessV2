@@ -84,7 +84,7 @@ from .expression_3d_coeffs import (
     _read_face_normalised,
     _write_face_normalised,
 )
-from .face_expression_editor_ui import (
+from ._face_helpers import (
     _parse_overrides as _parse_face_overrides_ui,
     _parse_gaze_overrides as _parse_gaze_overrides_ui,
     _apply_gaze_override_to_iris_entry,

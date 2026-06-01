@@ -291,6 +291,9 @@ def _run_mediapipe_on_face_crop(face_crop_rgb_uint8, crop_origin_xy, crop_size_w
         'left_eye_inner_px':  (float(l_inner[0]), float(l_inner[1])),
         'left_eye_outer_px':  (float(l_outer[0]), float(l_outer[1])),
         'lip_openness_ratio': lip_ratio,
+        # Full 478-point MediaPipe mesh in FULL-FRAME pixel coords.
+        # Consumed by gaze_pose_norm for solvePnP head-pose estimation.
+        'landmarks_px_full': pts_px,
     }
 
 
@@ -338,6 +341,36 @@ except Exception as _exc:  # noqa: BLE001
     _GAZE_L2CS_IMPORTED = False
     logging.getLogger(__name__).debug(
         "gaze_l2cs module unavailable (%s); L2CS-Net engine disabled.",
+        _exc,
+    )
+
+# Stage-3 gaze upgrade: pose-normalized data preprocessing (clean-room
+# port of the 2018 ETRA paper, Apache-2.0). Pure cv2+numpy; head-pose-
+# invariant input warp.
+try:
+    from . import gaze_pose_norm as _gaze_pose_norm  # type: ignore
+    _GAZE_POSE_NORM_IMPORTED = True
+except Exception as _exc:  # noqa: BLE001
+    _gaze_pose_norm = None
+    _GAZE_POSE_NORM_IMPORTED = False
+    logging.getLogger(__name__).debug(
+        "gaze_pose_norm module unavailable (%s); pose normalization disabled.",
+        _exc,
+    )
+
+# Pose-normalized ResNet50 gaze estimator (operates on the warped
+# canonical face crop from gaze_pose_norm). Wraps a community-released
+# checkpoint that the USER places at ComfyUI/models/gaze/ — see the
+# license note in gaze_normalized_estimator.py for terms of use.
+try:
+    from . import gaze_normalized_estimator as _gaze_normalized_estimator  # type: ignore
+    _GAZE_NORM_EST_IMPORTED = True
+except Exception as _exc:  # noqa: BLE001
+    _gaze_normalized_estimator = None
+    _GAZE_NORM_EST_IMPORTED = False
+    logging.getLogger(__name__).debug(
+        "gaze_normalized_estimator module unavailable (%s); "
+        "pose_normalized_resnet50 engine disabled.",
         _exc,
     )
 
@@ -431,6 +464,9 @@ def _run_face_landmarker_on_face_crop(
         'face_transform': res.get("transform"),
         'R_head': R_head,
         'source': 'face_landmarker',
+        # Full 478-point MediaPipe mesh in FULL-FRAME pixel coords.
+        # Consumed by gaze_pose_norm for solvePnP head-pose estimation.
+        'landmarks_px_full': pts_px,
     }
 
 
@@ -1204,7 +1240,7 @@ class PoseAndFaceDetectionV2:
                 "face_smoothing_strength": ("FLOAT", {"default": 0.6, "min": 0.0, "max": 1.0, "step": 0.05, "tooltip": "Higher = more smoothing"}),
                 # Constant-size face box
                 "use_constant_face_box": ("BOOLEAN", {"default": True, "tooltip": "Keep a constant pixel size face crop; position adapts."}),
-                "face_box_size_px": ("INT", {"default": 224, "min": 64, "max": 1024, "step": 16, "tooltip": "Pixel size of the square face crop when constant mode is on."}),
+                "face_box_size_px": ("INT", {"default": 512, "min": 64, "max": 1024, "step": 16, "tooltip": "Pixel size of the square face crop when constant mode is on. Default 512 matches Wan 2.2 Animate's face encoder input size; lower values trigger an extra upscale inside the encoder and waste detail."}),
                 # Iris estimation
                 "use_iris_smoothing": ("BOOLEAN", {"default": True, "tooltip": "Temporally smooth iris pixel positions across frames. Reduces per-frame jitter that Wan 2.2 Animate's face encoder picks up and reproduces as wobbly gaze."}),
                 "iris_smoothing_strength": ("FLOAT", {"default": 0.4, "min": 0.0, "max": 1.0, "step": 0.05, "tooltip": "EMA mix weight when iris_smoothing_method='ema'. Higher = more smoothing, more lag. Ignored for one_euro / none."}),
@@ -1237,7 +1273,7 @@ class PoseAndFaceDetectionV2:
                 "eye_y_fraction": ("FLOAT", {"default": 0.30, "min": 0.10, "max": 0.60, "step": 0.01, "tooltip": "Target eye row as a fraction of crop height (0.30 = upper third). Only used when eye_align_mode = 'eye_upper_third'."}),
                 "face_cfg_scale": ("FLOAT", {"default": 1.0, "min": 1.0, "max": 10.0, "step": 0.1, "tooltip": "Wan-Animate paper recommendation #3 (paper section 4.3): CFG on the face conditioning input gives finer control over expression / gaze when finer reenactment is desired. This widget is a passthrough -- wire the FLOAT output 'face_cfg_scale' into your Wan-Animate sampler's face CFG input. 1.0 = CFG disabled (default, fastest). 2.0-4.0 = stronger expression adherence. >5.0 may over-saturate."}),
                 # ---- Gaze engine selector + Kalman tuning (appended at end for back-compat with saved workflows) ----
-                "gaze_engine": (["blendshape_head_corrected", "blendshape_only", "l2cs_gaze360", "l2cs_mpiigaze"], {"default": "blendshape_head_corrected", "tooltip": "Per-eye gaze yaw/pitch engine.\n\n* blendshape_head_corrected (DEFAULT, recommended): MediaPipe ARKit blend shapes + solvePnP head pose + Kalman temporal smoother. Eye-in-head rotation is composed with the head rotation so the rendered arrow tracks rotated heads. Pure numpy + cv2, no downloads.\n* blendshape_only: legacy May-2026 shipped behavior; eye-in-head only, no head composition.\n* l2cs_gaze360: L2CS-Net (MIT) ResNet50 trained on Gaze360. ~10.4\u00b0 MAE but robust to extreme poses (recommended for Wan-Animate character scenes). One-time ~100MB weight download to ComfyUI/models/gaze/.\n* l2cs_mpiigaze: L2CS-Net MPIIGaze variant. ~3.9\u00b0 MAE but calibrated only for near-portrait subjects.\n\nETH-XGaze intentionally not offered: CC BY-NC-SA 4.0 license blocks commercial use."}),
+                "gaze_engine": (["blendshape_head_corrected", "blendshape_only", "l2cs_gaze360", "l2cs_mpiigaze", "pose_normalized_resnet50"], {"default": "blendshape_head_corrected", "tooltip": "Per-eye gaze yaw/pitch engine.\n\n* blendshape_head_corrected (DEFAULT, recommended): MediaPipe ARKit blend shapes + solvePnP head pose + Kalman temporal smoother. Eye-in-head rotation is composed with the head rotation so the rendered arrow tracks rotated heads. Pure numpy + cv2, no downloads.\n* blendshape_only: legacy May-2026 shipped behavior; eye-in-head only, no head composition.\n* l2cs_gaze360: L2CS-Net (MIT) ResNet50 trained on Gaze360. ~10.4\u00b0 MAE but robust to extreme poses (recommended for Wan-Animate character scenes). One-time ~100MB weight download to ComfyUI/models/gaze/.\n* l2cs_mpiigaze: L2CS-Net MPIIGaze variant. ~3.9\u00b0 MAE but calibrated only for near-portrait subjects.\n* pose_normalized_resnet50: Highest-accuracy path. Pipeline = solvePnP head pose -> analytical pose-normalized 224x224 face warp (head roll removed, camera distance fixed at 600 mm) -> ResNet50+Linear(2048,2) gaze regressor -> de-rotate output back to camera frame. Major accuracy gain on tilted / off-axis heads. The normalization warp is a clean-room implementation of the 2018 ETRA paper's published equations and ships with this pack (Apache-2.0). The ResNet50 checkpoint is NOT bundled \u2014 place a community-released gaze-trained ResNet50 weight file at <ComfyUI>/models/gaze/pose_normalized_resnet50.pth.tar to enable this engine. Note: those community checkpoints are typically released under CC BY-NC-SA 4.0 (non-commercial); you are responsible for confirming the licence of any weights you install matches your use case. If the file is missing the node automatically falls back to l2cs_gaze360."}),
                 "gaze_kalman_meas_std_deg": ("FLOAT", {"default": 3.0, "min": 0.1, "max": 20.0, "step": 0.1, "tooltip": "Kalman measurement noise (degrees). Higher = trust the model less and lean on the velocity model more — smoother. Used by blendshape_head_corrected and l2cs_* engines."}),
                 "gaze_kalman_process_std": ("FLOAT", {"default": 0.8, "min": 0.05, "max": 5.0, "step": 0.05, "tooltip": "Kalman process noise (rad/s). Roughly the expected saccade velocity scale. Higher = filter reacts faster to genuine motion but jitters more."}),
                 "gaze_fps": ("FLOAT", {"default": 30.0, "min": 1.0, "max": 240.0, "step": 1.0, "tooltip": "Video fps used by the Kalman dt. Set to match your source clip; affects velocity coupling, not absolute angles."}),
@@ -1247,8 +1283,8 @@ class PoseAndFaceDetectionV2:
             },
         }
 
-    RETURN_TYPES = ("POSEDATA", "IMAGE", "STRING", "BBOX", "BBOX", "STRING", "IMAGE", "STRING", "STRING", "FLOAT", "FACE_RESTORE_INFO", "FLOAT")
-    RETURN_NAMES = ("pose_data", "face_images", "key_frame_body_points", "bboxes", "face_bboxes", "iris_data", "debug_image", "right_pupil_xy", "left_pupil_xy", "lip_openness_ratio", "restore_info", "face_cfg_scale")
+    RETURN_TYPES = ("POSEDATA", "IMAGE", "STRING", "BBOX", "BBOX", "STRING", "IMAGE", "STRING", "STRING", "FLOAT", "FACE_RESTORE_INFO", "FLOAT", "IMAGE")
+    RETURN_NAMES = ("pose_data", "face_images", "key_frame_body_points", "bboxes", "face_bboxes", "iris_data", "debug_image", "right_pupil_xy", "left_pupil_xy", "lip_openness_ratio", "restore_info", "face_cfg_scale", "face_images_512")
     OUTPUT_TOOLTIPS = (
         "Per-frame pose+face+iris dict bundle. Feed into Draw ViT Pose (V2).",
         "Cropped face IMAGE batch suitable for face-id encoders.",
@@ -1262,6 +1298,7 @@ class PoseAndFaceDetectionV2:
         "Mouth-open scalar list (0=closed, 1=wide).",
         "Per-frame {x1,y1,x2,y2,size,frame_shape} dict for paste-back nodes.",
         "CFG scale for the face conditioning input. Wire into the Wan-Animate sampler's face CFG. 1.0 = CFG off (paper default).",
+        "Cropped face IMAGE batch force-resized to 512x512 (bilinear). Pre-shaped for the Wan 2.2 Animate face encoder; wire directly without an extra Resize node.",
     )
     FUNCTION = "process"
     CATEGORY = "WanAnimatePreprocess_V2"
@@ -1709,6 +1746,42 @@ class PoseAndFaceDetectionV2:
                 _engine,
             )
             _engine = "blendshape_head_corrected"
+        # The pose_normalized_resnet50 engine requires the normalizer
+        # module, the ResNet50 estimator module, AND a usable checkpoint
+        # at <ComfyUI>/models/gaze/. If any prerequisite is missing we
+        # fall back to plain l2cs_gaze360 (still a strong baseline).
+        _pose_norm_resnet50_enabled = (_engine == "pose_normalized_resnet50")
+        _pose_norm_model = None
+        if _pose_norm_resnet50_enabled:
+            _missing_reason = None
+            if not (_GAZE_POSE_NORM_IMPORTED and _gaze_pose_norm is not None
+                    and _gaze_pose_norm.is_available()):
+                _missing_reason = "gaze_pose_norm module / cv2 unavailable"
+            elif not (_GAZE_NORM_EST_IMPORTED
+                      and _gaze_normalized_estimator is not None
+                      and _gaze_normalized_estimator.is_available()):
+                _missing_reason = "gaze_normalized_estimator / torch unavailable"
+            else:
+                try:
+                    _pose_norm_model = _gaze_normalized_estimator.get_model()
+                except Exception as exc:  # noqa: BLE001
+                    _pose_norm_model = None
+                    _missing_reason = f"checkpoint load failed: {exc!r}"
+                if _pose_norm_model is None and _missing_reason is None:
+                    _missing_reason = (
+                        "no ResNet50 gaze checkpoint at "
+                        "<ComfyUI>/models/gaze/pose_normalized_resnet50.pth.tar"
+                    )
+            if _missing_reason is not None:
+                _fb_engine = "l2cs_gaze360" if (
+                    _GAZE_L2CS_IMPORTED and _gaze_l2cs is not None
+                ) else "blendshape_head_corrected"
+                logging.getLogger(__name__).warning(
+                    "gaze_engine=pose_normalized_resnet50 disabled (%s); "
+                    "falling back to %s.", _missing_reason, _fb_engine,
+                )
+                _pose_norm_resnet50_enabled = False
+                _engine = _fb_engine
         if _engine == "blendshape_head_corrected" and not (
             _GAZE_3D_IMPORTED and _gaze_3d is not None
         ):
@@ -1805,9 +1878,20 @@ class PoseAndFaceDetectionV2:
                 # Override face_kps[1:69] with MediaPipe-derived 68 landmarks
                 # (face_kps[0] is the body-anchored face anchor from ViTPose;
                 # leave it intact so Wan's pose encoder keeps its global hook).
+                # Defensive guard: every upstream MediaPipe path *should*
+                # populate 'kps68_norm' but a partial dict (gaze-only,
+                # iris-only, mocked) would crash the shape assignment with
+                # a confusing TypeError. Skip the override in that case;
+                # downstream still gets the ViTPose-derived face_kps as
+                # a fallback.
                 face_kps = meta['keypoints_face']
-                if face_kps.shape[0] >= 69:
-                    face_kps[1:69, :] = mp_result['kps68_norm']
+                _kps68 = mp_result.get('kps68_norm') if isinstance(mp_result, dict) else None
+                if (
+                    _kps68 is not None
+                    and face_kps.shape[0] >= 69
+                    and getattr(_kps68, 'shape', None) == (68, 3)
+                ):
+                    face_kps[1:69, :] = _kps68
                     meta['keypoints_face'] = face_kps
 
                 rix, riy = mp_result['right_iris_px']
@@ -1828,19 +1912,53 @@ class PoseAndFaceDetectionV2:
                 # on per-frame failure; the outer loop keeps the last
                 # good gaze if EVERY engine misses on this frame.
                 _l2cs_per_eye = None
-                if l2cs_enabled and _l2cs_pipeline is not None:
+                if (l2cs_enabled and _l2cs_pipeline is not None) or \
+                        (_pose_norm_resnet50_enabled and _pose_norm_model is not None):
                     try:
                         full_rgb_u8 = (np.clip(images_np[idx], 0, 1) * 255).astype(np.uint8)
                         _fb_xyxy = (
                             int(face_bboxes[idx][0]), int(face_bboxes[idx][2]),
                             int(face_bboxes[idx][1]), int(face_bboxes[idx][3]),
                         )
-                        _l2cs_out = _gaze_l2cs.infer_frame(
-                            _l2cs_pipeline, full_rgb_u8, face_bbox=_fb_xyxy,
-                        )
+                        # Two inference paths:
+                        #   * pose_normalized_resnet50: clean-room pose-
+                        #     normalized 224x224 warp (removes head roll +
+                        #     fixes distance to 600 mm) -> ResNet50+Linear(2,)
+                        #     gaze head -> de-rotate via R_norm.T back to
+                        #     the original camera frame.
+                        #   * l2cs_*: full-frame RetinaFace + L2CS network.
+                        _l2cs_out = None
+                        if _pose_norm_resnet50_enabled and _pose_norm_model is not None:
+                            _norm_obj = None
+                            try:
+                                _lm_full = mp_result.get('landmarks_px_full')
+                                if _lm_full is None:
+                                    _lm_full = mp_result.get('landmarks_norm_full')
+                                if _lm_full is not None:
+                                    _norm_obj = _gaze_pose_norm.normalize_face_for_gaze(
+                                        full_rgb_u8, _lm_full, image_size=(W, H),
+                                    )
+                            except Exception as exc:  # noqa: BLE001
+                                logging.getLogger(__name__).debug(
+                                    "[PoseNorm] normalize failed: %s", exc)
+                                _norm_obj = None
+                            if _norm_obj is not None:
+                                _raw = _gaze_normalized_estimator.infer_normalized(
+                                    _pose_norm_model, _norm_obj.image,
+                                )
+                                if _raw is not None:
+                                    _yn, _pn, _cn = _raw
+                                    _yc, _pc = _gaze_pose_norm.denormalize_gaze(
+                                        _yn, _pn, _norm_obj.R_norm,
+                                    )
+                                    _l2cs_out = (_yc, _pc, _cn)
+                        elif l2cs_enabled and _l2cs_pipeline is not None:
+                            _l2cs_out = _gaze_l2cs.infer_frame(
+                                _l2cs_pipeline, full_rgb_u8, face_bbox=_fb_xyxy,
+                            )
                     except Exception as exc:  # noqa: BLE001
                         logging.getLogger(__name__).debug(
-                            "[L2CS] infer_frame failed: %s", exc)
+                            "[gaze] external regressor inference failed: %s", exc)
                         _l2cs_out = None
                     if _l2cs_out is not None:
                         _y_l, _p_l, _c_l = _l2cs_out
@@ -1972,15 +2090,22 @@ class PoseAndFaceDetectionV2:
                         ref = eye_ref[eye_name]
                         ddx = ipx - ref['cx']
                         ddy = ipy - ref['cy']
-                        # One-shot diagnostic for first frame, both eyes:
-                        # writes iris pixel, eye centroid, and resulting
-                        # unit vector to a debug log so we can verify the
-                        # screen-space convention end-to-end. Tracked in
-                        # user memory `comfyui_workflow_rules.md` ("gaze
-                        # arrow direction" investigation, May 2026).
-                        if idx == 0:
+                        # Diagnostic log for the gaze direction
+                        # investigation (user memory
+                        # `comfyui_workflow_rules.md`, May 2026).
+                        # By default writes the first frame only (cheap
+                        # one-shot sanity check).  Set the env var
+                        # `MEC_GAZE_DEBUG_ALL_FRAMES=1` to dump every
+                        # frame — useful when chasing a per-frame
+                        # direction artefact.  The hard-coded "frame=0"
+                        # tag is replaced with the real `idx` so multi-
+                        # frame logs are readable.
+                        import os as _os
+                        _all_frames = _os.environ.get(
+                            "MEC_GAZE_DEBUG_ALL_FRAMES", ""
+                        ) not in ("", "0", "false", "False")
+                        if idx == 0 or _all_frames:
                             try:
-                                import os as _os
                                 _dbg_path = _os.path.join(
                                     _os.path.dirname(__file__),
                                     "_gaze_debug.log",
@@ -1997,7 +2122,7 @@ class PoseAndFaceDetectionV2:
                                 _bs_str = ' '.join(f"{k}={float(_bs_raw.get(k,0.0)):.3f}" for k in _bs_keys)
                                 with open(_dbg_path, "a", encoding="utf-8") as _fh:
                                     _fh.write(
-                                        f"frame=0 eye={eye_name} "
+                                        f"frame={idx} eye={eye_name} "
                                         f"iris_px=({ipx:.1f},{ipy:.1f}) "
                                         f"eye_corner_mid=({ref['cx']:.1f},{ref['cy']:.1f}) "
                                         f"hw={ref['hw']:.1f} "
@@ -2270,6 +2395,24 @@ class PoseAndFaceDetectionV2:
             ],
         }
 
+        # ── face_images_512: force-resized to 512x512 for the Wan 2.2 ──
+        # Animate face encoder. Always bilinear, regardless of source
+        # crop size. Computed lazily here (single resize at the end) so
+        # the per-frame loop stays untouched. Falls back to the original
+        # tensor if either dimension already equals 512.
+        try:
+            import torch.nn.functional as _F
+            if (face_images_tensor.shape[1] == 512
+                    and face_images_tensor.shape[2] == 512):
+                face_images_512_tensor = face_images_tensor
+            else:
+                _t = face_images_tensor.permute(0, 3, 1, 2).contiguous()
+                _t = _F.interpolate(_t, size=(512, 512),
+                                    mode="bilinear", align_corners=False)
+                face_images_512_tensor = _t.permute(0, 2, 3, 1).contiguous()
+        except Exception:  # noqa: BLE001 — never break the node on resize
+            face_images_512_tensor = face_images_tensor
+
         return (
             pose_data,
             face_images_tensor,
@@ -2283,6 +2426,7 @@ class PoseAndFaceDetectionV2:
             mean_lip_openness,
             restore_info,
             float(face_cfg_scale),
+            face_images_512_tensor,
         )
 
 
@@ -3821,7 +3965,7 @@ NODE_CLASS_MAPPINGS = {
     "WanAnimateFaceQualityCheckV2": WanAnimateFaceQualityCheckV2,
     "DepthPoseCannyCombinedV2": DepthPoseCannyCombinedV2,
     # Self-contained alias (Task 2): same class, friendlier name highlighting bundled MiDaS + Normal + Blend modes
-    "SelfContainedControlNetPreprocessorV2": DepthPoseCannyCombinedV2,
+    # Removed 2026-05-18: SelfContainedControlNetPreprocessorV2 was just an alias of DepthPoseCannyCombinedV2.
     # KANIBUS gap nodes (May 2026): derived eye-feature series.
     "EARBlinkDetectorC2C": EARBlinkDetectorC2C,
     "SaccadeClassifierC2C": SaccadeClassifierC2C,
@@ -3835,7 +3979,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "DrawViTPoseV2": "Draw ViT Pose (V2)",
     "WanAnimateFaceQualityCheckV2": "Wan-Animate Face Quality Check (V2)",
     "DepthPoseCannyCombinedV2": "Depth + Pose + Canny Combined (V2)",
-    "SelfContainedControlNetPreprocessorV2": "Self-Contained ControlNet Preprocessor (V2)",
+    # Display-name entry removed alongside class alias above.
     "EARBlinkDetectorC2C": "EAR Blink Detector",
     "SaccadeClassifierC2C": "Saccade Classifier (300\u00b0/s)",
     "PupilDilationTrackerC2C": "Pupil Dilation Tracker",

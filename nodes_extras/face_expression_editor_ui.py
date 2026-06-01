@@ -79,19 +79,24 @@ from __future__ import annotations
 
 import json
 import logging
-import math
 from copy import deepcopy
 
 import numpy as np
 
+# Helpers + gaze constants now live in a neutral module to keep the
+# import graph acyclic and to avoid coupling controller code to this
+# UI node class. Re-exported here for backward compatibility.
+from ._face_helpers import (  # noqa: F401  (re-export)
+    _GAZE_MAX_YAW_RAD,
+    _GAZE_MAX_PITCH_RAD,
+    _get_body_kps,
+    _set_body_kps,
+    _parse_overrides,
+    _parse_gaze_overrides,
+    _apply_gaze_override_to_iris_entry,
+)
+
 log = logging.getLogger(__name__)
-
-
-# Canonical max-gaze angle constants — must match gaze_blendshape.py so that
-# the JS drag offset (which is bbox-normalised) maps to the SAME (yaw, pitch)
-# radians the downstream pipeline already expects.
-_GAZE_MAX_YAW_RAD   = math.radians(30.0)
-_GAZE_MAX_PITCH_RAD = math.radians(25.0)
 
 
 # ── iBUG-68 region slices ─────────────────────────────────────────────
@@ -128,58 +133,8 @@ _POSE18_EDGES: tuple[tuple[int, int], ...] = (
 )
 
 
-# ── Body keypoint helpers (image-normalised [0,1] floats) ─────────────
-def _get_body_kps(meta) -> np.ndarray | None:
-    """Return (18, 2) image-normalised body keypoints, or None.
-
-    ``keypoints_body`` in POSEDATA is stored as a python list of 18 items;
-    each item is either ``None`` (joint missing in this frame) or a
-    sequence ``[x_norm, y_norm, (confidence?)]`` already normalised to
-    the source image's WxH.  We preserve missing joints by writing NaN
-    so the JS overlay can hide them.
-    """
-    if not isinstance(meta, dict):
-        return None
-    arr = meta.get("keypoints_body")
-    if not isinstance(arr, (list, tuple)) or len(arr) < 18:
-        return None
-    out = np.full((18, 2), np.nan, dtype=np.float32)
-    for i in range(18):
-        v = arr[i]
-        if v is None:
-            continue
-        try:
-            out[i, 0] = float(v[0])
-            out[i, 1] = float(v[1])
-        except (TypeError, ValueError, IndexError):
-            continue
-    return out
-
-
-def _set_body_kps(meta: dict, xy_norm: np.ndarray) -> None:
-    """Write back (18, 2) image-normalised body keypoints into ``meta``.
-
-    Preserves the original 3rd component (confidence) when present, and
-    keeps slots that are still NaN as None so downstream renderers can
-    distinguish "edited" from "missing".
-    """
-    src = meta.get("keypoints_body")
-    if not isinstance(src, list):
-        return
-    for i in range(min(18, len(src))):
-        x, y = float(xy_norm[i, 0]), float(xy_norm[i, 1])
-        if np.isnan(x) or np.isnan(y):
-            # Leave the joint as it was — user did NOT add a brand-new joint
-            # via override; missing joints stay missing.
-            continue
-        v = src[i]
-        if v is None:
-            src[i] = [x, y, 1.0]
-        else:
-            try:
-                src[i] = [x, y, float(v[2])] if len(v) >= 3 else [x, y]
-            except (TypeError, ValueError, IndexError):
-                src[i] = [x, y]
+# Body keypoint helpers (_get_body_kps / _set_body_kps) and the override
+# JSON parsers now live in ``_face_helpers`` and are re-exported above.
 
 
 def _bbox_xywh(kps: np.ndarray) -> tuple[float, float, float, float]:
@@ -253,128 +208,8 @@ def _set_face_kps(meta: dict, xy_pixels: np.ndarray) -> None:
     meta["keypoints_face"] = arr
 
 
-def _parse_overrides(blob: str | None) -> dict[int, dict[int, tuple[float, float]]]:
-    """Parse the JS-overlay payload. Returns ``{}`` on empty/invalid."""
-    if not blob or not blob.strip():
-        return {}
-    try:
-        data = json.loads(blob)
-    except json.JSONDecodeError as e:
-        log.warning("landmark_overrides_json ignored — not valid JSON: %s", e)
-        return {}
-    frames = data.get("frames") if isinstance(data, dict) else None
-    if not isinstance(frames, dict):
-        return {}
-    out: dict[int, dict[int, tuple[float, float]]] = {}
-    for f_key, lm_map in frames.items():
-        try:
-            f_idx = int(f_key)
-        except (TypeError, ValueError):
-            continue
-        if not isinstance(lm_map, dict):
-            continue
-        per_frame: dict[int, tuple[float, float]] = {}
-        for lm_key, xy in lm_map.items():
-            try:
-                lm_idx = int(lm_key)
-            except (TypeError, ValueError):
-                continue
-            if not (isinstance(xy, (list, tuple)) and len(xy) == 2):
-                continue
-            try:
-                per_frame[lm_idx] = (float(xy[0]), float(xy[1]))
-            except (TypeError, ValueError):
-                continue
-        if per_frame:
-            out[f_idx] = per_frame
-    return out
-
-
-def _parse_gaze_overrides(blob: str | None) -> dict[int, dict[str, tuple[float, float]]]:
-    """Parse the JS gaze-overlay payload.
-
-    Expected shape (mirror of the JS contract)::
-
-        {
-          "frames": {
-            "<frame_idx>": {
-              "l": [yaw_rad, pitch_rad],
-              "r": [yaw_rad, pitch_rad]
-            }, ...
-          }
-        }
-
-    Returns ``{frame_idx: {"l": (yaw, pitch), "r": (yaw, pitch)}}``.
-    Missing eyes / invalid entries are silently dropped.
-    """
-    if not blob or not blob.strip():
-        return {}
-    try:
-        data = json.loads(blob)
-    except json.JSONDecodeError as e:
-        log.warning("gaze_overrides_json ignored — not valid JSON: %s", e)
-        return {}
-    frames = data.get("frames") if isinstance(data, dict) else None
-    if not isinstance(frames, dict):
-        return {}
-    out: dict[int, dict[str, tuple[float, float]]] = {}
-    for f_key, eye_map in frames.items():
-        try:
-            f_idx = int(f_key)
-        except (TypeError, ValueError):
-            continue
-        if not isinstance(eye_map, dict):
-            continue
-        per_frame: dict[str, tuple[float, float]] = {}
-        for eye_key in ("l", "r"):
-            v = eye_map.get(eye_key)
-            if not (isinstance(v, (list, tuple)) and len(v) == 2):
-                continue
-            try:
-                per_frame[eye_key] = (float(v[0]), float(v[1]))
-            except (TypeError, ValueError):
-                continue
-        if per_frame:
-            out[f_idx] = per_frame
-    return out
-
-
-def _apply_gaze_override_to_iris_entry(entry: dict, eye_key: str,
-                                       yaw_rad: float, pitch_rad: float) -> None:
-    """Patch a single per-frame iris_data entry's ``{eye}_gaze`` dict in place.
-
-    Mirrors the field shape that downstream nodes (gaze_blendshape, the
-    Wan-Animate pose renderer) already consume: ``yaw_rad``, ``pitch_rad``,
-    plus a normalised 2-D direction (``dx``, ``dy``) and a magnitude in
-    [0, 1] derived from the override angles.  Source tag is changed to
-    ``"user_override"`` so the pipeline knows the value came from the UI.
-    """
-    eye_name = "left" if eye_key == "l" else "right"
-    key = f"{eye_name}_gaze"
-    g = entry.get(key)
-    if not isinstance(g, dict):
-        g = {}
-    # 2-D direction encoded as unit-length displacement on a flat plane.
-    # Positive yaw → look-right (dx > 0); positive pitch → look-up.  This
-    # matches how the JS overlay derives the offset from the eye centroid
-    # and how gaze_blendshape encodes the screen-space arrow.
-    yaw_n   = max(-1.0, min(1.0, yaw_rad   / _GAZE_MAX_YAW_RAD))
-    pitch_n = max(-1.0, min(1.0, pitch_rad / _GAZE_MAX_PITCH_RAD))
-    nrm = float(math.hypot(yaw_n, pitch_n))
-    if nrm > 1e-6:
-        dx = yaw_n / nrm
-        dy = -pitch_n / nrm        # image-Y is down → invert pitch
-        mag = min(1.0, nrm)
-    else:
-        dx = dy = 0.0
-        mag = 0.0
-    g["yaw_rad"]         = float(yaw_rad)
-    g["pitch_rad"]       = float(pitch_rad)
-    g["dx"]              = round(dx, 4)
-    g["dy"]              = round(dy, 4)
-    g["magnitude_norm"]  = round(mag, 4)
-    g["source"]          = "user_override"
-    entry[key] = g
+# _parse_overrides / _parse_gaze_overrides / _apply_gaze_override_to_iris_entry
+# now live in ``_face_helpers`` and are re-exported at the top of this file.
 
 
 class WanFaceExpressionEditorUI:
