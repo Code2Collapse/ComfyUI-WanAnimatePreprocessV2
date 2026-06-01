@@ -314,6 +314,136 @@ def _rot_matrix(yaw_deg: float, pitch_deg: float, roll_deg: float) -> np.ndarray
     return Rz @ Ry @ Rx
 
 
+def _apply_head_translation(
+    xy_norm: np.ndarray,
+    tx_face: float,
+    ty_face: float,
+    tz_scale: float,
+) -> np.ndarray:
+    """Translate + depth-scale the 68 landmarks rigidly.
+
+    tx_face / ty_face : translation in FACE-BBOX-width units. +tx moves
+        the face to image right; +ty moves it down. Typical user range
+        ±0.5 (half a face width).
+    tz_scale          : signed depth in face-bbox-width units. The face
+        is uniformly scaled around its own centroid by ``1 / (1 + tz)``;
+        +tz pushes the face away (smaller), -tz brings it forward
+        (larger). Clamped so the divisor cannot reach zero or flip sign.
+
+    All three are no-ops at 0.0 (fast path).
+    """
+    if abs(tx_face) < 1e-4 and abs(ty_face) < 1e-4 and abs(tz_scale) < 1e-4:
+        return xy_norm
+    bw, bh = _face_bbox_size(xy_norm)
+    s = max(bw, bh)
+    cx = float(xy_norm[:, 0].mean())
+    cy = float(xy_norm[:, 1].mean())
+    # Depth scale around centroid. Clamp tz so (1+tz) stays in [0.25, 4.0]
+    # i.e. zoom factor in [0.25x, 4.0x] — beyond that the face is unusable.
+    tz_clamped = float(np.clip(tz_scale, -0.75, 3.0))
+    zoom = 1.0 / (1.0 + tz_clamped)
+    out = xy_norm.copy()
+    if abs(zoom - 1.0) > 1e-4:
+        out[:, 0] = (out[:, 0] - cx) * zoom + cx
+        out[:, 1] = (out[:, 1] - cy) * zoom + cy
+    # Translation last, in IMAGE-normalised units (face-bbox * face_width).
+    out[:, 0] = out[:, 0] + tx_face * s
+    out[:, 1] = out[:, 1] + ty_face * s
+    return out
+
+
+def _propagate_head_overrides(
+    base: Dict[int, Dict[str, float]],
+    n_frames: int,
+    mode: str,
+    keys: Tuple[str, ...],
+) -> Dict[int, Dict[str, float]]:
+    """Spread sparse per-frame head/gaze pins across the whole timeline.
+
+    base    : ``{frame_idx: {"yaw": ..., ...}}`` from the JSON parser
+              (already merged with range-broadcast entries).
+    n_frames: total number of frames in the clip.
+    mode    : one of:
+        ``"off"``               — return ``base`` unchanged.
+        ``"hold_last"``         — every gap holds the previous pin's
+                                   value (step-function). Before the
+                                   first pin: no entry. Useful for
+                                   discrete pose changes.
+        ``"interpolate"``       — linearly interpolate each key between
+                                   adjacent pins; extrapolate flat at
+                                   the ends. Smooth, DAW-style automation.
+        ``"broadcast_first"``   — apply the first pin's values to every
+                                   frame that has no explicit pin.
+
+    Per-frame pins in ``base`` always win on output; only gaps are
+    filled. Keys missing from a pin are left unfilled (so two keys can
+    have independent timelines).
+    """
+    if mode == "off" or not base or n_frames <= 0:
+        return base
+    if mode not in ("hold_last", "interpolate", "broadcast_first"):
+        return base
+
+    # Per-key sorted pin list.
+    per_key_pins: Dict[str, list[Tuple[int, float]]] = {k: [] for k in keys}
+    for f_idx in sorted(base.keys()):
+        if not (0 <= f_idx < n_frames):
+            continue
+        entry = base[f_idx]
+        if not isinstance(entry, dict):
+            continue
+        for k in keys:
+            if k in entry:
+                try:
+                    per_key_pins[k].append((f_idx, float(entry[k])))
+                except (TypeError, ValueError):
+                    pass
+
+    # Walk every frame, compute the propagated value per key.
+    out: Dict[int, Dict[str, float]] = {f: dict(v) for f, v in base.items() if isinstance(v, dict)}
+    for k in keys:
+        pins = per_key_pins[k]
+        if not pins:
+            continue
+        if mode == "broadcast_first":
+            v0 = pins[0][1]
+            for f in range(n_frames):
+                slot = out.setdefault(f, {})
+                slot.setdefault(k, v0)
+            continue
+        # hold_last and interpolate share the same pin-walk skeleton.
+        for f in range(n_frames):
+            # Find left/right pins.
+            left = None
+            right = None
+            for p in pins:
+                if p[0] <= f:
+                    left = p
+                elif right is None:
+                    right = p
+                    break
+            slot = out.setdefault(f, {})
+            if k in slot:
+                continue  # explicit pin — leave it alone.
+            if left is None and right is None:
+                continue
+            if left is None:
+                # Before any pin — flat at the first pin.
+                slot[k] = right[1]
+                continue
+            if right is None or mode == "hold_last":
+                slot[k] = left[1]
+                continue
+            # Linear interpolation between adjacent pins.
+            span = right[0] - left[0]
+            if span <= 0:
+                slot[k] = left[1]
+            else:
+                t = (f - left[0]) / span
+                slot[k] = left[1] + (right[1] - left[1]) * t
+    return out
+
+
 def _apply_head_rotation(
     xy_norm: np.ndarray,
     yaw_deg: float,
@@ -357,7 +487,7 @@ def _apply_head_rotation(
 # ----------------------------------------------------------------------
 # Pose-JSON parsing
 # ----------------------------------------------------------------------
-_POSE_KEYS = ("yaw", "pitch", "roll")
+_POSE_KEYS = ("yaw", "pitch", "roll", "tx", "ty", "tz")
 _GAZE_KEYS = ("yaw", "pitch")
 
 
@@ -628,6 +758,39 @@ class WanFaceController3DV2:
                 "head_roll_deg": ("FLOAT", {
                     "default": 0.0, "min": -60.0, "max": 60.0, "step": 0.5,
                 }),
+                # ── (3b) Head translation (rigid 5-DOF extension) ────
+                # tx/ty in FACE-BBOX-WIDTH units (±0.5 ≈ half-face shift).
+                # tz is a depth-zoom signal: +tz pushes the face away
+                # (face shrinks); -tz brings it forward (grows). Clamped
+                # in _apply_head_translation so the zoom factor stays in
+                # [0.25x .. 4.0x].
+                "head_tx": ("FLOAT", {
+                    "default": 0.0, "min": -2.0, "max": 2.0, "step": 0.01,
+                    "tooltip": "Horizontal head shift in face-width units (+ = image right).",
+                }),
+                "head_ty": ("FLOAT", {
+                    "default": 0.0, "min": -2.0, "max": 2.0, "step": 0.01,
+                    "tooltip": "Vertical head shift in face-width units (+ = image down).",
+                }),
+                "head_tz": ("FLOAT", {
+                    "default": 0.0, "min": -0.75, "max": 3.0, "step": 0.01,
+                    "tooltip": "Depth shift: + pushes the face away (smaller), - brings it forward (larger).",
+                }),
+                # ── (3c) Rigid-pose propagation across the timeline ──
+                "propagate_head": (["off", "hold_last", "interpolate", "broadcast_first"], {
+                    "default": "off",
+                    "tooltip": (
+                        "How to fill timeline gaps between explicit head_pose_json pins:\n"
+                        "  off            – use pins where given, constants elsewhere.\n"
+                        "  hold_last      – step-function: each gap holds the previous pin.\n"
+                        "  interpolate    – DAW-style linear interpolation between pins.\n"
+                        "  broadcast_first – apply the first pin to every gap frame."
+                    ),
+                }),
+                "propagate_gaze": (["off", "hold_last", "interpolate", "broadcast_first"], {
+                    "default": "off",
+                    "tooltip": "Same propagation semantics for gaze_json pins.",
+                }),
                 # ── (4) Gaze ─────────────────────────────────────────
                 "gaze_json": ("STRING", {
                     "multiline": True, "default": "",
@@ -697,6 +860,11 @@ class WanFaceController3DV2:
             head_yaw_deg: float = 0.0,
             head_pitch_deg: float = 0.0,
             head_roll_deg: float = 0.0,
+            head_tx: float = 0.0,
+            head_ty: float = 0.0,
+            head_tz: float = 0.0,
+            propagate_head: str = "off",
+            propagate_gaze: str = "off",
             gaze_json: str = "",
             gaze_yaw_deg: float = 0.0,
             gaze_pitch_deg: float = 0.0,
@@ -738,6 +906,16 @@ class WanFaceController3DV2:
         )
         gaze_overrides = _parse_keyed_json(
             gaze_json, n_frames, _GAZE_KEYS, range_field="gaze",
+        )
+        # Spread sparse pins across the timeline when requested. This
+        # widens `head_overrides`/`gaze_overrides` with synthetic
+        # interpolated/held entries that the per-frame loop below picks
+        # up exactly like real pins.
+        head_overrides = _propagate_head_overrides(
+            head_overrides, n_frames, str(propagate_head), _POSE_KEYS,
+        )
+        gaze_overrides = _propagate_head_overrides(
+            gaze_overrides, n_frames, str(propagate_gaze), _GAZE_KEYS,
         )
 
         ref_norm_local = _ref_norm_from_bundle(reference_pose_data)
@@ -814,6 +992,20 @@ class WanFaceController3DV2:
                 n_rotated += 1
                 changed = True
 
+            # (3b) Head translation — tx/ty in face-width units; tz as
+            # depth zoom around the face centroid. Per-frame additive
+            # overrides under the key "tx"/"ty"/"tz" in head_pose_json
+            # are honoured (parser is permissive: any float-coerced
+            # value through _parse_keyed_json works once the key is in
+            # _POSE_KEYS_FULL).
+            tx = float(head_tx) + float(h_entry.get("tx", 0.0))
+            ty = float(head_ty) + float(h_entry.get("ty", 0.0))
+            tz = float(head_tz) + float(h_entry.get("tz", 0.0))
+            if abs(tx) > 1e-4 or abs(ty) > 1e-4 or abs(tz) > 1e-4:
+                xy_norm = _apply_head_translation(xy_norm, tx, ty, tz)
+                n_rotated += 1  # counted under rigid edits
+                changed = True
+
             if changed:
                 _write_face_normalised(meta, xy_norm.astype(np.float32))
                 affected += 1
@@ -847,11 +1039,16 @@ class WanFaceController3DV2:
             "constant_deg": {"yaw": float(head_yaw_deg),
                               "pitch": float(head_pitch_deg),
                               "roll": float(head_roll_deg)},
+            "constant_translation": {"tx": float(head_tx),
+                                      "ty": float(head_ty),
+                                      "tz": float(head_tz)},
+            "propagate_mode": str(propagate_head),
             "per_frame": {str(k): v for k, v in head_overrides.items()},
         }
         bundle["gaze_controls"] = {
             "constant_deg": {"yaw": float(gaze_yaw_deg),
                               "pitch": float(gaze_pitch_deg)},
+            "propagate_mode": str(propagate_gaze),
             "per_frame": {str(k): v for k, v in gaze_overrides.items()},
         }
 
