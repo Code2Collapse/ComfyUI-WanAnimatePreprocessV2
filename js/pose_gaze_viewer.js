@@ -183,6 +183,7 @@ app.registerExtension({
                 }
                 // Reserve extra height for the preview.
                 if (this.size && this.size[1] < 360) this.size[1] = 360;
+                _pgvInstances.add(this);
             } catch (e) {
                 reportFailure("pose_gaze_viewer.onNodeCreated", e);
             }
@@ -259,5 +260,60 @@ app.registerExtension({
             }
             return r;
         };
+
+        const onRemoved = nodeType.prototype.onRemoved;
+        nodeType.prototype.onRemoved = function () {
+            _pgvInstances.delete(this);
+            return onRemoved?.apply(this, arguments);
+        };
     },
 });
+
+// ── Ctrl+K command-palette integration ──────────────────────────────
+const _pgvInstances = new Set();
+function _pgvActive() {
+    let last = null;
+    for (const n of _pgvInstances) last = n;
+    return last || null;
+}
+function _pgvSetFrame(node, idx) {
+    if (!node) return;
+    const s = node.__pgv_slider;
+    if (!s) return;
+    const max = s.options?.max ?? 0;
+    const next = Math.max(0, Math.min(max, idx | 0));
+    node.__pgv_frame = next;
+    s.value = next;
+    if (s.callback) try { s.callback(next); } catch (_) {}
+    node.setDirtyCanvas(true, false);
+}
+function _pgvStep(node, delta) {
+    if (!node) return;
+    _pgvSetFrame(node, (node.__pgv_frame | 0) + delta);
+}
+function _pgvToggle(node, key) {
+    if (!node) return;
+    const w = node[key];
+    if (!w) return;
+    w.value = !w.value;
+    if (w.callback) try { w.callback(w.value); } catch (_) {}
+}
+function _pgvRegisterActions() {
+    const reg = window.__C2C_ACTIONS__?.register;
+    if (typeof reg !== "function") return;
+    const enabled = () => _pgvInstances.size > 0;
+    const actions = [
+        { id: "wanv2.pgv.nextFrame",  title: "Pose+Face Viewer: Next frame",     icon: "→", keywords: ["pose","face","viewer","next","frame"], run: () => _pgvStep(_pgvActive(), +1) },
+        { id: "wanv2.pgv.prevFrame",  title: "Pose+Face Viewer: Previous frame", icon: "←", keywords: ["pose","face","viewer","prev","frame"], run: () => _pgvStep(_pgvActive(), -1) },
+        { id: "wanv2.pgv.gotoFirst",  title: "Pose+Face Viewer: Go to first frame", icon: "⏮", keywords: ["pose","first","home"], run: () => _pgvSetFrame(_pgvActive(), 0) },
+        { id: "wanv2.pgv.gotoLast",   title: "Pose+Face Viewer: Go to last frame",  icon: "⏭", keywords: ["pose","last","end"],   run: () => { const n = _pgvActive(); _pgvSetFrame(n, n?.__pgv_slider?.options?.max ?? 0); } },
+        { id: "wanv2.pgv.toggleSkel", title: "Pose+Face Viewer: Toggle skeleton overlay", icon: "🦴", keywords: ["pose","skeleton","toggle"], run: () => _pgvToggle(_pgvActive(), "__pgv_showSkel") },
+        { id: "wanv2.pgv.toggleIris", title: "Pose+Face Viewer: Toggle iris overlay",     icon: "👁", keywords: ["face","iris","toggle"],     run: () => _pgvToggle(_pgvActive(), "__pgv_showIris") },
+        { id: "wanv2.pgv.toggleGaze", title: "Pose+Face Viewer: Toggle gaze arrows",      icon: "↗", keywords: ["face","gaze","toggle"],     run: () => _pgvToggle(_pgvActive(), "__pgv_showGaze") },
+    ];
+    for (const a of actions) {
+        try { reg({ ...a, kind: "command", scope: "graph", enabled }); } catch (_) {}
+    }
+}
+setTimeout(_pgvRegisterActions, 0);
+setTimeout(_pgvRegisterActions, 1000);

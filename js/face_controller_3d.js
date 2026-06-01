@@ -1794,6 +1794,14 @@ function buildOverlay(node) {
             drawPose();
             drawTimeline();
         },
+        // Imperative control surface for the Ctrl+K command palette and
+        // any other extension wanting to script the overlay.
+        focus()       { try { cvs.focus(); } catch (_) {} },
+        resetFrame()  { try { reset.click(); } catch (_) {} },
+        gotoFirst()   { _gotoFrame(0); },
+        gotoLast()    { _gotoFrame(parseInt(slider.max, 10) || 0); },
+        step(delta)   { _stepFrame(delta); },
+        setView(v)    { try { _setView(v); } catch (_) {} },
     };
 
     // Default view = both, applied AFTER api is wired so _setView can call drawPose.
@@ -1833,6 +1841,7 @@ app.registerExtension({
             if (node._cachedOverlayMeta) {
                 try { overlay.update(JSON.parse(node._cachedOverlayMeta)); } catch (_) {}
             }
+            _fc3dInstances.add(node);
         };
 
         const _executed = nodeType.prototype.onExecuted;
@@ -1847,5 +1856,40 @@ app.registerExtension({
                 this._faceOverlay.update(meta);
             }
         };
+
+        const _removed = nodeType.prototype.onRemoved;
+        nodeType.prototype.onRemoved = function () {
+            _fc3dInstances.delete(this);
+            return _removed?.apply(this, arguments);
+        };
     },
 });
+
+// ── Ctrl+K command-palette integration ──────────────────────────────
+// Tracks every live WanFaceController3DV2 node so the global palette
+// can dispatch keyboard shortcuts at the most-recently-created one.
+const _fc3dInstances = new Set();
+function _fc3dActive() {
+    let last = null;
+    for (const n of _fc3dInstances) last = n;
+    return last?._faceOverlay || null;
+}
+function _fc3dRegisterActions() {
+    const reg = window.__C2C_ACTIONS__?.register;
+    if (typeof reg !== "function") return;
+    const enabled = () => _fc3dInstances.size > 0;
+    const actions = [
+        { id: "mec.faceController.focus",      title: "Face Controller: Focus canvas (enable arrow-key nav)", icon: "◎", keywords: ["face","focus","keyboard"],          run: () => _fc3dActive()?.focus()       },
+        { id: "mec.faceController.resetFrame", title: "Face Controller: Reset overrides on current frame",     icon: "⟲", keywords: ["face","reset","clear","undo"],     run: () => _fc3dActive()?.resetFrame()  },
+        { id: "mec.faceController.gotoFirst",  title: "Face Controller: Go to first frame",                    icon: "⏮", keywords: ["face","first","home","frame"],      run: () => _fc3dActive()?.gotoFirst()   },
+        { id: "mec.faceController.gotoLast",   title: "Face Controller: Go to last frame",                     icon: "⏭", keywords: ["face","last","end","frame"],        run: () => _fc3dActive()?.gotoLast()    },
+        { id: "mec.faceController.viewFace",   title: "Face Controller: View — face only",                     icon: "👤", keywords: ["face","view","layout"],            run: () => _fc3dActive()?.setView("face") },
+        { id: "mec.faceController.viewPose",   title: "Face Controller: View — pose only",                     icon: "🦴", keywords: ["face","pose","view","layout"],    run: () => _fc3dActive()?.setView("pose") },
+        { id: "mec.faceController.viewBoth",   title: "Face Controller: View — face + pose",                   icon: "▦", keywords: ["face","pose","both","view","layout"], run: () => _fc3dActive()?.setView("both") },
+    ];
+    for (const a of actions) {
+        try { reg({ ...a, kind: "command", scope: "graph", enabled }); } catch (_) {}
+    }
+}
+setTimeout(_fc3dRegisterActions, 0);
+setTimeout(_fc3dRegisterActions, 1000);
