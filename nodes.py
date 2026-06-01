@@ -2504,21 +2504,71 @@ class PoseAndFaceDetectionV2:
         except Exception:  # noqa: BLE001 — never break the node on resize
             face_images_512_tensor = face_images_tensor
 
-        return (
-            pose_data,
-            face_images_tensor,
-            json.dumps(points_dict_list),
-            [bbox_ints],
-            face_bboxes,
-            json.dumps(iris_output),
-            debug_tensor,
-            json.dumps(right_pupil_seq),
-            json.dumps(left_pupil_seq),
-            mean_lip_openness,
-            restore_info,
-            float(face_cfg_scale),
-            face_images_512_tensor,
-        )
+        # C.2/C0.6 — UI payload for pose_gaze_viewer.js
+        # Compact per-frame summary (skeleton+iris+gaze unit-vectors).
+        # Capped at 240 frames to keep websocket cheap; viewer falls
+        # back to "no data" if absent.
+        _viewer_frames = []
+        try:
+            _max_f = min(240, len(all_iris))
+            for _fi in range(_max_f):
+                _ir = all_iris[_fi] or {}
+                _ri = _ir.get('right_iris') or {}
+                _li = _ir.get('left_iris') or {}
+                _rg = _ir.get('right_gaze') or {}
+                _lg = _ir.get('left_gaze') or {}
+                _kp_body = pose_metas[_fi].get('keypoints_body') if _fi < len(pose_metas) else None
+                _skel = []
+                if _kp_body is not None:
+                    for _kp in _kp_body:
+                        if _kp is None:
+                            _skel.append(None)
+                        else:
+                            _skel.append([round(float(_kp[0]) * float(W), 1),
+                                          round(float(_kp[1]) * float(H), 1)])
+                _viewer_frames.append({
+                    "frame": _fi,
+                    "skeleton": _skel,
+                    "right_iris": [round(float(_ri.get('x', 0.0)), 1),
+                                   round(float(_ri.get('y', 0.0)), 1)],
+                    "left_iris":  [round(float(_li.get('x', 0.0)), 1),
+                                   round(float(_li.get('y', 0.0)), 1)],
+                    "right_gaze": [round(float(_rg.get('dx', 0.0)), 3),
+                                   round(float(_rg.get('dy', 0.0)), 3),
+                                   round(float(_rg.get('magnitude_norm', 0.0)), 3)],
+                    "left_gaze":  [round(float(_lg.get('dx', 0.0)), 3),
+                                   round(float(_lg.get('dy', 0.0)), 3),
+                                   round(float(_lg.get('magnitude_norm', 0.0)), 3)],
+                })
+        except Exception:  # noqa: BLE001
+            _viewer_frames = []
+        _ui_payload = {
+            "viewer_meta": [json.dumps({
+                "src_w": int(W), "src_h": int(H),
+                "n_frames": int(B),
+                "engine": str(_engine),
+                "frames": _viewer_frames,
+            })],
+        }
+
+        return {
+            "ui": _ui_payload,
+            "result": (
+                pose_data,
+                face_images_tensor,
+                json.dumps(points_dict_list),
+                [bbox_ints],
+                face_bboxes,
+                json.dumps(iris_output),
+                debug_tensor,
+                json.dumps(right_pupil_seq),
+                json.dumps(left_pupil_seq),
+                mean_lip_openness,
+                restore_info,
+                float(face_cfg_scale),
+                face_images_512_tensor,
+            ),
+        }
 
 
 # ---------------------------------------------------
