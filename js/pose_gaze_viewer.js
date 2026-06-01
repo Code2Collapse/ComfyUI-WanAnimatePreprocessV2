@@ -218,5 +218,46 @@ app.registerExtension({
                 reportFailure("pose_gaze_viewer.onDrawForeground", e);
             }
         };
+
+        // Keyboard navigation when the node is the selected node in the
+        // LiteGraph canvas. LiteGraph dispatches keydown to the selected
+        // node via `onKeyDown(e)`. We step the viewer_frame slider.
+        const onKeyDown = nodeType.prototype.onKeyDown;
+        nodeType.prototype.onKeyDown = function (ev) {
+            // Pass through to any prior handler first.
+            const r = onKeyDown?.apply(this, arguments);
+            if (r === true) return r;
+            try {
+                const slider = this.__pgv_slider;
+                if (!slider) return r;
+                const max = slider.options?.max ?? 0;
+                const big = ev.shiftKey ? 10 : 1;
+                let next = this.__pgv_frame | 0;
+                let handled = false;
+                switch (ev.key) {
+                    case "ArrowLeft":
+                    case "ArrowDown":
+                        next = Math.max(0, next - big); handled = true; break;
+                    case "ArrowRight":
+                    case "ArrowUp":
+                        next = Math.min(max, next + big); handled = true; break;
+                    case "Home":
+                        next = 0; handled = true; break;
+                    case "End":
+                        next = max; handled = true; break;
+                }
+                if (handled && next !== this.__pgv_frame) {
+                    this.__pgv_frame = next;
+                    slider.value = next;
+                    if (slider.callback) try { slider.callback(next); } catch (_) {}
+                    this.setDirtyCanvas(true, false);
+                }
+                if (handled && ev.preventDefault) ev.preventDefault();
+                return handled || r;
+            } catch (e) {
+                reportFailure("pose_gaze_viewer.onKeyDown", e);
+            }
+            return r;
+        };
     },
 });
