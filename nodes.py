@@ -2473,12 +2473,20 @@ class DrawViTPoseV2:
                     "tooltip": "Skip iris frames whose detection confidence is below this."}),
                 "iris_color": (["white", "magenta", "yellow", "green"], {"default": "white",
                     "tooltip": "Color of the drawn pupil; magenta gives strongest sampler signal."}),
+                # ---- C0.5: face passthrough (Wan 2.2 Animate face encoder convenience) ----
+                "face_images": ("IMAGE", {"tooltip": "OPTIONAL face crop IMAGE batch (typically the face_images_512 output of PoseAndFaceDetectionV2). When wired, the node validates frame-count parity with the pose batch, optionally force-resizes to 512x512, and forwards it on the 'face_video' output so a single DrawViTPoseV2 can feed the Wan-Animate sampler's pose+face inputs in one place."}),
+                "face_cfg_scale": ("FLOAT", {"default": 1.0, "min": 1.0, "max": 10.0, "step": 0.1, "tooltip": "Passthrough face CFG scale (Wan-Animate paper Sec. 4.3). Wire the FLOAT output of PoseAndFaceDetectionV2.face_cfg_scale here for tidy graph routing."}),
+                "enforce_512_face": ("BOOLEAN", {"default": True, "tooltip": "If True and 'face_images' is provided at a non-512 size, force-resize each frame to 512x512 (bilinear) before forwarding. Default True so the encoder always sees the trained input shape."}),
             },
         }
 
-    RETURN_TYPES = ("IMAGE", )
-    RETURN_NAMES = ("pose_images", )
-    OUTPUT_TOOLTIPS = ("Rendered skeleton IMAGE batch. Feed into your Wan 2.2 Animate sampler.",)
+    RETURN_TYPES = ("IMAGE", "IMAGE", "FLOAT")
+    RETURN_NAMES = ("pose_images", "face_video", "face_cfg_scale")
+    OUTPUT_TOOLTIPS = (
+        "Rendered skeleton IMAGE batch. Feed into your Wan 2.2 Animate sampler.",
+        "Passthrough face IMAGE batch (512x512 if enforce_512_face). Empty single-frame zero tensor if 'face_images' was not wired.",
+        "Passthrough face_cfg_scale (Wan-Animate paper Sec. 4.3). 1.0 = CFG off.",
+    )
     FUNCTION = "process"
     CATEGORY = "WanAnimatePreprocess_V2"
 
@@ -2557,7 +2565,8 @@ class DrawViTPoseV2:
                 draw_head, pose_draw_threshold, retarget_padding=64,
                 draw_iris=True, draw_gaze=True,
                 iris_radius=4, gaze_arrow_len=30,
-                iris_min_confidence=0.05, iris_color="white"):
+                iris_min_confidence=0.05, iris_color="white",
+                face_images=None, face_cfg_scale=1.0, enforce_512_face=True):
         pose_metas = pose_data["pose_metas"]
         draw_hand = hand_stick_width != 0
 
@@ -2620,7 +2629,48 @@ class DrawViTPoseV2:
 
         pose_images_np = np.stack(pose_images, 0)
         pose_images_tensor = torch.from_numpy(pose_images_np).float() / 255.0
-        return (pose_images_tensor, )
+
+        # ---- C0.5: face passthrough -------------------------------------
+        # If the user wired face_images, validate frame-count parity, optionally
+        # force-resize to 512x512, and forward. Otherwise emit a single-frame
+        # zero tensor (Comfy refuses None for declared IMAGE outputs).
+        face_video_out = None
+        if face_images is not None:
+            try:
+                if hasattr(face_images, "detach"):
+                    _fi = face_images
+                else:
+                    _fi = torch.from_numpy(np.asarray(face_images))
+                if _fi.ndim != 4 or _fi.shape[-1] != 3:
+                    logging.getLogger(__name__).warning(
+                        "DrawViTPoseV2: face_images has unexpected shape %s; passing through unmodified.",
+                        tuple(_fi.shape),
+                    )
+                    face_video_out = _fi
+                else:
+                    if _fi.shape[0] != pose_images_tensor.shape[0]:
+                        logging.getLogger(__name__).warning(
+                            "DrawViTPoseV2: face_images frame count (%d) != pose frame count (%d); forwarding face_images as-is.",
+                            int(_fi.shape[0]), int(pose_images_tensor.shape[0]),
+                        )
+                    if bool(enforce_512_face) and (int(_fi.shape[1]) != 512 or int(_fi.shape[2]) != 512):
+                        # (B,H,W,3) -> (B,3,H,W) -> resize -> (B,H,W,3)
+                        _t = _fi.permute(0, 3, 1, 2).float()
+                        _t = torch.nn.functional.interpolate(
+                            _t, size=(512, 512), mode="bilinear", align_corners=False,
+                        )
+                        face_video_out = _t.permute(0, 2, 3, 1).contiguous().clamp(0.0, 1.0)
+                    else:
+                        face_video_out = _fi
+            except Exception as e:
+                logging.getLogger(__name__).warning(
+                    "DrawViTPoseV2: face passthrough failed (%s); forwarding original face_images.", e,
+                )
+                face_video_out = face_images
+        if face_video_out is None:
+            face_video_out = torch.zeros((1, 512, 512, 3), dtype=torch.float32)
+
+        return (pose_images_tensor, face_video_out, float(face_cfg_scale))
 
 
 # ====================================================================
