@@ -40,6 +40,12 @@
 // Catppuccin-ish palette to match the rest of the pack's UI.
 
 import { app } from "../../scripts/app.js";
+import { t as _t } from "./_c2c_i18n.js";
+// Tolerant wrapper: returns fallback on any i18n failure so missing
+// bundle / locale errors never break the overlay.
+function T(key, fallback, vars) {
+    try { return _t(key, fallback, vars); } catch (_) { return fallback ?? key; }
+}
 
 const NODE_CLASS = "WanFaceController3DV2";
 const OVERRIDE_WIDGET = "landmark_overrides_json";
@@ -397,7 +403,7 @@ function buildOverlay(node) {
         "border:1px solid " + C.border + ";border-radius:3px;" +
         "font:11px ui-monospace,monospace;color:" + C.text + ";" +
         "white-space:nowrap;overflow:hidden;text-overflow:ellipsis;";
-    statusEl.textContent = "hover a point to inspect — drag to move — or type exact coords below";
+    statusEl.textContent = T("fc3d.status.hoverHint", "hover a point to inspect \u2014 drag to move \u2014 or type exact coords below");
     root.appendChild(statusEl);
 
     // ── Numeric coordinate editor ──────────────────────────────────────
@@ -451,15 +457,16 @@ function buildOverlay(node) {
     };
 
     const tgtSel = document.createElement("select");
+    tgtSel.title = T("fc3d.tip.target", "What to edit: face landmark, pose joint, or gaze eye");
     tgtSel.title = "What to edit: face landmark, pose joint, or gaze eye";
     tgtSel.style.cssText =
         "padding:2px 4px;background:" + C.input_bg + ";color:" + C.text + ";" +
         "border:1px solid " + C.border + ";border-radius:2px;font:11px ui-sans-serif;";
     for (const [v, t] of [
-        ["face",   "face (iBUG-68)"],
-        ["pose",   "pose (OP-18)"],
-        ["gaze-l", "gaze L (rad)"],
-        ["gaze-r", "gaze R (rad)"],
+        ["face",   T("fc3d.target.face",  "face (iBUG-68)")],
+        ["pose",   T("fc3d.target.pose",  "pose (OP-18)")],
+        ["gaze-l", T("fc3d.target.gazeL", "gaze L (rad)")],
+        ["gaze-r", T("fc3d.target.gazeR", "gaze R (rad)")],
     ]) {
         const o = document.createElement("option"); o.value = v; o.textContent = t; tgtSel.appendChild(o);
     }
@@ -468,19 +475,19 @@ function buildOverlay(node) {
     idxInput.value = "30";
     const xInput   = _mkNumInput("x", 0.001, null, null, 64);
     const yInput   = _mkNumInput("y", 0.001, null, null, 64);
-    const btnSet   = _mkBtn("Set",   "Write these coordinates as the override for the current frame.", C.ok_bg);
-    const btnClear = _mkBtn("Clear", "Remove this point's override for the current frame.",            C.err_bg);
-    const btnPick  = _mkBtn("Pick",  "Copy the currently-hovered or last-selected point into these fields.", C.info_bg);
+    const btnSet   = _mkBtn(T("fc3d.btn.set",   "Set"),   T("fc3d.tip.set",   "Write these coordinates as the override for the current frame."), C.ok_bg);
+    const btnClear = _mkBtn(T("fc3d.btn.clear", "Clear"), T("fc3d.tip.clear", "Remove this point's override for the current frame."),            C.err_bg);
+    const btnPick  = _mkBtn(T("fc3d.btn.pick",  "Pick"),  T("fc3d.tip.pick",  "Copy the currently-hovered or last-selected point into these fields."), C.info_bg);
 
     const nameTag = document.createElement("span");
     nameTag.style.cssText = "color:" + C.dim + ";font:10px ui-monospace,monospace;margin-left:auto;";
     nameTag.textContent = "—";
 
     editor.append(
-        _mkLbl("target"), tgtSel,
-        _mkLbl("idx"),    idxInput,
-        _mkLbl("x"),      xInput,
-        _mkLbl("y"),      yInput,
+        _mkLbl(T("fc3d.lbl.target", "target")), tgtSel,
+        _mkLbl(T("fc3d.lbl.idx",    "idx")),    idxInput,
+        _mkLbl(T("fc3d.lbl.x",      "x")),      xInput,
+        _mkLbl(T("fc3d.lbl.y",      "y")),      yInput,
         btnSet, btnClear, btnPick,
         nameTag,
     );
@@ -492,11 +499,11 @@ function buildOverlay(node) {
         const isGaze = (t === "gaze-l" || t === "gaze-r");
         idxInput.style.display = isGaze ? "none" : "";
         if (isGaze) {
-            xInput.step = "0.01"; xInput.placeholder = "yaw rad";
-            yInput.step = "0.01"; yInput.placeholder = "pitch rad";
+            xInput.step = "0.01"; xInput.placeholder = T("fc3d.ph.yawRad",   "yaw rad");
+            yInput.step = "0.01"; yInput.placeholder = T("fc3d.ph.pitchRad", "pitch rad");
         } else {
-            xInput.step = "0.001"; xInput.placeholder = "x 0..1";
-            yInput.step = "0.001"; yInput.placeholder = "y 0..1";
+            xInput.step = "0.001"; xInput.placeholder = T("fc3d.ph.xNorm", "x 0..1");
+            yInput.step = "0.001"; yInput.placeholder = T("fc3d.ph.yNorm", "y 0..1");
             const maxIdx = (t === "pose") ? 17 : 67;
             idxInput.max = String(maxIdx);
             if ((parseInt(idxInput.value, 10) || 0) > maxIdx) idxInput.value = "0";
@@ -512,7 +519,9 @@ function buildOverlay(node) {
             const i = parseInt(idxInput.value, 10) || 0;
             nameTag.textContent = `pose[${i}] ${POSE18_NAMES[i] || "?"}`;
         } else {
-            nameTag.textContent = (t === "gaze-l") ? "gaze L  (yaw,pitch) in radians" : "gaze R  (yaw,pitch) in radians";
+            nameTag.textContent = (t === "gaze-l")
+                ? T("fc3d.tag.gazeL", "gaze L  (yaw,pitch) in radians")
+                : T("fc3d.tag.gazeR", "gaze R  (yaw,pitch) in radians");
         }
     }
     tgtSel.addEventListener("change", _refreshEditorUI);
@@ -523,13 +532,13 @@ function buildOverlay(node) {
         const x = Number(xInput.value);
         const y = Number(yInput.value);
         if (!isFinite(x) || !isFinite(y)) {
-            statusEl.textContent = "✗ Set: x or y is not a number";
+            statusEl.textContent = T("fc3d.err.setNaN", "\u2717 Set: x or y is not a number");
             return;
         }
         const key = String(state.frame);
         if (t === "face") {
             const i = parseInt(idxInput.value, 10);
-            if (!(i >= 0 && i <= 67)) { statusEl.textContent = "✗ face idx must be 0..67"; return; }
+            if (!(i >= 0 && i <= 67)) { statusEl.textContent = T("fc3d.err.faceIdx", "\u2717 face idx must be 0..67"); return; }
             const xc = Math.max(0, Math.min(1, x));
             const yc = Math.max(0, Math.min(1, y));
             const ov = parseOverrides(node);
@@ -539,7 +548,7 @@ function buildOverlay(node) {
             statusEl.textContent = `✓ face[${i}] ${LM_NAMES[i]} ← (${xc.toFixed(3)}, ${yc.toFixed(3)}) @ f${key}`;
         } else if (t === "pose") {
             const i = parseInt(idxInput.value, 10);
-            if (!(i >= 0 && i <= 17)) { statusEl.textContent = "✗ pose idx must be 0..17"; return; }
+            if (!(i >= 0 && i <= 17)) { statusEl.textContent = T("fc3d.err.poseIdx", "\u2717 pose idx must be 0..17"); return; }
             const xc = Math.max(0, Math.min(1, x));
             const yc = Math.max(0, Math.min(1, y));
             const ov = parsePoseOverrides(node);
@@ -620,7 +629,7 @@ function buildOverlay(node) {
             }
             return;
         }
-        statusEl.textContent = "hover a point first, then click Pick";
+        statusEl.textContent = T("fc3d.status.hoverFirst", "hover a point first, then click Pick");
     });
 
     // Safe body-keypoint accessor (handles either flat array or {keypoints_body:...} shape).
@@ -644,7 +653,7 @@ function buildOverlay(node) {
     tl.style.cssText =
         "width:100%;height:34px;display:block;background:" + C.canvas_bg + ";" +
         "border:1px solid " + C.border + ";border-radius:4px;margin-top:4px;cursor:pointer;";
-    tl.title = "timeline · click=jump · shift-click=range · right-click=clear that frame";
+    tl.title = T("fc3d.tip.timeline", "timeline \u00b7 click=jump \u00b7 shift-click=range \u00b7 right-click=clear that frame");
     root.appendChild(tl);
 
     const tlBar = document.createElement("div");
@@ -667,10 +676,10 @@ function buildOverlay(node) {
             "border-radius:3px;padding:1px 6px;cursor:pointer;font:11px ui-sans-serif;";
         return b;
     };
-    const btnPropagate  = _mkTlBtn("Δ off", "Δ propagate: when ON, dragging a face landmark or pose joint applies that edit as a DELTA to every frame in the selected range (or all frames if none selected). Lets you pose/express once and broadcast it.");
-    const btnClearRange = _mkTlBtn("clear range", "Clear all overrides in the highlighted range (shift-click to set range).");
-    const btnClearAll   = _mkTlBtn("clear all",   "Clear ALL overrides (face / pose / gaze / Δ) across every frame.");
-    const btnSelClear   = _mkTlBtn("✕", "Drop the current range selection.");
+    const btnPropagate  = _mkTlBtn(T("fc3d.btn.propOff", "\u0394 off"), T("fc3d.tip.prop", "\u0394 propagate: when ON, dragging a face landmark or pose joint applies that edit as a DELTA to every frame in the selected range (or all frames if none selected). Lets you pose/express once and broadcast it."));
+    const btnClearRange = _mkTlBtn(T("fc3d.btn.clearRange", "clear range"), T("fc3d.tip.clearRange", "Clear all overrides in the highlighted range (shift-click to set range)."));
+    const btnClearAll   = _mkTlBtn(T("fc3d.btn.clearAll",   "clear all"),   T("fc3d.tip.clearAll",   "Clear ALL overrides (face / pose / gaze / \u0394) across every frame."));
+    const btnSelClear   = _mkTlBtn(T("fc3d.btn.selClear", "\u2715"), T("fc3d.tip.selClear", "Drop the current range selection."));
     btnSelClear.style.padding = "1px 5px";
     tlBar.append(tlLegend, btnPropagate, btnClearRange, btnClearAll, btnSelClear, tlInfo);
     root.appendChild(tlBar);
@@ -890,7 +899,7 @@ function buildOverlay(node) {
     }
     btnClearRange.addEventListener("click", () => {
         const range = _tlRange();
-        if (!range) { tlInfo.textContent = "select a range first (shift-click)"; return; }
+        if (!range) { tlInfo.textContent = T("fc3d.info.selectRangeFirst", "select a range first (shift-click)"); return; }
         for (let f = range[0]; f <= range[1]; f++) _clearFrame(f);
         // Also drop Δ-propagation entries that overlap the cleared range.
         const ofa = parseOverrides(node);
@@ -915,7 +924,7 @@ function buildOverlay(node) {
     function _refreshPropBtn() {
         const r = _tlRange();
         if (!propagateMode) {
-            btnPropagate.textContent = "Δ off";
+            btnPropagate.textContent = T("fc3d.btn.propOff", "\u0394 off");
             btnPropagate.style.background = C.border;
             btnPropagate.style.color = C.text;
             btnPropagate.style.fontWeight = "normal";
@@ -942,7 +951,7 @@ function buildOverlay(node) {
     viewBar.style.cssText =
         "display:flex;align-items:center;gap:6px;margin-top:4px;font:11px ui-sans-serif;color:" + C.dim + ";";
     const viewLbl = document.createElement("span");
-    viewLbl.textContent = "view:";
+    viewLbl.textContent = T("fc3d.lbl.view", "view:");
     const _mkViewBtn = (label, value) => {
         const b = document.createElement("button");
         b.textContent = label;
@@ -952,9 +961,9 @@ function buildOverlay(node) {
             "border-radius:3px;padding:1px 6px;cursor:pointer;font:11px ui-sans-serif;";
         return b;
     };
-    const btnFace = _mkViewBtn("face", "face");
-    const btnPose = _mkViewBtn("pose", "pose");
-    const btnBoth = _mkViewBtn("both", "both");
+    const btnFace = _mkViewBtn("face", T("fc3d.view.face", "face"));
+    const btnPose = _mkViewBtn("pose", T("fc3d.view.pose", "pose"));
+    const btnBoth = _mkViewBtn("both", T("fc3d.view.both", "both"));
     const poseInfo = document.createElement("span");
     poseInfo.style.cssText = "margin-left:auto;color:" + C.dim + ";font:11px ui-monospace,monospace;";
     poseInfo.textContent = "—";
@@ -971,7 +980,7 @@ function buildOverlay(node) {
     // Hint when no pose data is available.
     const poseHint = document.createElement("div");
     poseHint.style.cssText = "font:11px ui-sans-serif;color:" + C.dim + ";margin-top:2px;";
-    poseHint.textContent = "queue prompt once to enable pose editing";
+    poseHint.textContent = T("fc3d.hint.queueFirst", "queue prompt once to enable pose editing");
     root.appendChild(poseHint);
 
     // ── Pose-canvas state ─────────────────────────────────────────────
@@ -1247,7 +1256,7 @@ function buildOverlay(node) {
     poseCvs.addEventListener("mouseup",    _endPoseDrag);
     poseCvs.addEventListener("mouseleave", () => {
         pstate.hoverJ = -1; _endPoseDrag(); drawPose();
-        statusEl.textContent = "hover a point to inspect — drag to move — or type exact coords below";
+        statusEl.textContent = T("fc3d.status.hoverHint", "hover a point to inspect \u2014 drag to move \u2014 or type exact coords below");
     });
 
     // Right-click on a joint = clear its override.
@@ -1651,7 +1660,7 @@ function buildOverlay(node) {
         gstate.hoverEye = null;
         endDrag();
         draw();
-        statusEl.textContent = "hover a point to inspect — drag to move — or type exact coords below";
+        statusEl.textContent = T("fc3d.status.hoverHint", "hover a point to inspect \u2014 drag to move \u2014 or type exact coords below");
     });
 
     // Right-click on a gaze handle = clear that eye's override for this frame.
