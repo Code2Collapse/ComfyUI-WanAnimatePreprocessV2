@@ -372,6 +372,21 @@ function buildOverlay(node) {
     slider.style.cssText = "width:100%;margin:2px 0 0 0;accent-color:" + C.sel;
     root.appendChild(slider);
 
+    // Make the canvas keyboard-focusable so users can step frames /
+    // clear overrides without reaching for the slider. Discoverability:
+    // outline ring on focus + tooltip lists shortcuts.
+    cvs.tabIndex = 0;
+    cvs.title =
+        "click+drag landmarks · arrow ←/→ step frame · shift+arrow ±10 · " +
+        "home/end first/last · R reset frame · delete clear hovered point · esc blur";
+    cvs.style.outline = "none";
+    cvs.addEventListener("focus", () => {
+        cvs.style.boxShadow = "0 0 0 2px " + C.accent;
+    });
+    cvs.addEventListener("blur", () => {
+        cvs.style.boxShadow = "none";
+    });
+
     // ── Status line (hover readout + selection echo) ───────────────────
     // Shows the nearest landmark / joint / gaze-handle the mouse is over,
     // its iBUG name, and its current normalised coordinates. Always-on so
@@ -1661,6 +1676,68 @@ function buildOverlay(node) {
         draw();
         drawPose();
         drawTimeline();
+    });
+
+    // Keyboard navigation on the focused canvas. Centralised here so the
+    // slider, frame label and all three sub-canvases stay in sync.
+    const _stepFrame = (delta) => {
+        const max = parseInt(slider.max, 10) || 0;
+        const next = Math.min(max, Math.max(0, state.frame + delta));
+        if (next === state.frame) return;
+        state.frame = next;
+        slider.value = String(next);
+        frameLbl.textContent = `frame ${state.frame} / ${slider.max}`;
+        draw(); drawPose(); drawTimeline();
+    };
+    const _gotoFrame = (idx) => {
+        const max = parseInt(slider.max, 10) || 0;
+        const next = Math.min(max, Math.max(0, idx));
+        if (next === state.frame) return;
+        state.frame = next;
+        slider.value = String(next);
+        frameLbl.textContent = `frame ${state.frame} / ${slider.max}`;
+        draw(); drawPose(); drawTimeline();
+    };
+    cvs.addEventListener("keydown", (ev) => {
+        // Don't fight with text inputs that may bubble keyboard events.
+        const tgt = ev.target;
+        if (tgt && tgt !== cvs && (tgt.tagName === "INPUT" || tgt.tagName === "TEXTAREA" || tgt.tagName === "SELECT")) return;
+        const big = ev.shiftKey ? 10 : 1;
+        switch (ev.key) {
+            case "ArrowLeft":
+            case "ArrowDown":
+                _stepFrame(-big); ev.preventDefault(); break;
+            case "ArrowRight":
+            case "ArrowUp":
+                _stepFrame(+big); ev.preventDefault(); break;
+            case "Home":
+                _gotoFrame(0); ev.preventDefault(); break;
+            case "End":
+                _gotoFrame(parseInt(slider.max, 10) || 0); ev.preventDefault(); break;
+            case "r":
+            case "R":
+                // Same effect as the header "reset" button: clear all
+                // overrides on the current frame.
+                reset.click(); ev.preventDefault(); break;
+            case "Escape":
+                cvs.blur(); ev.preventDefault(); break;
+            case "Delete":
+            case "Backspace": {
+                // Clear the override for the hovered landmark, if any.
+                if (state.hoverLm >= 0) {
+                    const ov = parseOverrides(node);
+                    const key = String(state.frame);
+                    if (ov.frames?.[key]) {
+                        delete ov.frames[key][String(state.hoverLm)];
+                        if (Object.keys(ov.frames[key]).length === 0) delete ov.frames[key];
+                        writeOverrides(node, ov);
+                        draw();
+                    }
+                    ev.preventDefault();
+                }
+                break;
+            }
+        }
     });
 
     reset.addEventListener("click", () => {
