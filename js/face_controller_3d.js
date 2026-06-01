@@ -1054,6 +1054,10 @@ function buildOverlay(node) {
                     if (partial.jaw        !== undefined) _wWrite("jaw_rot_deg",    partial.jaw);
                     if (partial.neck_yaw   !== undefined) _wWrite("neck_yaw_deg",   partial.neck_yaw);
                     if (partial.neck_pitch !== undefined) _wWrite("neck_pitch_deg", partial.neck_pitch);
+                    // (P1.D) drive the live-mirror + server-resync engine
+                    // directly so gizmo drags feel instant even if the
+                    // widget-callback chain is throttled.
+                    try { _scheduleLocalMirror(); _scheduleServerResync(); } catch (_) {}
                 },
                 onClose: () => {
                     _fc3dEditor = null;
@@ -1881,6 +1885,288 @@ function buildOverlay(node) {
         drawPose();
     });
 
+    // ── (P1.D) Live-preview engine ──────────────────────────────────
+    // Two-tier responsiveness:
+    //   (1) Local mirror: every DOF widget change schedules a rAF tick
+    //       that re-applies the rigid 2D transforms (yaw/pitch/roll/
+    //       scale/tx/ty/gaze) to a cached BASELINE meta. Feels instant.
+    //   (2) Server resync: 300 ms after the last edit, POST the current
+    //       widget state to /c2c/fc3d_preview for an authoritative
+    //       single-frame recompute (includes jaw/neck rotation which
+    //       depend on per-frame body anatomy). The response replaces the
+    //       mirrored state with ground truth for the visible frame.
+    //
+    // The local mirror only approximates: it doesn't run jaw/neck/
+    // expression-coeff math (those need region-specific knowledge that
+    // lives in python). For those, the visible state stays at the
+    // last server truth until the 300 ms re-sync lands.
+
+    let _localBaseline = null;       // { faceFrames, poseFrames, widgetSnap }
+    let _mirrorRaf = 0;
+    let _resyncTimer = 0;
+    let _resyncInFlight = false;
+    let _resyncSeq = 0;
+    const DOF_NAMES = [
+        "head_yaw_deg", "head_pitch_deg", "head_roll_deg",
+        "head_tx", "head_ty", "head_tz",
+        "head_scale", "jaw_rot_deg", "neck_yaw_deg", "neck_pitch_deg",
+        "gaze_yaw_deg", "gaze_pitch_deg",
+        "expression_strength", "expression_clamp", "blend_strength",
+    ];
+
+    function _readAllDOF() {
+        const out = {};
+        for (const k of DOF_NAMES) {
+            const w = readWidget(node, k);
+            out[k] = w ? Number(w.value) || 0 : 0;
+        }
+        // Also capture the string JSONs / mode combos so the server
+        // re-sync runs the exact same pipeline as a real queue.
+        for (const k of [
+            "expression_coeffs_json", "head_pose_json", "gaze_json",
+            "use_metas", "propagate_head", "propagate_gaze",
+            "landmark_overrides_json", "pose_overrides_json", "gaze_overrides_json",
+        ]) {
+            const w = readWidget(node, k);
+            if (w) out[k] = w.value;
+        }
+        for (const k of ["blend_mouth", "blend_brows", "blend_eyes", "blend_jaw"]) {
+            const w = readWidget(node, k);
+            if (w) out[k] = !!w.value;
+        }
+        return out;
+    }
+
+    function _deepCloneFrames(frames) {
+        if (!Array.isArray(frames)) return [];
+        return frames.map(f => {
+            if (!f) return f;
+            const c = { ...f };
+            if (Array.isArray(f.kps)) c.kps = f.kps.map(p => (Array.isArray(p) ? p.slice() : p));
+            return c;
+        });
+    }
+
+    function _captureBaseline() {
+        _localBaseline = {
+            faceFrames: Array.isArray(state.meta?.frames)
+                ? state.meta.frames.map(fr => fr ? { ...fr } : fr)
+                : [],
+            poseFrames: _deepCloneFrames(pstate.frames),
+            // Original 68-point landmark arrays read from the freshly
+            // delivered overlay_meta (these are post-edit, so we record
+            // them as the new "zero" for incremental mirror math).
+            faceLm: {},   // frameIdx → [[x,y]*68] in image-norm coords
+            widgetSnap: _readAllDOF(),
+        };
+        const lmsFrames = state.meta?.frames;
+        if (Array.isArray(lmsFrames)) {
+            for (let i = 0; i < lmsFrames.length; i++) {
+                try {
+                    const lms = landmarksForFrame(i);
+                    if (Array.isArray(lms) && lms.length === 68) {
+                        _localBaseline.faceLm[i] = lms.map(p => p.slice());
+                    }
+                } catch (_) {}
+            }
+        }
+    }
+
+    function _mirrorTransform(frameIdx) {
+        // Apply (current DOF − baseline DOF) as a 2D rigid transform to
+        // baseline face landmarks + body keypoints for this frame and
+        // mutate state.meta.frames[i].d_norm / pstate.frames[i].kps so
+        // the existing draw() / drawPose() picks the change up.
+        if (!_localBaseline) return;
+        const base = _localBaseline.widgetSnap;
+        const now  = _readAllDOF();
+        const dYaw   = (now.head_yaw_deg   - base.head_yaw_deg)   * Math.PI / 180;
+        const dPitch = (now.head_pitch_deg - base.head_pitch_deg) * Math.PI / 180;
+        const dRoll  = (now.head_roll_deg  - base.head_roll_deg)  * Math.PI / 180;
+        const dTx    =  now.head_tx        - base.head_tx;
+        const dTy    =  now.head_ty        - base.head_ty;
+        const dTz    =  now.head_tz        - base.head_tz;
+        const rScale = (now.head_scale     || 1) / (base.head_scale || 1);
+        const dNYaw  = (now.neck_yaw_deg   - base.neck_yaw_deg)   * Math.PI / 180;
+        const dNPit  = (now.neck_pitch_deg - base.neck_pitch_deg) * Math.PI / 180;
+
+        const cosR = Math.cos(dRoll), sinR = Math.sin(dRoll);
+        // Approximate yaw / pitch as horizontal / vertical squashes
+        // about the face centroid (mirrors python _apply_head_rotation
+        // for small angles using the canonical-z = 0 assumption).
+        const cosY = Math.cos(dYaw);
+        const cosP = Math.cos(dPitch);
+        // tz uses the same 1/(1+tz) perspective shrink as python.
+        const tzClamp = Math.max(-0.75, Math.min(3.0, dTz));
+        const zoomTz = 1.0 / (1.0 + tzClamp);
+
+        // ── Face landmarks ──────────────────────────────────────────
+        const baseLm = _localBaseline.faceLm[frameIdx];
+        const faceFr = state.meta?.frames?.[frameIdx];
+        if (baseLm && faceFr) {
+            // Centroid of baseline landmarks.
+            let cx = 0, cy = 0;
+            for (const p of baseLm) { cx += p[0]; cy += p[1]; }
+            cx /= baseLm.length; cy /= baseLm.length;
+            // Compose: scale (rScale × zoomTz) → roll → yaw/pitch squash → translate
+            const s = rScale * zoomTz;
+            // Face-bbox width for tx/ty units (matches python convention).
+            let mnX = 1, mxX = 0, mnY = 1, mxY = 0;
+            for (const p of baseLm) {
+                if (p[0] < mnX) mnX = p[0]; if (p[0] > mxX) mxX = p[0];
+                if (p[1] < mnY) mnY = p[1]; if (p[1] > mxY) mxY = p[1];
+            }
+            const bbW = Math.max(1e-6, mxX - mnX);
+            // d_norm is the per-landmark delta in face-bbox-normalised
+            // units (overlay_meta convention). Compute new = T(base).
+            const dNorm = new Array(68);
+            const newLm = new Array(68);
+            for (let i = 0; i < baseLm.length; i++) {
+                let x = baseLm[i][0] - cx;
+                let y = baseLm[i][1] - cy;
+                // scale
+                x *= s; y *= s;
+                // roll (in-plane rotation)
+                const rx = x * cosR - y * sinR;
+                const ry = x * sinR + y * cosR;
+                // yaw / pitch squash
+                let nx = rx * cosY;
+                let ny = ry * cosP;
+                nx += cx + dTx * bbW;
+                ny += cy + dTy * bbW;
+                newLm[i] = [nx, ny];
+                dNorm[i] = [(nx - baseLm[i][0]) / bbW,
+                            (ny - baseLm[i][1]) / bbW];
+            }
+            // Patch the per-frame entry: writing the absolute coords as
+            // "lms" plus the delta in d_norm covers both rendering paths
+            // (full-frame redraw vs. delta-style overlay).
+            faceFr.lms = newLm;
+            faceFr.d_norm = dNorm;
+        }
+
+        // ── Body keypoints (neck rotation only) ─────────────────────
+        const basePose = _localBaseline.poseFrames?.[frameIdx];
+        const livePose = pstate.frames?.[frameIdx];
+        if (basePose && livePose && Array.isArray(basePose.kps)
+            && Array.isArray(livePose.kps) && livePose.kps.length === 18) {
+            const neck = basePose.kps[1];
+            const baseKps = basePose.kps;
+            if (Array.isArray(neck) && neck.length >= 2
+                && (Math.abs(dNYaw) > 1e-3 || Math.abs(dNPit) > 1e-3)) {
+                const nx = neck[0], ny = neck[1];
+                const headCluster = [0, 14, 15, 16, 17];
+                const cyN = Math.cos(dNYaw);
+                const cpN = Math.cos(dNPit), spN = Math.sin(dNPit);
+                const newKps = baseKps.map(p => (Array.isArray(p) ? p.slice() : p));
+                for (const idx of headCluster) {
+                    const p = baseKps[idx];
+                    if (!Array.isArray(p)) continue;
+                    const dx = p[0] - nx, dy = p[1] - ny;
+                    newKps[idx][0] = nx + dx * cyN;
+                    newKps[idx][1] = ny + dy * cpN - spN * Math.abs(dy);
+                }
+                livePose.kps = newKps;
+            } else {
+                // Reset to baseline if neck deltas are zero.
+                livePose.kps = baseKps.map(p => (Array.isArray(p) ? p.slice() : p));
+            }
+        }
+    }
+
+    function _scheduleLocalMirror() {
+        if (_mirrorRaf) return;
+        _mirrorRaf = requestAnimationFrame(() => {
+            _mirrorRaf = 0;
+            try { _mirrorTransform(state.frame); } catch (_) {}
+            try { draw(); drawPose(); } catch (_) {}
+        });
+    }
+
+    async function _serverResync() {
+        const seq = ++_resyncSeq;
+        if (_resyncInFlight) return;  // a fresh trigger after timer fires already
+        _resyncInFlight = true;
+        try {
+            const body = { node_id: String(node.id), frame_idx: state.frame, ..._readAllDOF() };
+            const resp = await fetch("/c2c/fc3d_preview", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(body),
+            });
+            if (seq !== _resyncSeq) return; // a newer request was already queued
+            if (resp.status === 412) {
+                // Cache miss — node hasn't been queued yet; silently skip.
+                return;
+            }
+            if (!resp.ok) return;
+            const data = await resp.json();
+            if (seq !== _resyncSeq) return;
+            // Splice the authoritative per-frame data into state.meta + pstate.
+            const fIdx = data.frame_idx;
+            const faceArr = data.face_norm;     // 68-point bbox-norm
+            const bodyArr = data.body_kps;      // 18-point image-norm or null
+            // Convert face-bbox-norm back into IMAGE-norm so it matches the
+            // baseline coordinate system used by draw().
+            if (Array.isArray(faceArr) && _localBaseline?.faceLm?.[fIdx]) {
+                const baseLm = _localBaseline.faceLm[fIdx];
+                let mnX = 1, mxX = 0, mnY = 1, mxY = 0;
+                for (const p of baseLm) {
+                    if (p[0] < mnX) mnX = p[0]; if (p[0] > mxX) mxX = p[0];
+                    if (p[1] < mnY) mnY = p[1]; if (p[1] > mxY) mxY = p[1];
+                }
+                const bbW = Math.max(1e-6, mxX - mnX);
+                const bbH = Math.max(1e-6, mxY - mnY);
+                const absLm = faceArr.map(p => [mnX + p[0] * bbW, mnY + p[1] * bbH]);
+                const faceFr = state.meta?.frames?.[fIdx];
+                if (faceFr) {
+                    faceFr.lms = absLm;
+                    faceFr.d_norm = absLm.map((p, i) => [
+                        (p[0] - baseLm[i][0]) / bbW,
+                        (p[1] - baseLm[i][1]) / bbH,
+                    ]);
+                }
+            }
+            if (Array.isArray(bodyArr) && pstate.frames?.[fIdx]) {
+                pstate.frames[fIdx].kps = bodyArr.map(p =>
+                    Array.isArray(p) ? p.slice() : [NaN, NaN]);
+            }
+            try { draw(); drawPose(); } catch (_) {}
+        } catch (_) {
+            // Network/CORS failure — silent; local mirror still visible.
+        } finally {
+            _resyncInFlight = false;
+        }
+    }
+
+    function _scheduleServerResync() {
+        if (_resyncTimer) clearTimeout(_resyncTimer);
+        _resyncTimer = setTimeout(() => {
+            _resyncTimer = 0;
+            _serverResync();
+        }, 300);
+    }
+
+    // Hook callbacks on every DOF widget so any edit (slider, numeric
+    // type-in, or the 3D gizmo via _wWrite) triggers both passes.
+    function _hookDOFWidgets() {
+        for (const k of DOF_NAMES) {
+            const w = readWidget(node, k);
+            if (!w || w.__fc3d_hooked) continue;
+            const orig = w.callback;
+            w.callback = function (v) {
+                try { orig?.call(this, v, node, w); } catch (_) {}
+                _scheduleLocalMirror();
+                _scheduleServerResync();
+            };
+            w.__fc3d_hooked = true;
+        }
+    }
+    // Defer one tick so widgets exist (they're added by ComfyUI after
+    // onNodeCreated runs).
+    setTimeout(_hookDOFWidgets, 0);
+    setTimeout(_hookDOFWidgets, 250);
+
     // Public API: feed in new overlay_meta after execution.
     const api = {
         root,
@@ -1911,6 +2197,10 @@ function buildOverlay(node) {
             frameLbl.textContent = `frame ${state.frame} / ${slider.max}`;
             poseHint.style.display =
                 (pstate.view !== "face" && pstate.frames.length === 0) ? "block" : "none";
+            // (P1.D) Capture this as the local-mirror baseline so subsequent
+            // gizmo / widget edits can be rendered instantly relative to it
+            // until the 300 ms server re-sync replaces it with truth.
+            _captureBaseline();
             draw();
             drawPose();
             drawTimeline();
@@ -1923,6 +2213,25 @@ function buildOverlay(node) {
         gotoLast()    { _gotoFrame(parseInt(slider.max, 10) || 0); },
         step(delta)   { _stepFrame(delta); },
         setView(v)    { try { _setView(v); } catch (_) {} },
+        // (P1.D) Live-preview control surface.
+        mirrorRefresh() { try { _scheduleLocalMirror(); } catch (_) {} },
+        serverResync()  { try { _scheduleServerResync(); } catch (_) {} },
+        resetTransform() {
+            for (const k of DOF_NAMES) {
+                const w = readWidget(node, k);
+                if (!w) continue;
+                let def = 0;
+                if (k === "head_scale" || k === "expression_strength" || k === "blend_strength") def = 1;
+                if (k === "expression_clamp") def = w.options?.default ?? 1.5;
+                if (w.value !== def) {
+                    w.value = def;
+                    try { w.callback?.(def, node, w); } catch (_) {}
+                }
+            }
+            node.setDirtyCanvas?.(true, true);
+            _scheduleLocalMirror();
+            _scheduleServerResync();
+        },
         // Tear down the 3D editor (if open) and release its WebGL/RAF
         // resources. Called by onRemoved so deleting a node doesn't leak
         // a GL context or an animation loop.
@@ -2016,6 +2325,9 @@ function _fc3dRegisterActions() {
         { id: "mec.faceController.viewFace",   title: "Face Controller: View — face only",                     icon: "👤", keywords: ["face","view","layout"],            run: () => _fc3dActive()?.setView("face") },
         { id: "mec.faceController.viewPose",   title: "Face Controller: View — pose only",                     icon: "🦴", keywords: ["face","pose","view","layout"],    run: () => _fc3dActive()?.setView("pose") },
         { id: "mec.faceController.viewBoth",   title: "Face Controller: View — face + pose",                   icon: "▦", keywords: ["face","pose","both","view","layout"], run: () => _fc3dActive()?.setView("both") },
+        { id: "mec.faceController.mirrorRefresh", title: "Face Controller: Refresh live mirror (local)",        icon: "↻", keywords: ["face","live","mirror","preview"],   run: () => _fc3dActive()?.mirrorRefresh() },
+        { id: "mec.faceController.serverResync",  title: "Face Controller: Re-sync from server now",            icon: "⇅", keywords: ["face","sync","server","resync","preview"], run: () => _fc3dActive()?.serverResync() },
+        { id: "mec.faceController.resetTransform", title: "Face Controller: Reset all head/jaw/neck/gaze DOFs", icon: "⌖", keywords: ["face","reset","transform","head","jaw","neck","gaze","dof"], run: () => _fc3dActive()?.resetTransform() },
     ];
     for (const a of actions) {
         try { reg({ ...a, kind: "command", scope: "graph", enabled }); } catch (_) {}
