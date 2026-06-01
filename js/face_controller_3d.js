@@ -64,6 +64,13 @@ const _C_FALLBACK = {
     gaze_l:        "#f38ba8",
     gaze_r:        "#94e2d5",
     gaze_drag:     "#f9e2af",
+    canvas_bg:     "#0e0e16",
+    input_bg:      "#1a1a23",
+    btn_off_bg:    "#22222e",
+    fg_inverse:    "#11111a",
+    ok_bg:         "#2d3b22",
+    err_bg:        "#3b2222",
+    info_bg:       "#222b3b",
 };
 const _C_TOKEN = {
     bg:     "--c2c-bg",
@@ -82,6 +89,13 @@ const _C_TOKEN = {
     gaze_l:        "--c2c-red",
     gaze_r:        "--c2c-green",
     gaze_drag:     "--c2c-yellow",
+    canvas_bg:     "--c2c-crust",
+    input_bg:      "--c2c-mantle",
+    btn_off_bg:    "--c2c-surface0",
+    fg_inverse:    "--c2c-crust",
+    ok_bg:         "--c2c-greenDim",
+    err_bg:        "--c2c-redDim",
+    info_bg:       "--c2c-blueDim",
 };
 const C = new Proxy(_C_FALLBACK, {
     get(target, key) {
@@ -338,7 +352,7 @@ function buildOverlay(node) {
     reset.textContent = "reset";
     reset.title = "Clear overrides for THIS frame";
     reset.style.cssText =
-        "background:#2a2a35;color:" + C.text + ";border:1px solid " + C.border + ";" +
+        "background:" + C.border + ";color:" + C.text + ";border:1px solid " + C.border + ";" +
         "border-radius:3px;padding:2px 6px;cursor:pointer;font:11px ui-sans-serif;";
     hdr.append(legend, frameLbl, reset);
     root.appendChild(hdr);
@@ -348,7 +362,7 @@ function buildOverlay(node) {
     cvs.width = 220;
     cvs.height = 220;
     cvs.style.cssText =
-        "width:100%;height:auto;display:block;background:#0e0e16;" +
+        "width:100%;height:auto;display:block;background:" + C.canvas_bg + ";" +
         "border:1px solid " + C.border + ";border-radius:4px;cursor:crosshair;";
     root.appendChild(cvs);
 
@@ -364,7 +378,7 @@ function buildOverlay(node) {
     // the user can read out a point's position without queueing first.
     const statusEl = document.createElement("div");
     statusEl.style.cssText =
-        "margin-top:4px;padding:3px 6px;background:#0e0e16;" +
+        "margin-top:4px;padding:3px 6px;background:" + C.canvas_bg + ";" +
         "border:1px solid " + C.border + ";border-radius:3px;" +
         "font:11px ui-monospace,monospace;color:" + C.text + ";" +
         "white-space:nowrap;overflow:hidden;text-overflow:ellipsis;";
@@ -388,7 +402,7 @@ function buildOverlay(node) {
     const editor = document.createElement("div");
     editor.style.cssText =
         "display:flex;flex-wrap:wrap;align-items:center;gap:4px;margin-top:4px;" +
-        "padding:4px;background:#0e0e16;border:1px solid " + C.border + ";" +
+        "padding:4px;background:" + C.canvas_bg + ";border:1px solid " + C.border + ";" +
         "border-radius:3px;font:11px ui-sans-serif;color:" + C.text + ";";
 
     const _mkLbl = (txt) => {
@@ -405,7 +419,7 @@ function buildOverlay(node) {
         if (max !== null) i.max = String(max);
         i.placeholder = placeholder;
         i.style.cssText =
-            "width:" + width + "px;padding:2px 4px;background:#1a1a23;color:" + C.text + ";" +
+            "width:" + width + "px;padding:2px 4px;background:" + C.input_bg + ";color:" + C.text + ";" +
             "border:1px solid " + C.border + ";border-radius:2px;" +
             "font:11px ui-monospace,monospace;";
         return i;
@@ -424,7 +438,7 @@ function buildOverlay(node) {
     const tgtSel = document.createElement("select");
     tgtSel.title = "What to edit: face landmark, pose joint, or gaze eye";
     tgtSel.style.cssText =
-        "padding:2px 4px;background:#1a1a23;color:" + C.text + ";" +
+        "padding:2px 4px;background:" + C.input_bg + ";color:" + C.text + ";" +
         "border:1px solid " + C.border + ";border-radius:2px;font:11px ui-sans-serif;";
     for (const [v, t] of [
         ["face",   "face (iBUG-68)"],
@@ -439,9 +453,9 @@ function buildOverlay(node) {
     idxInput.value = "30";
     const xInput   = _mkNumInput("x", 0.001, null, null, 64);
     const yInput   = _mkNumInput("y", 0.001, null, null, 64);
-    const btnSet   = _mkBtn("Set",   "Write these coordinates as the override for the current frame.", "#2d3b22");
-    const btnClear = _mkBtn("Clear", "Remove this point's override for the current frame.",            "#3b2222");
-    const btnPick  = _mkBtn("Pick",  "Copy the currently-hovered or last-selected point into these fields.", "#222b3b");
+    const btnSet   = _mkBtn("Set",   "Write these coordinates as the override for the current frame.", C.ok_bg);
+    const btnClear = _mkBtn("Clear", "Remove this point's override for the current frame.",            C.err_bg);
+    const btnPick  = _mkBtn("Pick",  "Copy the currently-hovered or last-selected point into these fields.", C.info_bg);
 
     const nameTag = document.createElement("span");
     nameTag.style.cssText = "color:" + C.dim + ";font:10px ui-monospace,monospace;margin-left:auto;";
@@ -613,7 +627,7 @@ function buildOverlay(node) {
     tl.width = 480;
     tl.height = 34;
     tl.style.cssText =
-        "width:100%;height:34px;display:block;background:#0e0e16;" +
+        "width:100%;height:34px;display:block;background:" + C.canvas_bg + ";" +
         "border:1px solid " + C.border + ";border-radius:4px;margin-top:4px;cursor:pointer;";
     tl.title = "timeline · click=jump · shift-click=range · right-click=clear that frame";
     root.appendChild(tl);
@@ -634,7 +648,7 @@ function buildOverlay(node) {
         b.textContent = label;
         b.title = title;
         b.style.cssText =
-            "background:#2a2a35;color:" + C.text + ";border:1px solid " + C.border + ";" +
+            "background:" + C.border + ";color:" + C.text + ";border:1px solid " + C.border + ";" +
             "border-radius:3px;padding:1px 6px;cursor:pointer;font:11px ui-sans-serif;";
         return b;
     };
@@ -726,7 +740,7 @@ function buildOverlay(node) {
     function drawTimeline() {
         const ctx = tl.getContext("2d");
         const W = tl.width, H = tl.height;
-        ctx.fillStyle = "#0e0e16";
+        ctx.fillStyle = C.canvas_bg;
         ctx.fillRect(0, 0, W, H);
         const n = _frameCount();
         if (n <= 0) {
@@ -887,13 +901,13 @@ function buildOverlay(node) {
         const r = _tlRange();
         if (!propagateMode) {
             btnPropagate.textContent = "Δ off";
-            btnPropagate.style.background = "#2a2a35";
+            btnPropagate.style.background = C.border;
             btnPropagate.style.color = C.text;
             btnPropagate.style.fontWeight = "normal";
         } else {
             btnPropagate.textContent = r ? `Δ sel[${r[0]}..${r[1]}]` : "Δ all";
             btnPropagate.style.background = C.accent;
-            btnPropagate.style.color = "#11111a";
+            btnPropagate.style.color = C.fg_inverse;
             btnPropagate.style.fontWeight = "bold";
         }
     }
@@ -919,7 +933,7 @@ function buildOverlay(node) {
         b.textContent = label;
         b.dataset.value = value;
         b.style.cssText =
-            "background:#22222e;color:" + C.text + ";border:1px solid " + C.border + ";" +
+            "background:" + C.btn_off_bg + ";color:" + C.text + ";border:1px solid " + C.border + ";" +
             "border-radius:3px;padding:1px 6px;cursor:pointer;font:11px ui-sans-serif;";
         return b;
     };
@@ -935,7 +949,7 @@ function buildOverlay(node) {
     const poseCvs = document.createElement("canvas");
     poseCvs.width = 320; poseCvs.height = 240;
     poseCvs.style.cssText =
-        "width:100%;height:auto;display:block;background:#0e0e16;" +
+        "width:100%;height:auto;display:block;background:" + C.canvas_bg + ";" +
         "border:1px solid " + C.border + ";border-radius:4px;cursor:crosshair;margin-top:4px;";
     root.appendChild(poseCvs);
 
@@ -966,8 +980,8 @@ function buildOverlay(node) {
         poseHint.style.display = (showPose && pstate.frames.length === 0) ? "block" : "none";
         for (const b of [btnFace, btnPose, btnBoth]) {
             const on = (b.dataset.value === v);
-            b.style.background = on ? C.accent : "#22222e";
-            b.style.color      = on ? "#11111a" : C.text;
+            b.style.background = on ? C.accent : C.btn_off_bg;
+            b.style.color      = on ? C.fg_inverse : C.text;
         }
         drawPose();
     }
@@ -1011,7 +1025,7 @@ function buildOverlay(node) {
     function drawPose() {
         const ctx = poseCvs.getContext("2d");
         const W = poseCvs.width, H = poseCvs.height;
-        ctx.fillStyle = "#0e0e16";
+        ctx.fillStyle = C.canvas_bg;
         ctx.fillRect(0, 0, W, H);
         // Grid
         ctx.strokeStyle = C.grid; ctx.lineWidth = 1;
@@ -1082,7 +1096,7 @@ function buildOverlay(node) {
             ctx.arc(x, y, r, 0, Math.PI * 2);
             ctx.fill();
             // White stroke for visibility against bones.
-            ctx.lineWidth = 1; ctx.strokeStyle = "#0e0e16";
+            ctx.lineWidth = 1; ctx.strokeStyle = C.canvas_bg;
             ctx.stroke();
         }
 
@@ -1307,7 +1321,7 @@ function buildOverlay(node) {
         }
         const ctx = cvs.getContext("2d");
         const W = cvs.width, H = cvs.height;
-        ctx.fillStyle = "#0e0e16";
+        ctx.fillStyle = C.canvas_bg;
         ctx.fillRect(0, 0, W, H);
 
         // Faint grid (every 25%).
