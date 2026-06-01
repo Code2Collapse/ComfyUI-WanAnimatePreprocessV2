@@ -964,10 +964,113 @@ function buildOverlay(node) {
     const btnFace = _mkViewBtn("face", T("fc3d.view.face", "face"));
     const btnPose = _mkViewBtn("pose", T("fc3d.view.pose", "pose"));
     const btnBoth = _mkViewBtn("both", T("fc3d.view.both", "both"));
+    // 3D editor button — lazy-loads Three.js from a CDN with graceful
+    // fallback to the existing 2D canvas if the load fails (offline,
+    // CSP block, etc.). The 3D editor mounts a self-contained overlay
+    // below the pose canvas and writes back to the head_tx/ty/tz +
+    // yaw/pitch/roll widgets through callbacks.
+    const btn3D = _mkViewBtn(
+        T("fc3d.view.threeD", "3D\u2026"),
+        "3d",
+    );
+    btn3D.title = T(
+        "fc3d.tip.threeD",
+        "Open a 3D head editor (loads Three.js on demand). Drag the gizmo to set head translation; slide yaw/pitch/roll to rotate.",
+    );
+    let _fc3dEditor = null;   // { destroy, refresh } once mounted
+    let _fc3dHost   = null;   // host div for the overlay
+    btn3D.addEventListener("click", async () => {
+        // Toggle behaviour: a second click closes the editor.
+        if (_fc3dEditor) {
+            try { _fc3dEditor.destroy(); } catch (_) {}
+            _fc3dEditor = null;
+            if (_fc3dHost) { try { _fc3dHost.remove(); } catch (_) {} _fc3dHost = null; }
+            btn3D.style.background = C.btn_off_bg;
+            return;
+        }
+        btn3D.style.background = C.btn_on_bg || C.accent;
+        // Build a host container directly after the pose canvas / hint.
+        _fc3dHost = document.createElement("div");
+        _fc3dHost.style.cssText = "margin-top:6px;";
+        root.appendChild(_fc3dHost);
+
+        // Widget read/write helpers for the 6 head-pose widgets. The
+        // python node declares these as widget names yaw_deg, pitch_deg,
+        // roll_deg, head_tx, head_ty, head_tz; if any of them are missing
+        // (older python node), the corresponding getter returns 0 and the
+        // setter is a no-op so the editor still works.
+        const _wRead = (name) => {
+            const w = readWidget(node, name);
+            return w ? Number(w.value) || 0 : 0;
+        };
+        const _wWrite = (name, v) => {
+            const w = readWidget(node, name);
+            if (!w) return;
+            const num = Number(v);
+            if (!Number.isFinite(num)) return;
+            // Respect widget min/max if declared by the widget config.
+            let clamped = num;
+            if (w.options) {
+                if (w.options.min !== undefined) clamped = Math.max(w.options.min, clamped);
+                if (w.options.max !== undefined) clamped = Math.min(w.options.max, clamped);
+            }
+            if (w.value !== clamped) {
+                w.value = clamped;
+                try { w.callback?.(clamped, node, w); } catch (_) {}
+                node.setDirtyCanvas?.(true, true);
+            }
+        };
+
+        try {
+            const mod = await import("./face_3d_editor.js");
+            if (!_fc3dHost) return;  // user closed before load resolved
+            _fc3dEditor = await mod.mount3DEditor(_fc3dHost, {
+                theme: C,
+                getLandmarks: () => {
+                    try { return landmarksForFrame(state.frame); }
+                    catch (_) { return null; }
+                },
+                getHeadPose: () => ({
+                    yaw:   _wRead("head_yaw_deg"),
+                    pitch: _wRead("head_pitch_deg"),
+                    roll:  _wRead("head_roll_deg"),
+                    tx:    _wRead("head_tx"),
+                    ty:    _wRead("head_ty"),
+                    tz:    _wRead("head_tz"),
+                }),
+                setHeadPose: (partial) => {
+                    if (partial.yaw   !== undefined) _wWrite("head_yaw_deg",   partial.yaw);
+                    if (partial.pitch !== undefined) _wWrite("head_pitch_deg", partial.pitch);
+                    if (partial.roll  !== undefined) _wWrite("head_roll_deg",  partial.roll);
+                    if (partial.tx    !== undefined) _wWrite("head_tx",   partial.tx);
+                    if (partial.ty    !== undefined) _wWrite("head_ty",   partial.ty);
+                    if (partial.tz    !== undefined) _wWrite("head_tz",   partial.tz);
+                },
+                onClose: () => {
+                    _fc3dEditor = null;
+                    if (_fc3dHost) { try { _fc3dHost.remove(); } catch (_) {} _fc3dHost = null; }
+                    btn3D.style.background = C.btn_off_bg;
+                },
+            });
+        } catch (err) {
+            // Hard failure (network down, bad CDN, etc.) — leave a
+            // readable note in the host and revert the toggle.
+            if (_fc3dHost) {
+                _fc3dHost.textContent =
+                    T("fc3d.err.three", "3D editor unavailable: ") +
+                    (err?.message || String(err));
+                _fc3dHost.style.cssText =
+                    "margin-top:6px;padding:4px 6px;color:#ff7070;" +
+                    "background:" + C.canvas_bg + ";border:1px solid " + C.border + ";" +
+                    "border-radius:3px;font:11px ui-monospace,monospace;";
+            }
+            btn3D.style.background = C.btn_off_bg;
+        }
+    });
     const poseInfo = document.createElement("span");
     poseInfo.style.cssText = "margin-left:auto;color:" + C.dim + ";font:11px ui-monospace,monospace;";
     poseInfo.textContent = "—";
-    viewBar.append(viewLbl, btnFace, btnPose, btnBoth, poseInfo);
+    viewBar.append(viewLbl, btnFace, btnPose, btnBoth, btn3D, poseInfo);
     root.appendChild(viewBar);
 
     const poseCvs = document.createElement("canvas");
@@ -1811,6 +1914,14 @@ function buildOverlay(node) {
         gotoLast()    { _gotoFrame(parseInt(slider.max, 10) || 0); },
         step(delta)   { _stepFrame(delta); },
         setView(v)    { try { _setView(v); } catch (_) {} },
+        // Tear down the 3D editor (if open) and release its WebGL/RAF
+        // resources. Called by onRemoved so deleting a node doesn't leak
+        // a GL context or an animation loop.
+        destroy3D() {
+            try { _fc3dEditor?.destroy(); } catch (_) {}
+            _fc3dEditor = null;
+            if (_fc3dHost) { try { _fc3dHost.remove(); } catch (_) {} _fc3dHost = null; }
+        },
     };
 
     // Default view = both, applied AFTER api is wired so _setView can call drawPose.
@@ -1868,6 +1979,7 @@ app.registerExtension({
 
         const _removed = nodeType.prototype.onRemoved;
         nodeType.prototype.onRemoved = function () {
+            try { this._faceOverlay?.destroy3D?.(); } catch (_) {}
             _fc3dInstances.delete(this);
             return _removed?.apply(this, arguments);
         };
