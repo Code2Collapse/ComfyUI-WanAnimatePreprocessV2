@@ -2320,9 +2320,9 @@ app.registerExtension({
             });
             // Give it a stable min-height so the node doesn't collapse before
             // first execution. Height accounts for face canvas + pose canvas
-            // + headers/slider/view-bar. Use the `width` LiteGraph passes
-            // (inset widget-column width) rather than `node.size[0]` to
-            // avoid dark gutters bleeding through on both edges.
+            // + headers/slider/view-bar.
+            // Use the inset `width` LiteGraph passes; using `node.size[0]`
+            // over-reserves the column and leaves dark gutters on the edges.
             w.computeSize = (width) => [width, 560];
 
             // Restore any prior overlay_meta cached on the workflow's exec data
