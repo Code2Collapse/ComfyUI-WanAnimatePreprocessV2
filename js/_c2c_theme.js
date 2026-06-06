@@ -29,18 +29,9 @@
  */
 
 import { app } from "../../scripts/app.js";
-// Side-effect import: installs ResizeObserver/MutationObserver that publish
-// --c2c-native-top / --c2c-native-left / --c2c-native-bottom on :root so every
-// C2C floating surface can anchor itself off ComfyUI's live native chrome
-// (workflow tabs, left rail, status strip) instead of guessing fixed pixel
-// offsets. Imported here so every consumer of the theme transitively gets it.
-import "./_c2c_native_offsets.js";
-// Side-effect import: mounts the P0.2 OmniBar (the single, theme-aware,
-// position-configurable command bar that hosts ALL future C2C surfaces via
-// its window.C2COmniBar.register() slot API). Theme.js is the universally-
-// imported entry point, so importing OmniBar here guarantees it boots
-// regardless of which C2C extension the user has enabled first.
-import "./c2c_omnibar.js";
+// NOTE: _c2c_native_offsets.js and c2c_omnibar.js live in CustomNodePacks only.
+// This satellite copy of _c2c_theme.js (for WanAnimatePreprocessV2) does not
+// need them — the main pack boots them via its own copy.
 import { reportFailure as __c2cReport } from "./_c2c_report.js";
 
 // ── Catppuccin variants ────────────────────────────────────────────────────
@@ -631,7 +622,9 @@ export function listVariants() { return Object.keys(PALETTES); }
 applyThemeVars();
 
 // Register a setting so the user can switch variants from ComfyUI's Settings.
-try {
+const _C2C_THEME_SATELLITE = typeof import.meta?.url === "string"
+    && import.meta.url.includes("WanAnimatePreprocessV2");
+if (!_C2C_THEME_SATELLITE && !window.__C2C_THEME_REG__) { window.__C2C_THEME_REG__ = true; try {
     app.registerExtension({
         name: "C2C.Theme",
         settings: [
@@ -657,4 +650,4 @@ try {
             },
         ],
     });
-} catch (__c2cErr) { __c2cReport("_c2c_theme", __c2cErr); }
+} catch (__c2cErr) { __c2cReport("_c2c_theme", __c2cErr); } }

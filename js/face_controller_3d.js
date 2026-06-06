@@ -14,6 +14,65 @@ const NODE_CLASS = "WanFaceController3DV2";
 const OVERRIDE_WIDGET = "landmark_overrides_json";
 const POSE_OVERRIDE_WIDGET = "pose_overrides_json";
 const GAZE_OVERRIDE_WIDGET = "gaze_overrides_json";
+const CONFIG_WIDGET = "fc3d_config_json";
+
+/** Mirrors Python _FC3D_DEFAULT_CFG — editor-owned tunables blob. */
+const FC3D_DEFAULT_CFG = {
+    expression_coeffs_json: "",
+    expression_strength: 1.0,
+    expression_clamp: 1.5,
+    propagate_expression: "off",
+    head_pose_json: "",
+    head_yaw_deg: 0.0,
+    head_pitch_deg: 0.0,
+    head_roll_deg: 0.0,
+    head_tx: 0.0,
+    head_ty: 0.0,
+    head_tz: 0.0,
+    head_scale: 1.0,
+    jaw_rot_deg: 0.0,
+    neck_yaw_deg: 0.0,
+    neck_pitch_deg: 0.0,
+    propagate_head: "off",
+    propagate_gaze: "off",
+    gaze_json: "",
+    gaze_yaw_deg: 0.0,
+    gaze_pitch_deg: 0.0,
+    blend_strength: 0.0,
+    blend_mouth: true,
+    blend_brows: false,
+    blend_eyes: false,
+    blend_jaw: false,
+    use_metas: "edited",
+    frame_start: -1,
+    frame_end: -1,
+    preview_frame_idx: 0,
+    preview_size: 512,
+    preview_max_video_frames: 120,
+};
+
+const FC3D_PARAM_OPTS = {
+    expression_strength: { min: -3, max: 3, step: 0.05 },
+    expression_clamp: { min: 0.1, max: 3, step: 0.05 },
+    head_yaw_deg: { min: -90, max: 90, step: 0.5 },
+    head_pitch_deg: { min: -60, max: 60, step: 0.5 },
+    head_roll_deg: { min: -60, max: 60, step: 0.5 },
+    head_tx: { min: -2, max: 2, step: 0.01 },
+    head_ty: { min: -2, max: 2, step: 0.01 },
+    head_tz: { min: -0.75, max: 3, step: 0.01 },
+    head_scale: { min: 0.25, max: 4, step: 0.01 },
+    jaw_rot_deg: { min: -25, max: 25, step: 0.25 },
+    neck_yaw_deg: { min: -60, max: 60, step: 0.5 },
+    neck_pitch_deg: { min: -45, max: 45, step: 0.5 },
+    gaze_yaw_deg: { min: -30, max: 30, step: 0.5 },
+    gaze_pitch_deg: { min: -30, max: 30, step: 0.5 },
+    blend_strength: { min: 0, max: 1, step: 0.05 },
+    frame_start: { min: -1, max: 999999, step: 1 },
+    frame_end: { min: -1, max: 999999, step: 1 },
+    preview_frame_idx: { min: 0, max: 999999, step: 1 },
+    preview_size: { min: 128, max: 2048, step: 32 },
+    preview_max_video_frames: { min: 1, max: 1024, step: 1 },
+};
 
 // ─── Theme palette (CSS-var backed; hex fallbacks) ──────────────────
 const _C_FALLBACK = {
@@ -146,26 +205,43 @@ const FC3D_TAB_CTX_MAX = { face: 80, expr: 200, gaze: 110, pose: 160, set: 200 }
 
 const FC3D_HIDE_STYLE_ID = "fc3d-wan-face-hide-css";
 
-/** Collapse chrome widgets in LiteGraph + Vue (matches CustomNodePacks _widget_visibility). */
+/** Collapse chrome widgets in both LiteGraph canvas mode AND Vue mode. */
 function _fc3dHideChromeWidget(w) {
     if (!w || w.name === "face_overlay") return;
     w.__fc3d_chrome_hidden = true;
     if (w.options === undefined) w.options = {};
+
+    // Vue frontend checks widget.options.hidden to skip rendering entirely
+    w.options.hidden = true;
+
+    // LiteGraph canvas mode + Vue layout
     if (w.__fc3d_origType === undefined) w.__fc3d_origType = w.type;
     if (w.__fc3d_origComputeSize === undefined) w.__fc3d_origComputeSize = w.computeSize;
     w.type = "hidden";
     w.hidden = true;
     w.computeSize = () => [0, -4];
+    w.computeLayoutSize = () => ({ minHeight: 0, maxHeight: 0, minWidth: 0 });
     w.draw = () => {};
-    const el = w.element;
-    if (!el) return;
-    el.hidden = true;
-    if (w.__fc3d_origElDisplay === undefined) w.__fc3d_origElDisplay = el.style.display;
-    el.style.display = "none";
-    const wrap = el.parentElement;
-    if (wrap?.classList?.contains("dom-widget") || wrap?.classList?.contains("lg-node-widget")) {
-        if (w.__fc3d_origWrapDisplay === undefined) w.__fc3d_origWrapDisplay = wrap.style.display;
+    if (w.options.getMinHeight === undefined) w.options.getMinHeight = () => 0;
+    if (w.options.getHeight === undefined) w.options.getHeight = () => 0;
+    if (w.options.getMaxHeight === undefined) w.options.getMaxHeight = () => 0;
+
+    // DOM elements (multiline STRING textareas)
+    const el = w.element ?? w.inputEl;
+    if (el) {
+        el.hidden = true;
+        el.style.display = "none";
+        el.style.height = "0";
+        el.style.overflow = "hidden";
+    }
+    // Hide the wrapper container too
+    const wrap = el?.parentElement;
+    if (wrap && (wrap.classList?.contains("dom-widget") ||
+                 wrap.classList?.contains("lg-node-widget") ||
+                 wrap.classList?.contains("comfy-widget"))) {
         wrap.style.display = "none";
+        wrap.style.height = "0";
+        wrap.style.overflow = "hidden";
     }
 }
 
@@ -174,10 +250,12 @@ function _fc3dEnsureHideCss() {
     const st = document.createElement("style");
     st.id = FC3D_HIDE_STYLE_ID;
     st.textContent = `
-.node.fc3d-wan-face .comfy-widget:not(:has(.fc3d-editor-root)),
-.node.fc3d-wan-face .lg-node-widget:not(:has(.fc3d-editor-root)) {
+.fc3d-wan-face .comfy-widget:not(:has(.fc3d-editor-root)),
+.fc3d-wan-face .lg-node-widget:not(:has(.fc3d-editor-root)):not([class*="resize"]) {
     display: none !important; height: 0 !important; max-height: 0 !important;
+    min-height: 0 !important;
     margin: 0 !important; padding: 0 !important; overflow: hidden !important;
+    position: absolute !important; pointer-events: none !important;
 }
 `;
     document.head.appendChild(st);
@@ -185,7 +263,14 @@ function _fc3dEnsureHideCss() {
 
 function _fc3dHideChromeWidgets(node, domW) {
     _fc3dEnsureHideCss();
+    // Apply the class to the Vue node container for CSS rules
     if (node.el) node.el.classList.add("fc3d-wan-face");
+    // Also try to find the node container from the DOM widget's element
+    const editorEl = domW?.element;
+    if (editorEl) {
+        const nodeContainer = editorEl.closest("[data-node-id]") || editorEl.closest(".graphnode") || editorEl.closest(".node");
+        if (nodeContainer) nodeContainer.classList.add("fc3d-wan-face");
+    }
     for (const wg of node.widgets || []) {
         if (wg !== domW) _fc3dHideChromeWidget(wg);
     }
@@ -201,121 +286,49 @@ function _fc3dWriteNodeSize(node, w, h) {
     }
 }
 
-/** Node bounding box — respects user drag-resize; content height is minimum only. */
-function _fc3dBindComputeSize(node, getMinH) {
-    node.computeSize = function () {
-        const w = Math.max(FC3D_NODE_W, this.size?.[0] || FC3D_NODE_W);
-        const userH = this.size?.[1];
-        if (this._fc3dClampResize && userH >= FC3D_MIN_H) {
-            return [w, Math.min(FC3D_MAX_H, userH)];
-        }
-        const minH = Math.min(FC3D_MAX_H, Math.max(FC3D_MIN_H, getMinH()));
-        if (this._fc3dUserSized && userH >= FC3D_MIN_H) {
-            return [w, Math.min(FC3D_MAX_H, userH)];
-        }
-        return [w, minH];
-    };
+/**
+ * Simplified size management — follows official ComfyUI DOMWidget API.
+ * No setSize override, no clamp loops, no snap-back.
+ */
+function _fc3dGetContentHeight(node) {
+    return Math.min(FC3D_MAX_H, Math.max(FC3D_MIN_H, node._faceOverlay?.getHeight?.() || FC3D_MIN_H));
 }
 
-function _fc3dClampSavedSize(node, getMinH) {
-    if (node._fc3dUserSized) return;
-    const minH = Math.min(FC3D_MAX_H, Math.max(FC3D_MIN_H, getMinH()));
-    const w = Math.max(FC3D_NODE_W, node.size?.[0] || FC3D_NODE_W);
-    if (!node.size || node.size[1] > FC3D_MAX_H + 40 || node.size[1] < FC3D_MIN_H - 40) {
-        node.setSize([w, minH]);
-        node.setDirtyCanvas?.(true, true);
-    }
-}
+function _fc3dSetupDomWidget(node, domW) {
+    const contentH = () => _fc3dGetContentHeight(node);
 
-/** Apply DOM widget + node box; user-resize keeps node.size, content-only uses measured min height. */
-function _fc3dApplyNodeSize(node, domW, getMinH) {
-    if (!node || !domW || typeof getMinH !== "function") return;
-    const minH = Math.min(FC3D_MAX_H, Math.max(FC3D_MIN_H, getMinH()));
-    const layoutMinH = () => (node._fc3dUserSized ? FC3D_MIN_H : minH);
-    const keepW = Math.max(FC3D_NODE_W, node.size?.[0] || FC3D_NODE_W);
-    const targetH = (node._fc3dUserSized && node.size?.[1] >= FC3D_MIN_H)
-        ? Math.min(FC3D_MAX_H, node.size[1])
-        : minH;
-    domW.computeSize = (width) => {
-        const tw = Math.max(FC3D_NODE_W, width || keepW);
-        const th = (node._fc3dUserSized && node.size?.[1] >= FC3D_MIN_H)
-            ? Math.min(FC3D_MAX_H, node.size[1])
-            : minH;
-        return [tw, th];
+    domW.computeSize = (width) => [
+        Math.max(FC3D_NODE_W, width || node.size?.[0] || FC3D_NODE_W),
+        contentH(),
+    ];
+    domW.computeLayoutSize = () => ({
+        minHeight: FC3D_MIN_H,
+        maxHeight: FC3D_MAX_H,
+    });
+    if (!domW.options) domW.options = {};
+    domW.options.getMinHeight = () => FC3D_MIN_H;
+    domW.options.getHeight = contentH;
+    domW.options.getMaxHeight = () => FC3D_MAX_H;
+    domW.options.afterResize = function () {
+        try { node._faceOverlay?._relayout?.(); } catch (_) {}
+        try { node._faceOverlay?.render?.(); node._faceOverlay?.drawTimeline?.(); } catch (_) {}
     };
-    domW.computeLayoutSize = () => ({ minHeight: layoutMinH(), maxHeight: FC3D_MAX_H });
-    if (domW.options) {
-        domW.options.getMinHeight = layoutMinH;
-        domW.options.getHeight = () => {
-            if (node._fc3dUserSized && node.size?.[1] >= FC3D_MIN_H) {
-                return Math.min(FC3D_MAX_H, node.size[1]);
-            }
-            return minH;
-        };
-        domW.options.getMaxHeight = () => FC3D_MAX_H;
-    }
     if (domW.element) {
         domW.element.style.overflow = "hidden";
-        domW.element.style.height = `${targetH}px`;
-        domW.element.style.minHeight = `${layoutMinH()}px`;
-        domW.element.style.maxHeight = `${FC3D_MAX_H}px`;
         domW.element.style.width = "100%";
         domW.element.style.boxSizing = "border-box";
         domW.element.style.background = C.bg;
         domW.element.style.padding = "0";
-        domW.element.style.margin = "0";
-        domW.element.style.display = "flex";
-        domW.element.style.flexDirection = "column";
-    }
-    const overlayRoot = node._faceOverlay?.root;
-    if (overlayRoot) {
-        overlayRoot.style.height = `${targetH}px`;
-        overlayRoot.style.minHeight = `${layoutMinH}px`;
-        overlayRoot.style.maxHeight = `${FC3D_MAX_H}px`;
-        overlayRoot.style.overflow = "hidden";
-    }
-    if (node._fc3dUserResizing || node._fc3dClampResize) return;
-    if (node._fc3dUserSized) {
-        node.setDirtyCanvas?.(true, true);
-        return;
-    }
-    try {
-        const sz = node.computeSize();
-        const nw = Math.max(FC3D_NODE_W, sz[0] || keepW);
-        const nh = Math.min(FC3D_MAX_H, Math.max(FC3D_MIN_H, sz[1] || targetH));
-        node._fc3dClampResize = true;
-        const _set = node._fc3dOrigSetSize || node.setSize.bind(node);
-        node._fc3dInternalSize = true;
-        _set([nw, nh]);
-        node._fc3dInternalSize = false;
-        node._fc3dClampResize = false;
-        _fc3dWriteNodeSize(node, nw, nh);
-        node.setDirtyCanvas(true, true);
-    } catch (_) {
-        node._fc3dClampResize = false;
     }
 }
 
-/** Force LiteGraph box to match computeSize (initial add only — skip after user resize). */
-function _fc3dForceNodeSize(node) {
-    if (!node?.computeSize || node._fc3dUserSized) return;
+function _fc3dSyncNodeSize(node) {
+    if (!node) return;
     try {
         const sz = node.computeSize();
-        const nw = Math.max(FC3D_NODE_W, sz[0] || node.size?.[0] || FC3D_NODE_W);
-        const nh = Math.min(FC3D_MAX_H, Math.max(FC3D_MIN_H, sz[1] || FC3D_MIN_H));
-        if (!node._fc3dClampResize) {
-            node._fc3dClampResize = true;
-            const _set = node._fc3dOrigSetSize || node.setSize.bind(node);
-            node._fc3dInternalSize = true;
-            _set([nw, nh]);
-            node._fc3dInternalSize = false;
-            node._fc3dClampResize = false;
-        }
-        _fc3dWriteNodeSize(node, nw, nh);
+        node.setSize(sz);
         node.setDirtyCanvas?.(true, true);
-    } catch (_) {
-        node._fc3dClampResize = false;
-    }
+    } catch (_) {}
 }
 
 function makeDefaultMeta() {
@@ -329,6 +342,71 @@ function makeDefaultMeta() {
 
 // ─── Widget + Override helpers ──────────────────────────────────────
 function readWidget(node,name) { return node.widgets?.find(w=>w.name===name); }
+
+function _parseFc3dConfig(node) {
+    const w = readWidget(node, CONFIG_WIDGET);
+    if (!w?.value) return { ...FC3D_DEFAULT_CFG };
+    try {
+        const o = JSON.parse(w.value);
+        return (o && typeof o === "object") ? { ...FC3D_DEFAULT_CFG, ...o } : { ...FC3D_DEFAULT_CFG };
+    } catch (_) {
+        return { ...FC3D_DEFAULT_CFG };
+    }
+}
+
+function _writeFc3dConfig(node, cfg) {
+    const w = readWidget(node, CONFIG_WIDGET);
+    if (!w) return;
+    const s = JSON.stringify(cfg);
+    if (w.value === s) return;
+    w.value = s;
+    try { w.callback?.(s, node, w); } catch (_) {}
+    node.setDirtyCanvas?.(true, true);
+}
+
+function readParam(node, key) {
+    const cfg = _parseFc3dConfig(node);
+    if (Object.prototype.hasOwnProperty.call(cfg, key)) return cfg[key];
+    const w = readWidget(node, key);
+    if (w) return w.value;
+    return FC3D_DEFAULT_CFG[key];
+}
+
+function writeParam(node, key, val) {
+    const cfg = _parseFc3dConfig(node);
+    if (cfg[key] === val) return;
+    cfg[key] = val;
+    _writeFc3dConfig(node, cfg);
+    const legacy = readWidget(node, key);
+    if (legacy && legacy.value !== val) {
+        legacy.value = val;
+        try { legacy.callback?.(val, node, legacy); } catch (_) {}
+    }
+    node.setDirtyCanvas?.(true, true);
+}
+
+function _fc3dMigrateLegacyWidgets(node) {
+    const cfg = _parseFc3dConfig(node);
+    let changed = false;
+    for (const key of Object.keys(FC3D_DEFAULT_CFG)) {
+        const lw = readWidget(node, key);
+        if (!lw || lw === readWidget(node, CONFIG_WIDGET)) continue;
+        const cur = cfg[key];
+        const def = FC3D_DEFAULT_CFG[key];
+        const lv = lw.value;
+        if (lv === undefined || lv === null || lv === "") continue;
+        if (cur === def && lv !== def && String(lv) !== String(def)) {
+            cfg[key] = lv;
+            changed = true;
+        }
+    }
+    if (changed) _writeFc3dConfig(node, cfg);
+}
+
+function _fc3dEmitParam(node, key, val, hooks) {
+    writeParam(node, key, val);
+    try { hooks?.(); } catch (_) {}
+}
 
 const _fc3dPending = new WeakMap();
 function _fc3dSchedulePersist(node) {
@@ -419,9 +497,20 @@ function buildEditor(node) {
         `height:auto;max-height:100%;align-self:stretch;` +
         `background:${C.bg};border:1px solid ${C.border};border-radius:6px;` +
         `padding:6px;overflow:hidden;font:12px ui-sans-serif,system-ui;color:${C.text};` +
-        `user-select:none;pointer-events:none;`);
+        `user-select:none;pointer-events:auto;`);
     root.classList.add("fc3d-editor-root");
     root.style.flex = "1 1 auto";
+
+    // Forward middle-mouse to canvas so workflow panning works over the editor
+    root.addEventListener("pointerdown", (e) => {
+        if (e.button === 1) { try { app.canvas?.processMouseDown(e); } catch (_) {} }
+    });
+    root.addEventListener("pointermove", (e) => {
+        if ((e.buttons & 4) === 4) { try { app.canvas?.processMouseMove(e); } catch (_) {} }
+    });
+    root.addEventListener("pointerup", (e) => {
+        if (e.button === 1) { try { app.canvas?.processMouseUp(e); } catch (_) {} }
+    });
 
     // ── Tab bar ──────────────────────────────────────────────────────
     const tabBar = _el("div",
@@ -697,11 +786,9 @@ function buildEditor(node) {
         exprPropSel.appendChild(o);
     }
     const wPropExpr = readWidget(node, "propagate_expression");
-    if (wPropExpr) {
-        exprPropSel.value = String(wPropExpr.value || "off");
-        exprPropSel.addEventListener("change", () =>
-            _fc3dEmitWidget(node, wPropExpr, exprPropSel.value, _onWidgetChg));
-    }
+    exprPropSel.value = String(readParam(node, "propagate_expression") || "off");
+    exprPropSel.addEventListener("change", () =>
+        _fc3dEmitParam(node, "propagate_expression", exprPropSel.value, _onWidgetChg));
     exprPropRow.append(exprPropLbl, exprPropSel);
     exprFineTune.appendChild(exprPropRow);
     exprFineTune.open = false;
@@ -810,9 +897,7 @@ function buildEditor(node) {
     }
 
     function _addFloatRow(parent, name, label) {
-        const w = readWidget(node, name);
-        if (!w) return;
-        const opts = w.options || {};
+        const opts = FC3D_PARAM_OPTS[name] || {};
         const min = opts.min ?? -3, max = opts.max ?? 3, step = opts.step ?? 0.05;
         const row = _el("div",
             "display:grid;grid-template-columns:clamp(72px,34%,110px) 1fr minmax(32px,2.5em);" +
@@ -821,17 +906,17 @@ function buildEditor(node) {
         lbl.textContent = label || name;
         const sl = _el("input", `width:100%;height:10px;accent-color:${C.sel};cursor:pointer;`);
         sl.type = "range"; sl.min = String(min); sl.max = String(max); sl.step = String(step);
-        sl.value = String(Number(w.value) || 0);
+        sl.value = String(Number(readParam(node, name)) || 0);
         const val = _el("span", `font:9px ui-monospace,monospace;color:${C.dim};text-align:right;`);
         const _fmt = (v) => (Math.abs(step) < 0.1 ? Number(v).toFixed(2) : Number(v).toFixed(1));
         val.textContent = _fmt(sl.value);
         sl.addEventListener("input", () => {
             const v = parseFloat(sl.value);
             val.textContent = _fmt(v);
-            _fc3dEmitWidget(node, w, v, _onWidgetChg);
+            _fc3dEmitParam(node, name, v, _onWidgetChg);
         });
         _setUiSync.push(() => {
-            sl.value = String(Number(w.value) ?? 0);
+            sl.value = String(Number(readParam(node, name)) ?? 0);
             val.textContent = _fmt(sl.value);
         });
         row.append(lbl, sl, val);
@@ -839,8 +924,6 @@ function buildEditor(node) {
     }
 
     function _addComboRow(parent, name, label, values) {
-        const w = readWidget(node, name);
-        if (!w) return;
         const row = _el("div",
             "display:grid;grid-template-columns:clamp(72px,34%,110px) 1fr;align-items:center;gap:4px;min-height:22px;width:100%;");
         const lbl = _el("span", `font:9px ui-sans-serif;color:${C.dim};overflow:hidden;text-overflow:ellipsis;`);
@@ -848,38 +931,34 @@ function buildEditor(node) {
         const sel = _el("select",
             `font:9px ui-sans-serif;padding:2px;background:${C.input_bg};color:${C.text};` +
             `border:1px solid ${C.border};border-radius:3px;width:100%;max-width:100%;`);
-        const vals = values || (Array.isArray(w.options) ? w.options : w.options?.values) || PROPAGATE_OPTS;
+        const vals = values || PROPAGATE_OPTS;
         for (const v of vals) {
             const o = _el("option"); o.value = v; o.textContent = v;
             sel.appendChild(o);
         }
-        sel.value = String(w.value ?? vals[0]);
-        sel.addEventListener("change", () => _fc3dEmitWidget(node, w, sel.value, _onWidgetChg));
-        _setUiSync.push(() => { sel.value = String(w.value ?? vals[0]); });
+        sel.value = String(readParam(node, name) ?? vals[0]);
+        sel.addEventListener("change", () => _fc3dEmitParam(node, name, sel.value, _onWidgetChg));
+        _setUiSync.push(() => { sel.value = String(readParam(node, name) ?? vals[0]); });
         row.append(lbl, sel);
         parent.appendChild(row);
     }
 
     function _addBoolRow(parent, name, label) {
-        const w = readWidget(node, name);
-        if (!w) return;
         const row = _el("div", "display:flex;align-items:center;gap:5px;height:18px;");
         const cb = _el("input", `accent-color:${C.sel};cursor:pointer;`);
-        cb.type = "checkbox"; cb.checked = !!w.value;
+        cb.type = "checkbox"; cb.checked = !!readParam(node, name);
         const lbl = _el("span", `font:9px ui-sans-serif;color:${C.dim};cursor:pointer;`);
         lbl.textContent = label || name;
-        const flip = () => _fc3dEmitWidget(node, w, cb.checked, _onWidgetChg);
+        const flip = () => _fc3dEmitParam(node, name, cb.checked, _onWidgetChg);
         cb.addEventListener("change", flip);
         lbl.addEventListener("click", () => { cb.checked = !cb.checked; flip(); });
-        _setUiSync.push(() => { cb.checked = !!w.value; });
+        _setUiSync.push(() => { cb.checked = !!readParam(node, name); });
         row.append(cb, lbl);
         parent.appendChild(row);
     }
 
     function _addIntRow(parent, name, label) {
-        const w = readWidget(node, name);
-        if (!w) return;
-        const opts = w.options || {};
+        const opts = FC3D_PARAM_OPTS[name] || {};
         const row = _el("div",
             "display:grid;grid-template-columns:clamp(72px,34%,110px) 1fr;align-items:center;gap:4px;min-height:22px;width:100%;");
         const lbl = _el("span", `font:9px ui-sans-serif;color:${C.dim};overflow:hidden;text-overflow:ellipsis;`);
@@ -891,13 +970,13 @@ function buildEditor(node) {
         if (opts.min !== undefined) inp.min = String(opts.min);
         if (opts.max !== undefined) inp.max = String(opts.max);
         if (opts.step !== undefined) inp.step = String(opts.step);
-        inp.value = String(Number(w.value) ?? 0);
+        inp.value = String(Number(readParam(node, name)) ?? 0);
         inp.addEventListener("change", () => {
             let v = parseInt(inp.value, 10);
             if (!Number.isFinite(v)) v = 0;
-            _fc3dEmitWidget(node, w, v, _onWidgetChg);
+            _fc3dEmitParam(node, name, v, _onWidgetChg);
         });
-        _setUiSync.push(() => { inp.value = String(Number(w.value) ?? 0); });
+        _setUiSync.push(() => { inp.value = String(Number(readParam(node, name)) ?? 0); });
         row.append(lbl, inp);
         parent.appendChild(row);
     }
@@ -1025,23 +1104,18 @@ function buildEditor(node) {
         }
         const computedMin = Math.min(FC3D_MAX_H, Math.max(FC3D_MIN_H, _canvasViewPx + _CHROME_PX - 12 + ctxH + 12));
 
-        if (node._fc3dUserSized && node.size?.[1] >= FC3D_MIN_H) {
-            _fillAvailableHeight(node.size[0], node.size[1]);
-        } else {
-            _applyCanvasViewPx(FC3D_TAB_CANVAS_PX[activeTab] ?? FC3D_CANVAS_VIEW_PX);
-            _editorH = computedMin;
-            const layoutMin = computedMin;
-            root.style.height = `${_editorH}px`;
-            root.style.minHeight = `${layoutMin}px`;
-            root.style.maxHeight = `${FC3D_MAX_H}px`;
-            if (ctxScroll) {
-                ctxScroll.style.maxHeight = `min(${FC3D_CTX_SCROLL_MAX}px, 42vh)`;
-                ctxScroll.style.flex = "0 1 auto";
-            }
+        _applyCanvasViewPx(FC3D_TAB_CANVAS_PX[activeTab] ?? FC3D_CANVAS_VIEW_PX);
+        _editorH = computedMin;
+        root.style.height = `${_editorH}px`;
+        root.style.minHeight = `${FC3D_MIN_H}px`;
+        root.style.maxHeight = `${FC3D_MAX_H}px`;
+        if (ctxScroll) {
+            ctxScroll.style.maxHeight = `min(${FC3D_CTX_SCROLL_MAX}px, 42vh)`;
+            ctxScroll.style.flex = "0 1 auto";
         }
-        if (!node._fc3dUserResizing && !node._fc3dUserSized && Math.abs(_editorH - _lastLayoutH) > 8) {
+        if (Math.abs(_editorH - _lastLayoutH) > 8) {
             _lastLayoutH = _editorH;
-            try { node._fc3dApplySize?.(); } catch (_) {}
+            try { _fc3dSyncNodeSize(node); } catch (_) {}
         }
     }
     function _scheduleRelayout() {
@@ -1071,9 +1145,9 @@ function buildEditor(node) {
 
     // ── Undo/Redo system ────────────────────────────────────────────
     const _undoStack=[],_redoStack=[],_UNDO_LIMIT=50;
-    function _snapshotState(){const snap={};for(const wn of[OVERRIDE_WIDGET,POSE_OVERRIDE_WIDGET,GAZE_OVERRIDE_WIDGET,COEFF_WIDGET]){const w=readWidget(node,wn);if(w)snap[wn]=w.value||"";}return JSON.stringify(snap);}
+    function _snapshotState(){const snap={};for(const wn of[OVERRIDE_WIDGET,POSE_OVERRIDE_WIDGET,GAZE_OVERRIDE_WIDGET]){const w=readWidget(node,wn);if(w)snap[wn]=w.value||"";}snap[COEFF_WIDGET]=String(readParam(node,COEFF_WIDGET)||"");return JSON.stringify(snap);}
     function _pushUndo(){const s=_snapshotState();if(_undoStack.length>0&&_undoStack[_undoStack.length-1]===s)return;_undoStack.push(s);if(_undoStack.length>_UNDO_LIMIT)_undoStack.shift();_redoStack.length=0;_updateUndoButtons();}
-    function _restoreSnap(snap){try{const obj=JSON.parse(snap);for(const[wn,val]of Object.entries(obj)){const w=readWidget(node,wn);if(w){w.value=val;try{w.callback?.(val,node,w);}catch(_){}}}}catch(_){}}
+    function _restoreSnap(snap){try{const obj=JSON.parse(snap);for(const[wn,val]of Object.entries(obj)){if(wn===COEFF_WIDGET){writeParam(node,wn,val);continue;}const w=readWidget(node,wn);if(w){w.value=val;try{w.callback?.(val,node,w);}catch(_){}}}}catch(_){}}
     function _undo(){if(_undoStack.length<2)return;_redoStack.push(_undoStack.pop());_restoreSnap(_undoStack[_undoStack.length-1]);_updateUndoButtons();render();}
     function _redo(){if(!_redoStack.length)return;const s=_redoStack.pop();_undoStack.push(s);_restoreSnap(s);_updateUndoButtons();render();}
     function _updateUndoButtons(){btnUndo.disabled=_undoStack.length<2;btnRedo.disabled=!_redoStack.length;}
@@ -1098,10 +1172,10 @@ function buildEditor(node) {
     let _coeffCommitT = 0;
     function _parseCoeffsJson() {
         if (_coeffDraft) return _coeffDraft;
-        const w = readWidget(node, COEFF_WIDGET);
-        if (!w || !w.value) return { frames: {}, ranges: [] };
+        const raw = readParam(node, COEFF_WIDGET);
+        if (!raw) return { frames: {}, ranges: [] };
         try {
-            const o = JSON.parse(w.value);
+            const o = JSON.parse(String(raw));
             if (!o.frames || typeof o.frames !== "object") o.frames = {};
             if (!Array.isArray(o.ranges)) o.ranges = [];
             return o;
@@ -1111,11 +1185,8 @@ function buildEditor(node) {
     }
     function _flushCoeffDraft() {
         if (!_coeffDraft) return;
-        const w = readWidget(node, COEFF_WIDGET);
-        if (!w) return;
         _scheduleUndoSnap();
-        w.value = JSON.stringify(_coeffDraft, null, 0);
-        if (w.callback) try { w.callback(w.value, node, w); } catch (_) {}
+        writeParam(node, COEFF_WIDGET, JSON.stringify(_coeffDraft, null, 0));
         _coeffDraft = null;
     }
     function _scheduleCoeffCommit() {
@@ -1191,10 +1262,8 @@ function buildEditor(node) {
     }
 
     function _applyExpressionCoeffs(lms, coeffs) {
-        const wStr = readWidget(node, "expression_strength");
-        const wClamp = readWidget(node, "expression_clamp");
-        const strn = wStr ? Number(wStr.value) : 1;
-        const clamp = wClamp ? Number(wClamp.value) : 1.5;
+        const strn = Number(readParam(node, "expression_strength")) || 1;
+        const clamp = Number(readParam(node, "expression_clamp")) || 1.5;
         const [bw, bh] = _faceBBoxSize(lms);
         const out = lms.map((p) => [p[0], p[1]]);
         for (const axis of FACS_AXES) {
@@ -1493,8 +1562,8 @@ function buildEditor(node) {
         if(_fc3dEditor){try{_fc3dEditor.destroy();}catch(_){}_fc3dEditor=null;if(_fc3dHost){try{_fc3dHost.remove();}catch(_){}_fc3dHost=null;}btn3D.style.background=C.border;try{_persistSave?.();}catch(_){}return;}
         btn3D.style.background=C.accent;
         _fc3dHost=_el("div","margin-top:4px;");ctxPose.appendChild(_fc3dHost);
-        const _wRead=name=>{const w=readWidget(node,name);return w?Number(w.value)||0:0;};
-        const _wWrite=(name,v)=>{const w=readWidget(node,name);if(!w)return;let c=Number(v);if(!Number.isFinite(c))return;if(w.options){if(w.options.min!==undefined)c=Math.max(w.options.min,c);if(w.options.max!==undefined)c=Math.min(w.options.max,c);}if(w.value!==c){w.value=c;try{w.callback?.(c,node,w);}catch(_){}node.setDirtyCanvas?.(true,true);}};
+        const _wRead=(name)=>Number(readParam(node,name))||0;
+        const _wWrite=(name,v)=>{let c=Number(v);if(!Number.isFinite(c))return;const opts=FC3D_PARAM_OPTS[name]||{};if(opts.min!==undefined)c=Math.max(opts.min,c);if(opts.max!==undefined)c=Math.min(opts.max,c);writeParam(node,name,c);node.setDirtyCanvas?.(true,true);};
         try{
             const mod=await import("./face_3d_editor.js");if(!_fc3dHost)return;
             _fc3dEditor=await mod.mount3DEditor(_fc3dHost,{
@@ -1513,22 +1582,15 @@ function buildEditor(node) {
     const DOF_NAMES=["head_yaw_deg","head_pitch_deg","head_roll_deg","head_tx","head_ty","head_tz","head_scale","jaw_rot_deg","neck_yaw_deg","neck_pitch_deg","gaze_yaw_deg","gaze_pitch_deg","expression_strength","expression_clamp","blend_strength"];
     function _readAllDOF() {
         const out = {};
-        for (const k of DOF_NAMES) {
-            const w = readWidget(node, k);
-            out[k] = w ? Number(w.value) || 0 : 0;
-        }
+        for (const k of DOF_NAMES) out[k] = Number(readParam(node, k)) || 0;
         for (const k of [
             "expression_coeffs_json", "head_pose_json", "gaze_json",
             "use_metas", "propagate_expression", "propagate_head", "propagate_gaze",
             "landmark_overrides_json", "pose_overrides_json", "gaze_overrides_json",
             "frame_start", "frame_end",
-        ]) {
-            const w = readWidget(node, k);
-            if (w) out[k] = w.value;
-        }
+        ]) out[k] = readParam(node, k);
         for (const k of ["blend_mouth", "blend_brows", "blend_eyes", "blend_jaw"]) {
-            const w = readWidget(node, k);
-            if (w) out[k] = !!w.value;
+            out[k] = !!readParam(node, k);
         }
         return out;
     }
@@ -1549,34 +1611,20 @@ function buildEditor(node) {
     function _scheduleLocalMirror(){if(_mirrorRaf)return;_mirrorRaf=requestAnimationFrame(()=>{_mirrorRaf=0;try{_mirrorTransform(state.frame);}catch(_){}try{render();}catch(_){}});}
     async function _serverResync(){const seq=++_resyncSeq;if(_resyncInFlight)return;_resyncInFlight=true;try{const body={node_id:String(node.id),frame_idx:state.frame,..._readAllDOF()};const resp=await fetch("/c2c/fc3d_preview",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});if(seq!==_resyncSeq)return;if(resp.status===412){frameHint.textContent="queue node once for server preview";return;}if(!resp.ok)return;const data=await resp.json();if(seq!==_resyncSeq)return;const fIdx=data.frame_idx,faceArr=data.face_norm,bodyArr=data.body_kps;if(Array.isArray(faceArr)&&_localBaseline?.faceLm?.[fIdx]){const baseLm=_localBaseline.faceLm[fIdx];let mnX=1,mxX=0,mnY=1,mxY=0;for(const p of baseLm){if(p[0]<mnX)mnX=p[0];if(p[0]>mxX)mxX=p[0];if(p[1]<mnY)mnY=p[1];if(p[1]>mxY)mxY=p[1];}const bbW=Math.max(1e-6,mxX-mnX),bbH=Math.max(1e-6,mxY-mnY);const absLm=faceArr.map(p=>[mnX+p[0]*bbW,mnY+p[1]*bbH]);const faceFr=state.meta?.frames?.[fIdx];if(faceFr){faceFr.lms=absLm;faceFr.d_norm=absLm.map((p,i)=>[(p[0]-baseLm[i][0])/bbW,(p[1]-baseLm[i][1])/bbH]);}}if(Array.isArray(bodyArr)&&pstate.frames?.[fIdx]){pstate.frames[fIdx].kps=bodyArr.map(p=>Array.isArray(p)?p.slice():[NaN,NaN]);}try{render();}catch(_){}}catch(_){}finally{_resyncInFlight=false;}}
     function _scheduleServerResync(){if(_resyncTimer)clearTimeout(_resyncTimer);_resyncTimer=setTimeout(()=>{_resyncTimer=0;_serverResync();},120);}
-    function _hookDOFWidgets() {
-        for (const k of DOF_NAMES) {
-            const w = readWidget(node, k);
-            if (!w || w.__fc3d_hooked) continue;
-            const orig = w.callback;
-            w.callback = function (v) {
-                try { orig?.call(this, v, node, w); } catch (_) {}
-                try { _syncSettingsFromWidgets(); } catch (_) {}
-                _scheduleLocalMirror();
-                _scheduleServerResync();
-            };
-            w.__fc3d_hooked = true;
-        }
-    }
-    setTimeout(_hookDOFWidgets,0);setTimeout(_hookDOFWidgets,250);
-    function _hookCoeffWidget() {
-        const w = readWidget(node, COEFF_WIDGET);
+    function _hookConfigWidget() {
+        const w = readWidget(node, CONFIG_WIDGET);
         if (!w || w.__fc3d_hooked) return;
         const orig = w.callback;
         w.callback = function (v) {
             try { orig?.call(this, v, node, w); } catch (_) {}
-            render();
+            try { _syncSettingsFromWidgets(); } catch (_) {}
+            _scheduleLocalMirror();
             _scheduleServerResync();
         };
         w.__fc3d_hooked = true;
     }
-    setTimeout(_hookCoeffWidget, 0);
-    setTimeout(_hookCoeffWidget, 250);
+    setTimeout(_hookConfigWidget, 0);
+    setTimeout(_hookConfigWidget, 250);
     _onWidgetChg = () => { try { _scheduleLocalMirror(); _scheduleServerResync(); } catch (_) {} };
 
     // ── Persistence ─────────────────────────────────────────────────
@@ -1610,7 +1658,7 @@ function buildEditor(node) {
         setView(v){const map={face:"face",pose:"pose",both:"face"};switchTab(map[v]||v);},
         mirrorRefresh(){try{_scheduleLocalMirror();}catch(_){}},
         serverResync(){try{_scheduleServerResync();}catch(_){}},
-        resetTransform(){for(const k of DOF_NAMES){const w=readWidget(node,k);if(!w)continue;let def=0;if(k==="head_scale"||k==="expression_strength"||k==="blend_strength")def=1;if(k==="expression_clamp")def=w.options?.default??1.5;if(w.value!==def){w.value=def;try{w.callback?.(def,node,w);}catch(_){}}}node.setDirtyCanvas?.(true,true);_scheduleLocalMirror();_scheduleServerResync();},
+        resetTransform(){for(const k of DOF_NAMES){let def=0;if(k==="head_scale"||k==="expression_strength"||k==="blend_strength")def=1;if(k==="expression_clamp")def=FC3D_DEFAULT_CFG.expression_clamp;writeParam(node,k,def);}node.setDirtyCanvas?.(true,true);_scheduleLocalMirror();_scheduleServerResync();},
         setVideoFrames(urls){try{_setVideoFrames(urls);render();}catch(_){}},
         undo(){_undo();},redo(){_redo();},
         _scheduleUndoSnap(){_scheduleUndoSnap();},
@@ -1618,14 +1666,10 @@ function buildEditor(node) {
         _scheduleRelayout,
         _syncSettingsFromWidgets,
         getHeight: () => _editorH,
-        /** LiteGraph resize — grow canvas with width; respect user height (no snap-back). */
         onNodeResize(nodeW, nodeH) {
-            node._fc3dUserSized = true;
-            node._fc3dUserResizing = true;
             const applied = _fillAvailableHeight(nodeW, nodeH);
             _lastLayoutH = applied;
             try { render(); drawTimeline(); } catch (_) {}
-            node._fc3dUserResizing = false;
             return applied;
         },
         destroy3D(){
@@ -1659,53 +1703,35 @@ function buildEditor(node) {
 // ═══════════════════════════════════════════════════════════════════
 try { document.getElementById("fc3d-face-controller-css")?.remove(); } catch (_) {}
 
-/** Build DOM editor + size hooks (idempotent). Covers race when node spawns before beforeRegisterNodeDef. */
+/** Build DOM editor + size hooks (idempotent). */
 function _fc3dSetupNode(node) {
     if (!node || node._faceOverlay) return;
 
     for (const wg of node.widgets || []) {
         if (wg.options === undefined) wg.options = {};
     }
+    _fc3dMigrateLegacyWidgets(node);
 
     const overlay = buildEditor(node);
     node._faceOverlay = overlay;
 
-    let widgetH = overlay.getHeight?.() || 420;
-    const domContentMinH = () => Math.min(FC3D_MAX_H, Math.max(FC3D_MIN_H, overlay.getHeight?.() || FC3D_MIN_H));
-    const domMinH = () => (node._fc3dUserSized ? FC3D_MIN_H : domContentMinH());
-    const domTargetH = () => (node._fc3dUserSized && node.size?.[1] >= FC3D_MIN_H)
-        ? Math.min(FC3D_MAX_H, node.size[1]) : domContentMinH();
     const domW = node.addDOMWidget("face_overlay", "canvas", overlay.root, {
         getValue() { return ""; },
         setValue() {},
         serialize: false,
         hideOnZoom: false,
-        getMinHeight: domMinH,
-        getHeight: domTargetH,
+        getMinHeight: () => FC3D_MIN_H,
+        getHeight: () => _fc3dGetContentHeight(node),
         getMaxHeight: () => FC3D_MAX_H,
     });
-    domW.computeSize = (width) => [
-        Math.max(FC3D_NODE_W, width || node.size?.[0] || FC3D_NODE_W),
-        domTargetH(),
-    ];
-    domW.computeLayoutSize = () => ({ minHeight: domMinH(), maxHeight: FC3D_MAX_H });
-    domW.options.getMinHeight = domMinH;
-    domW.options.getHeight = domTargetH;
-    domW.options.getMaxHeight = () => FC3D_MAX_H;
+    _fc3dSetupDomWidget(node, domW);
 
     const hideChrome = () => _fc3dHideChromeWidgets(node, domW);
 
     node._fc3dDomW = domW;
     node._fc3dHideChrome = hideChrome;
-    if (node.resizable !== false) node.resizable = true;
-    if (!node.minimum_size) node.minimum_size = [FC3D_NODE_W, FC3D_MIN_H];
-    node.max_size = [900, FC3D_MAX_H];
-
-    node._fc3dApplySize = () => {
-        widgetH = overlay.getHeight?.() || 420;
-        _fc3dApplyNodeSize(node, domW, () => widgetH);
-    };
-    _fc3dBindComputeSize(node, () => widgetH);
+    node.resizable = true;
+    node.minimum_size = [FC3D_NODE_W, FC3D_MIN_H];
 
     hideChrome();
 
@@ -1713,107 +1739,36 @@ function _fc3dSetupNode(node) {
         try { overlay.update(JSON.parse(node._cachedOverlayMeta)); } catch (_) {}
     }
 
-    node._fc3dApplySize();
-    if (!node._fc3dUserSized) {
-        _fc3dForceNodeSize(node);
-        _fc3dClampSavedSize(node, () => widgetH);
-    }
-
-    const _syncAfterMount = () => {
+    // Single deferred sync — no clamp loop, no repeated setTimeouts
+    const _syncOnce = () => {
         hideChrome();
-        node._fc3dApplySize();
-        if (!node._fc3dUserSized) _fc3dForceNodeSize(node);
+        _fc3dSyncNodeSize(node);
     };
-    setTimeout(_syncAfterMount, 0);
-    setTimeout(_syncAfterMount, 120);
-    setTimeout(_syncAfterMount, 400);
+    setTimeout(_syncOnce, 0);
+    setTimeout(_syncOnce, 300);
 
-    if (!node._fc3dClampLoopStarted) {
-        node._fc3dClampLoopStarted = true;
-        let _fc3dClampLeft = 12;
-        const _fc3dClampLoop = () => {
-            requestAnimationFrame(() => {
-                try {
-                    hideChrome();
-                    if (!node._fc3dUserSized) {
-                        node._fc3dApplySize?.();
-                        _fc3dForceNodeSize(node);
-                    }
-                } catch (_) {}
-                if (--_fc3dClampLeft > 0) _fc3dClampLoop();
-            });
-        };
-        _fc3dClampLoop();
-    }
-
+    // Simple onResize — just notify the editor to relayout, no size overrides
     if (!node._fc3dHooksBound) {
         node._fc3dHooksBound = true;
         const _origOnAdded = node.onAdded;
         node.onAdded = function () {
             _origOnAdded?.apply(this, arguments);
-            _syncAfterMount();
+            _syncOnce();
         };
 
         const _origOnResize = node.onResize;
         node.onResize = function (size) {
-            if (node._fc3dClampResize) return;
-            node._fc3dUserSized = true;
-            const sz = size || node.size;
-            const nw = Math.max(FC3D_NODE_W, sz?.[0] || node.size?.[0] || FC3D_NODE_W);
-            const nh = Math.max(FC3D_MIN_H, Math.min(FC3D_MAX_H, sz?.[1] || node.size?.[1] || widgetH));
-            _fc3dWriteNodeSize(node, nw, nh);
-            if (sz && sz !== node.size) { sz[0] = nw; sz[1] = nh; }
             _origOnResize?.apply(this, arguments);
-            const appliedH = overlay.onNodeResize?.(nw, nh) ?? nh;
-            widgetH = appliedH;
-            _fc3dWriteNodeSize(node, nw, appliedH);
-            node._fc3dUserTargetH = appliedH;
-            node._fc3dUserTargetW = nw;
-            node._fc3dApplySize();
-            node.setDirtyCanvas?.(true, true);
+            const sz = size || node.size;
+            const nw = Math.max(FC3D_NODE_W, sz?.[0] || FC3D_NODE_W);
+            const nh = Math.max(FC3D_MIN_H, Math.min(FC3D_MAX_H, sz?.[1] || FC3D_MIN_H));
+            _fc3dWriteNodeSize(node, nw, nh);
+            try { overlay.onNodeResize?.(nw, nh); } catch (_) {}
+            try { overlay._relayout?.(); } catch (_) {}
             requestAnimationFrame(() => {
                 try { overlay.render?.(); overlay.drawTimeline?.(); } catch (_) {}
             });
         };
-
-        const _origSetSize = node.setSize?.bind(node);
-        if (_origSetSize) {
-            node._fc3dOrigSetSize = _origSetSize;
-            node.setSize = function (sz) {
-                if (!Array.isArray(sz) || sz.length < 2) return _origSetSize(sz);
-                let nw = Math.max(FC3D_NODE_W, sz[0]);
-                let nh = Math.max(FC3D_MIN_H, Math.min(FC3D_MAX_H, sz[1]));
-                const internal = !!node._fc3dInternalSize;
-                const userDrag = !!node._fc3dUserResizing;
-                if (node._fc3dUserSized && !internal && !userDrag) {
-                    const prevW = node._fc3dUserTargetW ?? node.size?.[0];
-                    if (node._fc3dUserTargetH != null && nh > node._fc3dUserTargetH + 1
-                        && Math.abs(nw - prevW) < 2) {
-                        nh = node._fc3dUserTargetH;
-                    }
-                    if (node._fc3dUserTargetW != null && nw > node._fc3dUserTargetW + 1
-                        && Math.abs(nh - (node._fc3dUserTargetH ?? node.size?.[1])) < 2) {
-                        nw = node._fc3dUserTargetW;
-                    }
-                    const curH = node.size?.[1];
-                    const curW = node.size?.[0];
-                    if (Math.abs(nh - curH) < 1 && Math.abs(nw - curW) < 1) return;
-                }
-                if (!internal) {
-                    node._fc3dUserSized = true;
-                    node._fc3dUserTargetH = nh;
-                    node._fc3dUserTargetW = nw;
-                }
-                node._fc3dClampResize = true;
-                _fc3dWriteNodeSize(node, nw, nh);
-                node._fc3dApplySize?.();
-                try { overlay._relayout?.(); } catch (_) {}
-                const out = _origSetSize([nw, nh]);
-                _fc3dWriteNodeSize(node, nw, nh);
-                node._fc3dClampResize = false;
-                return out;
-            };
-        }
     }
 
     _fc3dInstances.add(node);
@@ -1828,7 +1783,21 @@ app.registerExtension({
         nodeType.prototype.isWidgetVisible = function (widget) {
             if (widget?.name === "face_overlay") return true;
             if (widget?.__fc3d_chrome_hidden) return false;
+            if (widget?.options?.hidden) return false;
+            if (widget?.type === "hidden") return false;
             return _origIsWidgetVisible ? _origIsWidgetVisible.call(this, widget) : true;
+        };
+
+        const _origProtoCS = nodeType.prototype.computeSize;
+        nodeType.prototype.computeSize = function (outW) {
+            const w = Math.max(FC3D_NODE_W, this.size?.[0] || FC3D_NODE_W);
+            const cap = FC3D_MAX_H;
+            if (_origProtoCS) {
+                const sz = _origProtoCS.call(this, outW);
+                return [Math.max(sz[0] || w, FC3D_NODE_W), Math.min(sz[1] || cap, cap)];
+            }
+            const h = Math.min(Math.max(this.size?.[1] || FC3D_MIN_H, FC3D_MIN_H), cap);
+            return [w, h];
         };
 
         // Hide backend-only widgets the moment LiteGraph adds them — prevents
@@ -1844,6 +1813,30 @@ app.registerExtension({
             };
         }
 
+        // Multiline STRING inputs (fc3d_config_json etc) go through addDOMWidget
+        const _origAddDOMWidget = nodeType.prototype.addDOMWidget;
+        if (_origAddDOMWidget) {
+            nodeType.prototype.addDOMWidget = function (...args) {
+                const w = _origAddDOMWidget.apply(this, args);
+                if (w?.name && w.name !== "face_overlay") {
+                    _fc3dHideChromeWidget(w);
+                }
+                return w;
+            };
+        }
+
+        // Some paths use addCustomWidget
+        const _origAddCustomWidget = nodeType.prototype.addCustomWidget;
+        if (_origAddCustomWidget) {
+            nodeType.prototype.addCustomWidget = function (w) {
+                const result = _origAddCustomWidget.call(this, w);
+                if (w?.name && w.name !== "face_overlay") {
+                    _fc3dHideChromeWidget(w);
+                }
+                return result;
+            };
+        }
+
         const _created = nodeType.prototype.onNodeCreated;
         nodeType.prototype.onNodeCreated = function () {
             _created?.apply(this, arguments);
@@ -1854,24 +1847,15 @@ app.registerExtension({
         nodeType.prototype.onConfigure = function () {
             _configure?.apply(this, arguments);
             try {
+                _fc3dMigrateLegacyWidgets(this);
                 this._fc3dHideChrome?.();
-                _fc3dClampSavedSize(this, () => this._faceOverlay?.getHeight?.() || 420);
-                this._fc3dApplySize?.();
-                _fc3dForceNodeSize(this);
                 this._faceOverlay?._syncSettingsFromWidgets?.();
-                const savedH = this.size?.[1];
                 const contentH = this._faceOverlay?.getHeight?.() || FC3D_MIN_H;
-                if (savedH >= FC3D_MIN_H + 12 && savedH > contentH + 8) {
-                    this._fc3dUserSized = true;
-                    this._fc3dUserTargetH = savedH;
-                    this._fc3dUserTargetW = this.size?.[0];
-                } else if (savedH > contentH + 80 && !this._fc3dUserSized) {
-                    // Legacy workflows saved inflated height from raw widget stack — shrink void.
-                    this._fc3dUserSized = false;
-                    this._fc3dUserTargetH = null;
-                    this._fc3dUserTargetW = null;
+                const savedH = this.size?.[1];
+                if (savedH > contentH + 80) {
                     _fc3dWriteNodeSize(this, Math.max(FC3D_NODE_W, this.size?.[0] || FC3D_NODE_W), contentH);
                 }
+                _fc3dSyncNodeSize(this);
                 this._faceOverlay?._scheduleRelayout?.();
             } catch (_) {}
         };
@@ -1906,7 +1890,7 @@ app.registerExtension({
             try {
                 if (!node._faceOverlay) _fc3dSetupNode(node);
                 node._fc3dHideChrome?.();
-                node._fc3dApplySize?.();
+                _fc3dSyncNodeSize(node);
             } catch (_) {}
         });
     },
@@ -1917,9 +1901,7 @@ app.registerExtension({
             try {
                 if (!node._faceOverlay) _fc3dSetupNode(node);
                 node._fc3dHideChrome?.();
-                _fc3dClampSavedSize(node, () => node._faceOverlay?.getHeight?.() || 420);
-                node._fc3dApplySize?.();
-                _fc3dForceNodeSize(node);
+                _fc3dSyncNodeSize(node);
             } catch (_) {}
         });
     },

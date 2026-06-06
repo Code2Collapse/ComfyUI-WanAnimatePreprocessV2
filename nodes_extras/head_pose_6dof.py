@@ -1,32 +1,32 @@
 """WanHeadPose6DoFV2 — 6-DoF head pose via cv2.solvePnP.
 
-Uses MediaPipe's canonical 3D face model. Six rigid correspondences are
-sufficient for a stable PnP solution; we use 14 for accuracy:
+Uses an iBUG-68 landmark model. Six rigid correspondences are sufficient
+for a stable PnP solution; we use 14 for accuracy:
 
     Index  Name                           Canonical 3D (mm, head frame)
     -----  -----------------------------  ----------------------------
-      1    nose tip                       ( 0.000,  0.000,  0.000)
-    152    chin                           ( 0.000, -7.500, -1.500)
-     33    right eye outer corner         (-4.500,  3.500, -2.500)
-    263    left  eye outer corner         ( 4.500,  3.500, -2.500)
-    133    right eye inner corner         (-1.500,  3.500, -2.000)
-    362    left  eye inner corner         ( 1.500,  3.500, -2.000)
-     61    right mouth corner             (-2.500, -3.000, -2.000)
-    291    left  mouth corner             ( 2.500, -3.000, -2.000)
-    199    chin lower                     ( 0.000, -8.500, -1.000)
-      4    nose ridge                     ( 0.000,  1.500,  0.500)
-    234    right cheek                    (-7.000,  0.500, -4.000)
-    454    left  cheek                    ( 7.000,  0.500, -4.000)
-     93    right ear front                (-7.500,  1.500, -6.500)
-    323    left  ear front                ( 7.500,  1.500, -6.500)
+     30    nose tip                       ( 0.000,  0.000,  0.000)
+      8    chin                           ( 0.000, -7.500, -1.500)
+     36    left  eye left corner          (-4.500,  3.500, -2.500)
+     45    right eye right corner         ( 4.500,  3.500, -2.500)
+     39    left  eye right corner         (-1.500,  3.500, -2.000)
+     42    right eye left corner          ( 1.500,  3.500, -2.000)
+     48    left  mouth corner             (-2.500, -3.000, -2.000)
+     54    right mouth corner             ( 2.500, -3.000, -2.000)
+      6    chin side left                 (-5.500, -6.500, -4.000)
+     10    chin side right                ( 5.500, -6.500, -4.000)
+     27    nose bridge top                ( 0.000,  1.500,  0.500)
+      0    jaw right                      (-7.000,  0.500, -4.000)
+     16    jaw left                       ( 7.000,  0.500, -4.000)
+     33    nose bottom                    ( 0.000, -1.000,  0.500)
 
 Camera matrix: focal = max(W, H); principal point = image centre.
 Distortion assumed zero (rectified input).
 
 Inputs:
   - landmarks_json : STRING -- list per frame, each frame is a list of [x,y]
-                     in image pixel coords for MP 478 face mesh, OR a list
-                     of face dicts with "kps_face" key.
+                     in image pixel coords for iBUG-68 face landmarks, OR a
+                     list of face dicts with "kps_face" key.
   - image          : IMAGE  -- used only to read (H, W); optional if
                      image_size_override supplied.
 
@@ -51,23 +51,23 @@ import numpy as np
 import torch
 
 
-# Canonical 3D model points (MediaPipe-derived, mm)
-_LM_INDICES = [1, 152, 33, 263, 133, 362, 61, 291, 199, 4, 234, 454, 93, 323]
+# Canonical 3D model points (iBUG-68 indices, mm)
+_LM_INDICES = [30, 8, 36, 45, 39, 42, 48, 54, 6, 10, 27, 0, 16, 33]
 _MODEL_3D = np.array([
-    [ 0.0,  0.0,   0.0],
-    [ 0.0, -7.5,  -1.5],
-    [-4.5,  3.5,  -2.5],
-    [ 4.5,  3.5,  -2.5],
-    [-1.5,  3.5,  -2.0],
-    [ 1.5,  3.5,  -2.0],
-    [-2.5, -3.0,  -2.0],
-    [ 2.5, -3.0,  -2.0],
-    [ 0.0, -8.5,  -1.0],
-    [ 0.0,  1.5,   0.5],
-    [-7.0,  0.5,  -4.0],
-    [ 7.0,  0.5,  -4.0],
-    [-7.5,  1.5,  -6.5],
-    [ 7.5,  1.5,  -6.5],
+    [ 0.0,  0.0,   0.0],   # 30 nose tip
+    [ 0.0, -7.5,  -1.5],   # 8  chin
+    [-4.5,  3.5,  -2.5],   # 36 left eye left corner
+    [ 4.5,  3.5,  -2.5],   # 45 right eye right corner
+    [-1.5,  3.5,  -2.0],   # 39 left eye right corner
+    [ 1.5,  3.5,  -2.0],   # 42 right eye left corner
+    [-2.5, -3.0,  -2.0],   # 48 left mouth corner
+    [ 2.5, -3.0,  -2.0],   # 54 right mouth corner
+    [-5.5, -6.5,  -4.0],   # 6  chin side left
+    [ 5.5, -6.5,  -4.0],   # 10 chin side right
+    [ 0.0,  1.5,   0.5],   # 27 nose bridge top
+    [-7.0,  0.5,  -4.0],   # 0  jaw right
+    [ 7.0,  0.5,  -4.0],   # 16 jaw left
+    [ 0.0, -1.0,   0.5],   # 33 nose bottom
 ], dtype=np.float64)
 
 
@@ -134,11 +134,11 @@ def _draw_axes(img_u8: np.ndarray, rvec: np.ndarray, tvec: np.ndarray,
     return out
 
 
+_MIN_LANDMARKS_REQUIRED = max(_LM_INDICES) + 1  # 68 for iBUG-68
+
+
 def _extract_frame_landmarks(frame_entry, w: int, h: int) -> Optional[np.ndarray]:
     """Extract the 14 named landmark pixel coords from a frame entry."""
-    # Supported forms:
-    #   - list of [x, y] of length 478 (MP layout)
-    #   - dict with 'face_landmarks' or 'kps_face' key
     if isinstance(frame_entry, dict):
         for key in ("face_landmarks", "kps_face", "landmarks", "kps"):
             if key in frame_entry:
@@ -147,10 +147,9 @@ def _extract_frame_landmarks(frame_entry, w: int, h: int) -> Optional[np.ndarray
     if not isinstance(frame_entry, (list, tuple)) or not frame_entry:
         return None
     arr = np.asarray(frame_entry, dtype=np.float64)
-    if arr.ndim != 2 or arr.shape[0] < max(_LM_INDICES) + 1 or arr.shape[1] < 2:
+    if arr.ndim != 2 or arr.shape[0] < _MIN_LANDMARKS_REQUIRED or arr.shape[1] < 2:
         return None
     pts = arr[_LM_INDICES, :2]
-    # Heuristic: if values look normalised [0..1] -> scale to pixels
     if pts.max() <= 1.5 and pts.min() >= -0.5:
         pts = pts * np.array([[w, h]], dtype=np.float64)
     return pts
@@ -161,14 +160,14 @@ class WanHeadPose6DoFV2:
     FUNCTION = "execute"
     RETURN_TYPES = ("STRING", "IMAGE", "FLOAT", "FLOAT", "FLOAT")
     RETURN_NAMES = ("poses_json", "overlay", "yaw", "pitch", "roll")
-    DESCRIPTION = "6-DoF head pose via cv2.solvePnP on MediaPipe 478 landmarks (14-point canonical model)."
+    DESCRIPTION = "6-DoF head pose via cv2.solvePnP on iBUG-68 landmarks (14-point canonical model)."
 
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
                 "landmarks_json": ("STRING", {"multiline": True, "default": "[]",
-                    "tooltip": "JSON: list of frames; each frame is a list of [x,y] (length 478) or a dict with face_landmarks/kps_face."}),
+                    "tooltip": "JSON: list of frames; each frame is a list of [x,y] (iBUG-68, length >= 68) or a dict with face_landmarks/kps_face."}),
             },
             "optional": {
                 "image": ("IMAGE",),

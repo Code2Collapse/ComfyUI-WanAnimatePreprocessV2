@@ -221,16 +221,27 @@ class WanQualityScorerJitterV2:
             xs = [x for x in xs if isinstance(x, float) and x == x]
             return float(sum(xs) / len(xs)) if xs else float("nan")
 
+        # Normalize velocities by image diagonal for resolution-independence.
+        diag = max(float(image_diagonal_px), 64.0)
+        body_vels_norm = [v / diag if v == v else float("nan") for v in body_vels]
+        face_vels_norm = [v / diag if v == v else float("nan") for v in face_vels]
+        for i, m in enumerate(per_frame_metrics):
+            m["body_velocity_norm"] = body_vels_norm[i] if body_vels_norm[i] == body_vels_norm[i] else None
+            m["face_velocity_norm"] = face_vels_norm[i] if face_vels_norm[i] == face_vels_norm[i] else None
+
         m_body = _mean(body_vels)
         m_face = _mean(face_vels)
+        m_body_norm = _mean(body_vels_norm)
+        m_face_norm = _mean(face_vels_norm)
         m_expr = _mean(expr_jitter) if expr_jitter else 0.0
         m_vis = _mean(vis_ratios)
 
-        # Per-frame bad flag
+        # Per-frame bad flag: use normalized velocity for resolution-independent threshold.
+        bad_vel_norm = bad_velocity_thr_px / diag
         bad = 0
-        for m in per_frame_metrics:
-            bv = m.get("body_velocity_px")
-            if bv is not None and bv > bad_velocity_thr_px:
+        for i, m in enumerate(per_frame_metrics):
+            bv_n = body_vels_norm[i] if i < len(body_vels_norm) else float("nan")
+            if bv_n == bv_n and bv_n > bad_vel_norm:
                 m["bad"] = True
                 bad += 1
                 continue
@@ -238,15 +249,23 @@ class WanQualityScorerJitterV2:
                 m["bad"] = True
                 bad += 1
                 continue
+            ej = m.get("expression_jitter")
+            if ej is not None and ej > 0.1:
+                m["bad"] = True
+                bad += 1
+                continue
             m["bad"] = False
 
-        # Aggregate score
-        vel_score = 1.0 if not (m_body == m_body) else max(0.0, 1.0 - m_body / max(max_velocity_px, 1.0))
+        # Aggregate score using normalized velocity.
+        max_vel_norm = max_velocity_px / diag
+        vel_score = 1.0 if not (m_body_norm == m_body_norm) else max(0.0, 1.0 - m_body_norm / max(max_vel_norm, 1e-6))
         vis_score = m_vis if (m_vis == m_vis) else 1.0
         # Expression jitter typical range ~0..0.02; map 0->1, 0.05->0
         expr_score = max(0.0, 1.0 - (m_expr / 0.05)) if expr_jitter else 1.0
-        # Weighted: visibility most important
-        quality = float(0.5 * vis_score + 0.35 * vel_score + 0.15 * expr_score)
+        # Face velocity penalty (high face motion = identity drift risk).
+        face_vel_score = 1.0 if not (m_face_norm == m_face_norm) else max(0.0, 1.0 - m_face_norm / max(max_vel_norm * 0.5, 1e-6))
+        # Weighted: visibility most important, face velocity matters for identity work.
+        quality = float(0.4 * vis_score + 0.25 * vel_score + 0.20 * face_vel_score + 0.15 * expr_score)
         quality = max(0.0, min(1.0, quality))
 
         out_json = json.dumps({
@@ -254,12 +273,15 @@ class WanQualityScorerJitterV2:
             "summary": {
                 "mean_body_velocity_px": m_body if m_body == m_body else None,
                 "mean_face_velocity_px": m_face if m_face == m_face else None,
+                "mean_body_velocity_norm": m_body_norm if m_body_norm == m_body_norm else None,
+                "mean_face_velocity_norm": m_face_norm if m_face_norm == m_face_norm else None,
                 "mean_visibility_body": m_vis if m_vis == m_vis else None,
                 "mean_expression_jitter": m_expr,
                 "bad_frame_count": bad,
                 "n_frames": len(per_frame_metrics),
                 "quality_score": quality,
-                "weights": {"visibility": 0.5, "velocity": 0.35, "expression": 0.15},
+                "weights": {"visibility": 0.4, "body_velocity": 0.25,
+                            "face_velocity": 0.20, "expression": 0.15},
                 "thresholds": {
                     "confidence": float(confidence_threshold),
                     "max_velocity_px": float(max_velocity_px),

@@ -68,7 +68,7 @@ import json
 import logging
 import math
 from copy import deepcopy
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 
@@ -116,6 +116,64 @@ _POSE18_EDGES_UI: Tuple[Tuple[int, int], ...] = (
 )
 _GAZE_MAX_YAW_RAD   = math.radians(30.0)
 _GAZE_MAX_PITCH_RAD = math.radians(25.0)
+
+# Default editor-owned config (mirrors js/face_controller_3d.js FC3D_DEFAULT_CFG).
+_FC3D_DEFAULT_CFG: Dict[str, Any] = {
+    "expression_coeffs_json": "",
+    "expression_strength": 1.0,
+    "expression_clamp": 1.5,
+    "propagate_expression": "off",
+    "head_pose_json": "",
+    "head_yaw_deg": 0.0,
+    "head_pitch_deg": 0.0,
+    "head_roll_deg": 0.0,
+    "head_tx": 0.0,
+    "head_ty": 0.0,
+    "head_tz": 0.0,
+    "head_scale": 1.0,
+    "jaw_rot_deg": 0.0,
+    "neck_yaw_deg": 0.0,
+    "neck_pitch_deg": 0.0,
+    "propagate_head": "off",
+    "propagate_gaze": "off",
+    "gaze_json": "",
+    "gaze_yaw_deg": 0.0,
+    "gaze_pitch_deg": 0.0,
+    "blend_strength": 0.0,
+    "blend_mouth": True,
+    "blend_brows": False,
+    "blend_eyes": False,
+    "blend_jaw": False,
+    "use_metas": "edited",
+    "frame_start": -1,
+    "frame_end": -1,
+    "preview_frame_idx": 0,
+    "preview_size": 512,
+    "preview_max_video_frames": 120,
+}
+
+
+def _fc3d_default_config_json() -> str:
+    return json.dumps(_FC3D_DEFAULT_CFG, separators=(",", ":"))
+
+
+def _resolve_fc3d_run_params(
+    fc3d_config_json: str = "",
+    **legacy: Any,
+) -> Dict[str, Any]:
+    """Merge fc3d_config_json with legacy per-widget kwargs (old workflows)."""
+    cfg = dict(_FC3D_DEFAULT_CFG)
+    if fc3d_config_json and fc3d_config_json.strip():
+        try:
+            loaded = json.loads(fc3d_config_json)
+            if isinstance(loaded, dict):
+                cfg.update(loaded)
+        except json.JSONDecodeError as exc:
+            log.warning("fc3d_config_json ignored — not valid JSON: %s", exc)
+    for key in _FC3D_DEFAULT_CFG:
+        if key in legacy and legacy[key] is not None:
+            cfg[key] = legacy[key]
+    return cfg
 
 
 def _parse_pose_overrides_ui(blob: Optional[str]) -> Dict[int, Dict[int, Tuple[float, float]]]:
@@ -179,7 +237,7 @@ def _parse_range_deltas(
     every covered frame.  Per-frame absolute overrides (the ``frames``
     section) are applied *after* these and therefore win on conflicts.
     Coordinates are in the SAME normalised space as the per-frame section
-    (face: bbox-normalised, pose: image-normalised).
+    (face: image-normalised [0,1], pose: image-normalised).
     """
     if not blob or not blob.strip():
         return {}
@@ -1018,170 +1076,26 @@ class WanFaceController3DV2:
                 }),
             },
             "optional": {
-                # ── (2) Expression coeffs ────────────────────────────
-                "expression_coeffs_json": ("STRING", {
-                    "multiline": True, "default": "",
-                    "tooltip": "Per-frame and/or range expression coefficient JSON. "
-                               "Keys: " + ", ".join(_AXIS_NAMES),
-                }),
-                "expression_strength": ("FLOAT", {
-                    "default": 1.0, "min": -3.0, "max": 3.0, "step": 0.05,
-                    "tooltip": "Global multiplier on expression coefficients.",
-                }),
-                "expression_clamp": ("FLOAT", {
-                    "default": 1.5, "min": 0.1, "max": 3.0, "step": 0.05,
-                    "tooltip": "Symmetric clamp on each expression coefficient.",
-                }),
-                "propagate_expression": (["off", "hold_last", "interpolate", "broadcast_first"], {
-                    "default": "off",
-                    "tooltip": (
-                        "How to fill timeline gaps between expression keyframes:\n"
-                        "  off            – only frames with explicit data get expressions.\n"
-                        "  hold_last      – step-function: gaps hold the previous keyframe.\n"
-                        "  interpolate    – smooth linear interpolation between keyframes.\n"
-                        "  broadcast_first – apply the first keyframe to every gap frame."
-                    ),
-                }),
-                # ── (3) Head pose ────────────────────────────────────
-                "head_pose_json": ("STRING", {
-                    "multiline": True, "default": "",
-                    "tooltip": "Per-frame head pose JSON. Keys: yaw, pitch, roll (degrees).",
-                }),
-                "head_yaw_deg": ("FLOAT", {
-                    "default": 0.0, "min": -90.0, "max": 90.0, "step": 0.5,
-                    "tooltip": "Constant yaw applied to every frame (added to JSON).",
-                }),
-                "head_pitch_deg": ("FLOAT", {
-                    "default": 0.0, "min": -60.0, "max": 60.0, "step": 0.5,
-                }),
-                "head_roll_deg": ("FLOAT", {
-                    "default": 0.0, "min": -60.0, "max": 60.0, "step": 0.5,
-                }),
-                # ── (3b) Head translation (rigid 5-DOF extension) ────
-                # tx/ty in FACE-BBOX-WIDTH units (±0.5 ≈ half-face shift).
-                # tz is a depth-zoom signal: +tz pushes the face away
-                # (face shrinks); -tz brings it forward (grows). Clamped
-                # in _apply_head_translation so the zoom factor stays in
-                # [0.25x .. 4.0x].
-                "head_tx": ("FLOAT", {
-                    "default": 0.0, "min": -2.0, "max": 2.0, "step": 0.01,
-                    "tooltip": "Horizontal head shift in face-width units (+ = image right).",
-                }),
-                "head_ty": ("FLOAT", {
-                    "default": 0.0, "min": -2.0, "max": 2.0, "step": 0.01,
-                    "tooltip": "Vertical head shift in face-width units (+ = image down).",
-                }),
-                "head_tz": ("FLOAT", {
-                    "default": 0.0, "min": -0.75, "max": 3.0, "step": 0.01,
-                    "tooltip": "Depth shift: + pushes the face away (smaller), - brings it forward (larger).",
-                }),
-                # ── (3d) Extra DOF for Face Director real-time editor (Phase 1.A) ──
-                # head_scale is a direct uniform multiplier around the face
-                # centroid (distinct from tz which simulates depth via
-                # 1/(1+tz)). 1.0 = no-op. Clamped to [0.25, 4.0].
-                "head_scale": ("FLOAT", {
-                    "default": 1.0, "min": 0.25, "max": 4.0, "step": 0.01,
-                    "tooltip": "Uniform face scale around centroid (1.0 = no-op). Distinct from head_tz which is perspective-style.",
-                }),
-                # jaw_rot_deg rotates the lower-jaw landmarks (5..11) +
-                # follows the lower lip about the ear-to-ear hinge.
-                # Positive = mouth opens. Clamped ±25°.
-                "jaw_rot_deg": ("FLOAT", {
-                    "default": 0.0, "min": -25.0, "max": 25.0, "step": 0.25,
-                    "tooltip": "Jaw rotation about the ear-to-ear hinge (+ opens mouth, - closes).",
-                }),
-                # Neck rotation operates on the body keypoints (OpenPose-18),
-                # not the face landmarks — rotates the head cluster
-                # (nose+eyes+ears) about the neck joint.
-                "neck_yaw_deg": ("FLOAT", {
-                    "default": 0.0, "min": -60.0, "max": 60.0, "step": 0.5,
-                    "tooltip": "Neck yaw applied to body keypoints (head cluster rotates about neck). + = subject's left.",
-                }),
-                "neck_pitch_deg": ("FLOAT", {
-                    "default": 0.0, "min": -45.0, "max": 45.0, "step": 0.5,
-                    "tooltip": "Neck pitch applied to body keypoints (+ = chin up).",
-                }),
-                # ── (3c) Rigid-pose propagation across the timeline ──
-                "propagate_head": (["off", "hold_last", "interpolate", "broadcast_first"], {
-                    "default": "off",
-                    "tooltip": (
-                        "How to fill timeline gaps between explicit head_pose_json pins:\n"
-                        "  off            – use pins where given, constants elsewhere.\n"
-                        "  hold_last      – step-function: each gap holds the previous pin.\n"
-                        "  interpolate    – DAW-style linear interpolation between pins.\n"
-                        "  broadcast_first – apply the first pin to every gap frame."
-                    ),
-                }),
-                "propagate_gaze": (["off", "hold_last", "interpolate", "broadcast_first"], {
-                    "default": "off",
-                    "tooltip": "Same propagation semantics for gaze_json pins.",
-                }),
-                # ── (4) Gaze ─────────────────────────────────────────
-                "gaze_json": ("STRING", {
-                    "multiline": True, "default": "",
-                    "tooltip": "Per-frame gaze JSON. Keys: yaw, pitch (degrees, ±30 saturates).",
-                }),
-                "gaze_yaw_deg": ("FLOAT", {
-                    "default": 0.0, "min": -30.0, "max": 30.0, "step": 0.5,
-                }),
-                "gaze_pitch_deg": ("FLOAT", {
-                    "default": 0.0, "min": -30.0, "max": 30.0, "step": 0.5,
-                }),
-                # ── (1) Reference blend ──────────────────────────────
                 "reference_pose_data": ("POSEDATA", {
                     "tooltip": "Optional single-frame POSEDATA used as a region-wise shape target.",
                 }),
-                "blend_strength": ("FLOAT", {
-                    "default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05,
-                    "tooltip": "Reference-blend strength (0 = no blend, 1 = fully match reference).",
+                # All scalar / combo / multiline tunables live here; the in-canvas
+                # editor syncs this blob. Keeps LiteGraph node height minimal.
+                "fc3d_config_json": ("STRING", {
+                    "default": _fc3d_default_config_json(),
+                    "tooltip": "Editor-owned JSON for expression/head/gaze/blend/preview params. "
+                               "Synced automatically by face_controller_3d.js.",
                 }),
-                "blend_mouth": ("BOOLEAN", {"default": True}),
-                "blend_brows": ("BOOLEAN", {"default": False}),
-                "blend_eyes":  ("BOOLEAN", {"default": False}),
-                "blend_jaw":   ("BOOLEAN", {"default": False}),
-                # ── Common ───────────────────────────────────────────
-                "use_metas": (["edited", "original"], {
-                    "default": "edited",
-                    "tooltip": "'edited' = stack on pose_metas. 'original' = restart from pose_metas_original.",
-                }),
-                "frame_start": ("INT", {
-                    "default": -1, "min": -1, "max": 999999, "step": 1,
-                    "tooltip": "If >=0, only frames in [frame_start..frame_end] are touched. -1 = no clamp.",
-                }),
-                "frame_end": ("INT", {
-                    "default": -1, "min": -1, "max": 999999, "step": 1,
-                }),
-                # ── (Phase 1.C) Preview-output controls ──────────────
-                # preview_image renders one frame at this index; clamped
-                # to [0, n_frames-1] at runtime. overlay_video renders
-                # every frame within [frame_start..frame_end] up to
-                # preview_max_video_frames (perf guard for long shots).
-                "preview_frame_idx": ("INT", {
-                    "default": 0, "min": 0, "max": 999999, "step": 1,
-                    "tooltip": "Which frame to render as preview_image (single-frame IMAGE).",
-                }),
-                "preview_size": ("INT", {
-                    "default": 512, "min": 128, "max": 2048, "step": 32,
-                    "tooltip": "Square side length (px) of preview_image and overlay_video frames.",
-                }),
-                "preview_max_video_frames": ("INT", {
-                    "default": 120, "min": 1, "max": 1024, "step": 1,
-                    "tooltip": "Hard cap on overlay_video frame count (memory guard for long shots).",
-                }),
-                # ── Hidden override JSON inputs driven by the in-canvas
-                #    viewer UI (face landmark drags, body-joint drags,
-                #    gaze-handle drags). All face-bbox-normalised /
-                #    image-normalised / radian-encoded — see js/face_controller_3d.js.
                 "landmark_overrides_json": ("STRING", {
-                    "multiline": True, "default": "",
-                    "tooltip": 'JSON {"frames":{"<idx>":{"<lm>":[x_bbox_norm,y_bbox_norm]}}} from the in-canvas face viewer. Empty = no override.',
+                    "default": "",
+                    "tooltip": 'JSON {"frames":{"<idx>":{"<lm>":[x_img_norm,y_img_norm]}}} from the in-canvas face viewer (image-normalised 0..1). Empty = no override.',
                 }),
                 "pose_overrides_json": ("STRING", {
-                    "multiline": True, "default": "",
+                    "default": "",
                     "tooltip": 'JSON {"frames":{"<idx>":{"<joint>":[x_img_norm,y_img_norm]}}} from the in-canvas pose viewer (OpenPose-18).',
                 }),
                 "gaze_overrides_json": ("STRING", {
-                    "multiline": True, "default": "",
+                    "default": "",
                     "tooltip": 'JSON {"frames":{"<idx>":{"l":[yaw_rad,pitch_rad],"r":[yaw_rad,pitch_rad]}}} from the in-canvas gaze handles.',
                 }),
             },
@@ -1203,42 +1117,46 @@ class WanFaceController3DV2:
     # Execution
     # ------------------------------------------------------------------
     def run(self, pose_data,
-            expression_coeffs_json: str = "",
-            expression_strength: float = 1.0,
-            expression_clamp: float = 1.5,
-            propagate_expression: str = "off",
-            head_pose_json: str = "",
-            head_yaw_deg: float = 0.0,
-            head_pitch_deg: float = 0.0,
-            head_roll_deg: float = 0.0,
-            head_tx: float = 0.0,
-            head_ty: float = 0.0,
-            head_tz: float = 0.0,
-            head_scale: float = 1.0,
-            jaw_rot_deg: float = 0.0,
-            neck_yaw_deg: float = 0.0,
-            neck_pitch_deg: float = 0.0,
-            propagate_head: str = "off",
-            propagate_gaze: str = "off",
-            gaze_json: str = "",
-            gaze_yaw_deg: float = 0.0,
-            gaze_pitch_deg: float = 0.0,
+            fc3d_config_json: str = "",
             reference_pose_data=None,
-            blend_strength: float = 0.0,
-            blend_mouth: bool = True,
-            blend_brows: bool = False,
-            blend_eyes: bool = False,
-            blend_jaw: bool = False,
-            use_metas: str = "edited",
-            frame_start: int = -1,
-            frame_end: int = -1,
             landmark_overrides_json: str = "",
             pose_overrides_json: str = "",
             gaze_overrides_json: str = "",
-            preview_frame_idx: int = 0,
-            preview_size: int = 512,
-            preview_max_video_frames: int = 120,
-            unique_id: Optional[str] = None):
+            unique_id: Optional[str] = None,
+            **legacy_fc3d_kwargs):
+
+        cfg = _resolve_fc3d_run_params(fc3d_config_json, **legacy_fc3d_kwargs)
+        expression_coeffs_json = str(cfg.get("expression_coeffs_json", "") or "")
+        expression_strength = float(cfg.get("expression_strength", 1.0))
+        expression_clamp = float(cfg.get("expression_clamp", 1.5))
+        propagate_expression = str(cfg.get("propagate_expression", "off"))
+        head_pose_json = str(cfg.get("head_pose_json", "") or "")
+        head_yaw_deg = float(cfg.get("head_yaw_deg", 0.0))
+        head_pitch_deg = float(cfg.get("head_pitch_deg", 0.0))
+        head_roll_deg = float(cfg.get("head_roll_deg", 0.0))
+        head_tx = float(cfg.get("head_tx", 0.0))
+        head_ty = float(cfg.get("head_ty", 0.0))
+        head_tz = float(cfg.get("head_tz", 0.0))
+        head_scale = float(cfg.get("head_scale", 1.0))
+        jaw_rot_deg = float(cfg.get("jaw_rot_deg", 0.0))
+        neck_yaw_deg = float(cfg.get("neck_yaw_deg", 0.0))
+        neck_pitch_deg = float(cfg.get("neck_pitch_deg", 0.0))
+        propagate_head = str(cfg.get("propagate_head", "off"))
+        propagate_gaze = str(cfg.get("propagate_gaze", "off"))
+        gaze_json = str(cfg.get("gaze_json", "") or "")
+        gaze_yaw_deg = float(cfg.get("gaze_yaw_deg", 0.0))
+        gaze_pitch_deg = float(cfg.get("gaze_pitch_deg", 0.0))
+        blend_strength = float(cfg.get("blend_strength", 0.0))
+        blend_mouth = bool(cfg.get("blend_mouth", True))
+        blend_brows = bool(cfg.get("blend_brows", False))
+        blend_eyes = bool(cfg.get("blend_eyes", False))
+        blend_jaw = bool(cfg.get("blend_jaw", False))
+        use_metas = str(cfg.get("use_metas", "edited"))
+        frame_start = int(cfg.get("frame_start", -1))
+        frame_end = int(cfg.get("frame_end", -1))
+        preview_frame_idx = int(cfg.get("preview_frame_idx", 0))
+        preview_size = int(cfg.get("preview_size", 512))
+        preview_max_video_frames = int(cfg.get("preview_max_video_frames", 120))
 
         if not isinstance(pose_data, dict):
             raise ValueError("pose_data is not a POSEDATA bundle (expected dict).")
@@ -1501,11 +1419,7 @@ class WanFaceController3DV2:
         n_face_ov = n_pose_ov = n_gaze_ov_u = 0
         n_face_delta = n_pose_delta = 0
 
-        # (5a) Range-delta propagation — a single-frame edit broadcast as a
-        #      delta across every frame in its range.  Applied BEFORE the
-        #      per-frame absolute overrides so explicit pins always win.
-        #      Face deltas are bbox-normalised → scaled by each frame's own
-        #      face bbox so the edit tracks scale/pose changes per frame.
+        # (5a) Range-delta propagation — image-normalised deltas (same as JS canvas).
         for f_idx, lm_map in face_delta.items():
             if not (0 <= f_idx < n_frames):
                 continue
@@ -1513,14 +1427,11 @@ class WanFaceController3DV2:
             xy_now = _read_face_normalised(meta)
             if xy_now is None:
                 continue
-            mn = xy_now.min(axis=0); mx = xy_now.max(axis=0)
-            bw = max(float(mx[0] - mn[0]), 1e-6)
-            bh = max(float(mx[1] - mn[1]), 1e-6)
             for lm_idx, (dxn, dyn) in lm_map.items():
                 if not (0 <= lm_idx < _N_LM):
                     continue
-                xy_now[lm_idx, 0] = float(xy_now[lm_idx, 0] + dxn * bw)
-                xy_now[lm_idx, 1] = float(xy_now[lm_idx, 1] + dyn * bh)
+                xy_now[lm_idx, 0] = float(min(1.0, max(0.0, xy_now[lm_idx, 0] + dxn)))
+                xy_now[lm_idx, 1] = float(min(1.0, max(0.0, xy_now[lm_idx, 1] + dyn)))
                 n_face_delta += 1
             _write_face_normalised(meta, xy_now.astype(np.float32))
 
@@ -1547,14 +1458,12 @@ class WanFaceController3DV2:
             xy_now = _read_face_normalised(meta)
             if xy_now is None:
                 continue
-            mn = xy_now.min(axis=0); mx = xy_now.max(axis=0)
-            bw = max(float(mx[0] - mn[0]), 1e-6)
-            bh = max(float(mx[1] - mn[1]), 1e-6)
             for lm_idx, (xn, yn) in lm_map.items():
                 if not (0 <= lm_idx < _N_LM):
                     continue
-                xy_now[lm_idx, 0] = float(mn[0] + xn * bw)
-                xy_now[lm_idx, 1] = float(mn[1] + yn * bh)
+                # JS canvas stores image-normalised [0,1] absolute landmark coords.
+                xy_now[lm_idx, 0] = float(min(1.0, max(0.0, xn)))
+                xy_now[lm_idx, 1] = float(min(1.0, max(0.0, yn)))
                 n_face_ov += 1
             _write_face_normalised(meta, xy_now.astype(np.float32))
 
