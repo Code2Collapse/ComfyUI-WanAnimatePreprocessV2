@@ -97,7 +97,7 @@ _FLOAT_KWARGS = (
 _BOOL_KWARGS = ("blend_mouth", "blend_brows", "blend_eyes", "blend_jaw")
 _STR_KWARGS = (
     "expression_coeffs_json", "head_pose_json", "gaze_json",
-    "use_metas", "propagate_head", "propagate_gaze",
+    "use_metas", "propagate_expression", "propagate_head", "propagate_gaze",
     "landmark_overrides_json", "pose_overrides_json", "gaze_overrides_json",
 )
 

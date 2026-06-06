@@ -70,7 +70,7 @@ EXTRA_NODE_DISPLAY_NAME_MAPPINGS = {
     "WanQualityScorerJitterV2": "Wan Quality Scorer — Temporal Jitter (V2)",
     "WanPoseFormatConvertV2":   "Wan Pose Format Convert — OP18 → BODY-25 / COCO-17 / MP-33 (V2)",
     "WanPoseDetectViTPoseV2":   "Wan Pose Detect — YOLO + ViTPose (V2)",
-    "WanFaceController3DV2":    "Wan Face Controller 3D — Expression + Head Pose + Gaze + Viewer (V2)",
+    "WanFaceController3DV2":    "Wan Face Controller 3D",
 }
 if _ETHXGAZE_OK:
     EXTRA_NODE_DISPLAY_NAME_MAPPINGS["WanGazeETHXGazeV2"] = (

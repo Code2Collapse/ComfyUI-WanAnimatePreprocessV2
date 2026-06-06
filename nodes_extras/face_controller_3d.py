@@ -83,6 +83,7 @@ from .expression_3d_coeffs import (
     _parse_coeffs_json,
     _read_face_normalised,
     _write_face_normalised,
+    propagate_expression_keyframes,
 )
 from ._face_helpers import (
     _parse_overrides as _parse_face_overrides_ui,
@@ -1031,6 +1032,16 @@ class WanFaceController3DV2:
                     "default": 1.5, "min": 0.1, "max": 3.0, "step": 0.05,
                     "tooltip": "Symmetric clamp on each expression coefficient.",
                 }),
+                "propagate_expression": (["off", "hold_last", "interpolate", "broadcast_first"], {
+                    "default": "off",
+                    "tooltip": (
+                        "How to fill timeline gaps between expression keyframes:\n"
+                        "  off            – only frames with explicit data get expressions.\n"
+                        "  hold_last      – step-function: gaps hold the previous keyframe.\n"
+                        "  interpolate    – smooth linear interpolation between keyframes.\n"
+                        "  broadcast_first – apply the first keyframe to every gap frame."
+                    ),
+                }),
                 # ── (3) Head pose ────────────────────────────────────
                 "head_pose_json": ("STRING", {
                     "multiline": True, "default": "",
@@ -1195,6 +1206,7 @@ class WanFaceController3DV2:
             expression_coeffs_json: str = "",
             expression_strength: float = 1.0,
             expression_clamp: float = 1.5,
+            propagate_expression: str = "off",
             head_pose_json: str = "",
             head_yaw_deg: float = 0.0,
             head_pitch_deg: float = 0.0,
@@ -1273,6 +1285,9 @@ class WanFaceController3DV2:
         expr_per_frame = _parse_coeffs_json(expression_coeffs_json, n_frames)
         expr_ranges    = _expand_range_overrides(expression_coeffs_json, n_frames)
         expr_overrides = _merge_overrides(expr_per_frame, expr_ranges)
+        expr_overrides = propagate_expression_keyframes(
+            expr_overrides, n_frames, str(propagate_expression),
+        )
 
         head_overrides = _parse_keyed_json(
             head_pose_json, n_frames, _POSE_KEYS, range_field="pose",
@@ -1640,11 +1655,22 @@ class WanFaceController3DV2:
             + list(range(36, 48))            # eyes
             + list(range(48, 68))            # mouth
         )
+        face_frames_ui: list = []
+        for f_idx, meta in enumerate(metas):
+            xy_ui = _read_face_normalised(meta)
+            ent: dict = {"i": f_idx, "ok": xy_ui is not None}
+            if xy_ui is not None:
+                ent["lms"] = [
+                    [round(float(xy_ui[j, 0]), 5), round(float(xy_ui[j, 1]), 5)]
+                    for j in range(int(xy_ui.shape[0]))
+                ]
+            face_frames_ui.append(ent)
+
         overlay_meta = json.dumps({
             "selected": selectable_lms,
             "eye_emph": list(_EYE_EMPH_IDX),
             "d_norm":   [[0.0, 0.0] for _ in range(_N_LM)],
-            "frames":   [{"i": i, "ok": True} for i in range(n_frames)],
+            "frames":   face_frames_ui,
             "strength": 1.0,
             "pose": {
                 "format":      "openpose_18",
