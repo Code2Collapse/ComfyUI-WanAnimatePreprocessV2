@@ -316,6 +316,9 @@ function _fc3dSetupDomWidget(node, domW) {
     if (domW.element) {
         domW.element.style.overflow = "hidden";
         domW.element.style.width = "100%";
+        domW.element.style.height = `${contentH()}px`;
+        domW.element.style.minHeight = `${FC3D_MIN_H}px`;
+        domW.element.style.maxHeight = `${FC3D_MAX_H}px`;
         domW.element.style.boxSizing = "border-box";
         domW.element.style.background = C.bg;
         domW.element.style.padding = "0";
@@ -332,12 +335,16 @@ function _fc3dSyncNodeSize(node) {
 }
 
 function makeDefaultMeta() {
-    const zeros = Array.from({length:68},()=>[0,0]);
-    const selected = Array.from({length:68},(_,i)=>i);
-    return { selected, eye_emph:[37,38,43,44], d_norm:zeros,
-             frames:[{i:0,ok:true}], strength:1.0,
-             pose:{format:"openpose_18",joint_names:POSE18_NAMES,edges:POSE18_EDGES_DEFAULT,frames:[]},
-             gaze:null, _synthetic:true };
+    const zeros = Array.from({length:68}, () => [0, 0]);
+    const selected = Array.from({length: 68}, (_, i) => i);
+    const canon = CANONICAL.map((p) => [p[0], p[1]]);
+    return {
+        selected, eye_emph: [37, 38, 43, 44], d_norm: zeros,
+        frames: [{ i: 0, ok: true, lms: canon }],
+        strength: 1.0,
+        pose: { format: "openpose_18", joint_names: POSE18_NAMES, edges: POSE18_EDGES_DEFAULT, frames: [] },
+        gaze: null, _synthetic: true,
+    };
 }
 
 // ─── Widget + Override helpers ──────────────────────────────────────
@@ -501,16 +508,40 @@ function buildEditor(node) {
     root.classList.add("fc3d-editor-root");
     root.style.flex = "1 1 auto";
 
-    // Forward middle-mouse to canvas so workflow panning works over the editor
+    // Middle-mouse / wheel-button pan over the DOM widget (ComfyUI graph is underneath).
+    let _fc3dPanning = false;
+    let _fc3dPanStart = null;
+    const _fc3dPanApply = (e) => {
+        const c = app?.canvas;
+        if (!c?.ds || !_fc3dPanStart) return;
+        c.ds.offset[0] = _fc3dPanStart.off[0] + (e.clientX - _fc3dPanStart.x);
+        c.ds.offset[1] = _fc3dPanStart.off[1] + (e.clientY - _fc3dPanStart.y);
+        c.setDirty?.(true, true);
+        c.draw?.(true, true);
+    };
+    const _fc3dPanStop = () => {
+        _fc3dPanning = false;
+        _fc3dPanStart = null;
+        window.removeEventListener("pointermove", _fc3dPanApply, true);
+        window.removeEventListener("pointerup", _fc3dPanStop, true);
+    };
     root.addEventListener("pointerdown", (e) => {
-        if (e.button === 1) { try { app.canvas?.processMouseDown(e); } catch (_) {} }
-    });
-    root.addEventListener("pointermove", (e) => {
-        if ((e.buttons & 4) === 4) { try { app.canvas?.processMouseMove(e); } catch (_) {} }
-    });
+        if (e.button !== 1) return;
+        const c = app?.canvas;
+        if (!c?.ds) return;
+        _fc3dPanning = true;
+        _fc3dPanStart = { x: e.clientX, y: e.clientY, off: c.ds.offset.slice() };
+        e.preventDefault();
+        e.stopPropagation();
+        try { c.processMouseDown?.(e); } catch (_) {}
+        window.addEventListener("pointermove", _fc3dPanApply, true);
+        window.addEventListener("pointerup", _fc3dPanStop, true);
+    }, true);
     root.addEventListener("pointerup", (e) => {
-        if (e.button === 1) { try { app.canvas?.processMouseUp(e); } catch (_) {} }
-    });
+        if (e.button !== 1 || !_fc3dPanning) return;
+        try { app.canvas?.processMouseUp?.(e); } catch (_) {}
+        _fc3dPanStop();
+    }, true);
 
     // ── Tab bar ──────────────────────────────────────────────────────
     const tabBar = _el("div",
@@ -545,9 +576,10 @@ function buildEditor(node) {
     // ── Main canvas (fixed height — flex:1 was absorbing ComfyUI grid slack → black slab) ──
     let _canvasViewPx = FC3D_CANVAS_VIEW_PX;
     const canvasWrap = _el("div",
-        `position:relative;flex:0 0 auto;width:100%;overflow:hidden;background:${C.canvas_bg};` +
+        `position:relative;flex:0 0 auto;width:100%;overflow:hidden;background:#2a2a3d;` +
         `border:1px solid ${C.border};border-radius:6px;pointer-events:auto;cursor:crosshair;`);
     const cvs = _el("canvas", "display:block;width:100%;height:100%;cursor:crosshair;outline:none;");
+    cvs.dataset.fc3dMainCanvas = "1";
     let _canvasPx = FC3D_CANVAS_VIEW_PX;
     function _applyCanvasViewPx(px) {
         const side = Math.max(CANVAS_MIN_PX, Math.min(CANVAS_MAX_PX, Math.round(px)));
@@ -559,6 +591,8 @@ function buildEditor(node) {
         _canvasPx = side;
         cvs.width = side;
         cvs.height = side;
+        // Resizing clears the bitmap — schedule repaint (hook may call repaint too).
+        requestAnimationFrame(() => { try { render(); drawTimeline(); } catch (_) {} });
         return true;
     }
     function _syncCanvasPx() {
@@ -1334,9 +1368,11 @@ function buildEditor(node) {
     // ── Rendering functions ─────────────────────────────────────────
     let _tlRafPending = false;
     function render() {
+        if (cvs.width < 16 || cvs.height < 16) _applyCanvasViewPx(FC3D_TAB_CANVAS_PX[activeTab] ?? FC3D_CANVAS_VIEW_PX);
         if(!_tlRafPending){_tlRafPending=true;requestAnimationFrame(()=>{_tlRafPending=false;drawTimeline();});}
         const ctx=cvs.getContext("2d"),W=cvs.width,H=cvs.height;
-        ctx.fillStyle=C.canvas_bg;ctx.fillRect(0,0,W,H);
+        if (!ctx || W < 8 || H < 8) return;
+        ctx.fillStyle="#2a2a3d";ctx.fillRect(0,0,W,H);
         switch(activeTab) {
             case "face": case "gaze": case "set":
                 _renderFaceGaze(ctx,W,H,activeTab==="gaze"); break;
@@ -1345,10 +1381,18 @@ function buildEditor(node) {
         }
     }
 
-    function _drawGrid(ctx,W,H){ctx.strokeStyle=C.grid;ctx.lineWidth=1;for(let i=1;i<4;i++){ctx.beginPath();ctx.moveTo((i/4)*W,0);ctx.lineTo((i/4)*W,H);ctx.stroke();ctx.beginPath();ctx.moveTo(0,(i/4)*H);ctx.lineTo(W,(i/4)*H);ctx.stroke();}}
+    function _drawGrid(ctx,W,H){
+        ctx.strokeStyle="#6b7a9c";ctx.lineWidth=1;
+        for(let i=1;i<4;i++){
+            ctx.beginPath();ctx.moveTo((i/4)*W,0);ctx.lineTo((i/4)*W,H);ctx.stroke();
+            ctx.beginPath();ctx.moveTo(0,(i/4)*H);ctx.lineTo(W,(i/4)*H);ctx.stroke();
+        }
+    }
     function _drawVideoUnderlay(ctx,W,H){if(_videoFrames.length>0){const fi=Math.min(state.frame,_videoFrames.length-1),img=_videoFrames[fi];if(img&&img.complete&&img.naturalWidth>0){ctx.globalAlpha=0.3;ctx.drawImage(img,0,0,W,H);ctx.globalAlpha=1;}}}
     function _drawFaceWireframe(ctx,W,H,lms,alpha){
-        ctx.globalAlpha=alpha||1;ctx.strokeStyle=C.other;ctx.lineWidth=1.5;
+        ctx.globalAlpha=alpha||1;
+        ctx.strokeStyle = state.meta?._synthetic ? "#e8ecf8" : "#f5f7ff";
+        ctx.lineWidth = state.meta?._synthetic ? 3 : 2.5;
         for(const seg of SEGMENTS){const[a,b,closed]=seg;ctx.beginPath();for(let i=a;i<b;i++){const[x,y]=denormToCanvas(lms[i][0],lms[i][1],W,H);if(i===a)ctx.moveTo(x,y);else ctx.lineTo(x,y);}if(closed)ctx.closePath();ctx.stroke();}
         ctx.globalAlpha=1;
     }
@@ -1356,8 +1400,8 @@ function buildEditor(node) {
     function _renderFaceGaze(ctx,W,H,gazeEmphasis) {
         _drawVideoUnderlay(ctx,W,H);_drawGrid(ctx,W,H);
         if (state.meta?._synthetic) {
-            ctx.fillStyle = C.dim; ctx.font="10px ui-sans-serif"; ctx.textAlign = "left";
-            ctx.fillText("Queue once with pose_data for real landmarks", 4, H - 4);
+            ctx.fillStyle = C.dim; ctx.font="10px ui-sans-serif"; ctx.textAlign = "center";
+            ctx.fillText("canonical preview — queue with pose_data for detected face", W / 2, 14);
         }
         const lms=landmarksForFrame(state.frame),sel=selectedSet(),emp=emphSet();
         _drawFaceWireframe(ctx,W,H,lms,gazeEmphasis?0.4:1);
@@ -1435,7 +1479,7 @@ function buildEditor(node) {
 
     function drawTimeline() {
         const ctx=tl.getContext("2d"),W=tl.width,H=tl.height;
-        ctx.fillStyle=C.canvas_bg;ctx.fillRect(0,0,W,H);
+        ctx.fillStyle="#2a2a3d";ctx.fillRect(0,0,W,H);
         const n=_frameCount();
         if(n<=0){ctx.fillStyle=C.dim;ctx.font="9px ui-sans-serif";ctx.textAlign="center";ctx.fillText("queue to populate",W/2,H/2+3);return;}
         const range=_tlRange();
@@ -1666,6 +1710,7 @@ function buildEditor(node) {
         _scheduleRelayout,
         _syncSettingsFromWidgets,
         getHeight: () => _editorH,
+        repaint() { try { render(); drawTimeline(); } catch (_) {} },
         onNodeResize(nodeW, nodeH) {
             const applied = _fillAvailableHeight(nodeW, nodeH);
             _lastLayoutH = applied;
@@ -1772,6 +1817,9 @@ function _fc3dSetupNode(node) {
     }
 
     _fc3dInstances.add(node);
+    _fc3dHookCanvasDraw();
+    requestAnimationFrame(() => { try { overlay.repaint?.(); } catch (_) {} });
+    setTimeout(() => { try { overlay.repaint?.(); } catch (_) {} }, 120);
 }
 
 app.registerExtension({
@@ -1788,15 +1836,14 @@ app.registerExtension({
             return _origIsWidgetVisible ? _origIsWidgetVisible.call(this, widget) : true;
         };
 
-        const _origProtoCS = nodeType.prototype.computeSize;
         nodeType.prototype.computeSize = function (outW) {
-            const w = Math.max(FC3D_NODE_W, this.size?.[0] || FC3D_NODE_W);
-            const cap = FC3D_MAX_H;
-            if (_origProtoCS) {
-                const sz = _origProtoCS.call(this, outW);
-                return [Math.max(sz[0] || w, FC3D_NODE_W), Math.min(sz[1] || cap, cap)];
-            }
-            const h = Math.min(Math.max(this.size?.[1] || FC3D_MIN_H, FC3D_MIN_H), cap);
+            const w = Math.max(FC3D_NODE_W, outW || this.size?.[0] || FC3D_NODE_W);
+            const editorH = this._faceOverlay?.getHeight?.()
+                || this.widgets?.find(x => x.name === "face_overlay")?.computeSize?.(w)?.[1]
+                || FC3D_MIN_H;
+            const ioSlots = Math.max(2, (this.inputs?.length || 0) + (this.outputs?.length || 0));
+            const ioH = Math.min(120, ioSlots * 10);
+            const h = Math.min(FC3D_MAX_H, Math.max(FC3D_MIN_H, editorH + ioH));
             return [w, h];
         };
 
@@ -1911,6 +1958,20 @@ try { window.__FC3D_EXT__ = true; } catch (_) {}
 
 // ── Command palette ─────────────────────────────────────────────────
 const _fc3dInstances = new Set();
+let _fc3dCanvasDrawHooked = false;
+/** Repaint 2D canvas every graph draw so pan/zoom never leaves a stale/black slab. */
+function _fc3dHookCanvasDraw() {
+    if (_fc3dCanvasDrawHooked || !app?.canvas?.draw) return;
+    _fc3dCanvasDrawHooked = true;
+    const origDraw = app.canvas.draw.bind(app.canvas);
+    app.canvas.draw = function (force, skip_events) {
+        const ret = origDraw(force, skip_events);
+    for (const n of _fc3dInstances) {
+        try { n._faceOverlay?.repaint?.(); } catch (_) {}
+    }
+        return ret;
+    };
+}
 function _fc3dActive() { let last = null; for (const n of _fc3dInstances) last = n; return last?._faceOverlay || null; }
 function _fc3dRegisterActions() {
     const reg = window.__C2C_ACTIONS__?.register;

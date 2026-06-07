@@ -31,14 +31,16 @@ from .face_controller_3d import WanFaceController3DV2
 # Registers POST /c2c/fc3d_preview against ComfyUI's aiohttp server.
 # Failure is non-fatal: the node still works, only the live gizmo loses
 # its server-truth sync.
-try:
-    from . import _face_preview_server as _fps
-    _fps.try_register_routes_deferred()
-except Exception as _e:                                                  # noqa: BLE001
-    import logging as _logging
-    _logging.getLogger(__name__).info(
-        "fc3d_preview route registration skipped: %s", _e,
-    )
+import os as _os
+if not _os.environ.get("FC3D_SKIP_ROUTE_REG"):
+    try:
+        from . import _face_preview_server as _fps
+        _fps.try_register_routes_deferred()
+    except Exception as _e:                                              # noqa: BLE001
+        import logging as _logging
+        _logging.getLogger(__name__).info(
+            "fc3d_preview route registration skipped: %s", _e,
+        )
 
 # ETH-XGaze post-processor (optional; only loads if torch + checkpoint available).
 try:

@@ -207,7 +207,12 @@ def register_routes() -> bool:
         import server as _comfy_server  # ComfyUI's server module
         from aiohttp import web
     except Exception as exc:                                            # noqa: BLE001
-        log.warning("[fc3d_preview] aiohttp / ComfyUI server unavailable: %s", exc)
+        msg = str(exc)
+        # Headless smoke / pytest imports this module outside a live ComfyUI process.
+        if "utils.install_util" in msg or "No module named 'server'" in msg:
+            log.debug("[fc3d_preview] route registration skipped (offline): %s", exc)
+        else:
+            log.warning("[fc3d_preview] aiohttp / ComfyUI server unavailable: %s", exc)
         return False
 
     ps = getattr(_comfy_server, "PromptServer", None)
@@ -267,7 +272,10 @@ def register_routes() -> bool:
             result = node.run(cached, **kwargs)
             if not isinstance(result, dict) or "result" not in result:
                 raise RuntimeError("run() returned an unexpected envelope")
-            out_bundle, info, _ts = result["result"]
+            res = result["result"]
+            if not isinstance(res, tuple) or len(res) < 2:
+                raise RuntimeError("run() result tuple too short")
+            out_bundle, info = res[0], res[1]
         except Exception as exc:                                        # noqa: BLE001
             log.exception("[fc3d_preview] run() failed for node %s frame %d",
                           node_id, frame_idx)
@@ -294,9 +302,46 @@ def register_routes() -> bool:
             "max": _BUNDLE_CACHE_MAX,
         })
 
+    @routes.post("/c2c/fc3d_cache_seed")
+    async def _cache_seed(req):                                         # noqa: ANN001
+        """Seed the live-preview LRU cache (E2E / dev tooling).
+
+        Accepts ``{"node_id": "<graph id>", "pose_data": {<POSEDATA dict>}}``.
+        The bundle must look like a real POSEDATA payload (``pose_metas`` key).
+        """
+        try:
+            body = await req.json()
+        except Exception as exc:                                        # noqa: BLE001
+            return web.json_response(
+                {"error": "bad_json", "message": str(exc)}, status=400,
+            )
+        if not isinstance(body, dict):
+            return web.json_response(
+                {"error": "bad_json", "message": "body must be a JSON object"},
+                status=400,
+            )
+        node_id = str(body.get("node_id", "")).strip()
+        pose = body.get("pose_data")
+        if not node_id:
+            return web.json_response({"error": "missing_node_id"}, status=400)
+        if not isinstance(pose, dict) or not (
+            pose.get("pose_metas") or pose.get("pose_metas_original")
+        ):
+            return web.json_response(
+                {"error": "bad_pose_data",
+                 "message": "pose_data must be a POSEDATA dict with pose_metas"},
+                status=400,
+            )
+        cache_put(node_id, pose)
+        return web.json_response({
+            "ok": True,
+            "node_id": node_id,
+            "cached_nodes": cache_size(),
+        })
+
     _REGISTERED = True
     log.info("[fc3d_preview] routes registered (POST /c2c/fc3d_preview, "
-             "GET /c2c/fc3d_preview/status)")
+             "POST /c2c/fc3d_cache_seed, GET /c2c/fc3d_preview/status)")
     return True
 
 
@@ -304,6 +349,11 @@ def try_register_routes_deferred() -> None:
     """Attempt registration now; if the server isn't ready, retry on a
     background thread until it is (or 30 s elapse)."""
     if register_routes():
+        return
+    # Offline import (smoke tests) — do not spin a retry thread.
+    try:
+        import server as _comfy_server  # noqa: F401
+    except Exception:
         return
 
     def _retry():

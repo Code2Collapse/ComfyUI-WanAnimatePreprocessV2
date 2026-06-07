@@ -90,6 +90,8 @@ from ._face_helpers import (
     _parse_gaze_overrides as _parse_gaze_overrides_ui,
     _apply_gaze_override_to_iris_entry,
     _get_body_kps,
+    _meta_height,
+    _meta_width,
     _set_body_kps,
 )
 
@@ -1178,8 +1180,6 @@ class WanFaceController3DV2:
         _input_body_snap: dict = {}
         _src_metas_in = pose_data.get("pose_metas") or pose_data.get("pose_metas_original") or []
         for _i, _m in enumerate(_src_metas_in):
-            if not isinstance(_m, dict):
-                continue
             _fxy = _read_face_normalised(_m)
             if _fxy is not None:
                 _input_face_snap[_i] = _fxy.astype(np.float32, copy=True)
@@ -1518,8 +1518,8 @@ class WanFaceController3DV2:
                         body_list.append([round(float(x), 5), round(float(y), 5)])
                 body_frames_ui.append({
                     "i": f_idx, "ok": True,
-                    "w": float(meta.get("width", 1.0)),
-                    "h": float(meta.get("height", 1.0)),
+                    "w": float(_meta_width(meta)),
+                    "h": float(_meta_height(meta)),
                     "kps": body_list,
                 })
             else:

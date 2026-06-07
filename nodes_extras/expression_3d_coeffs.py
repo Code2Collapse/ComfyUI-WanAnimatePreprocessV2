@@ -205,7 +205,24 @@ _BASIS = _build_basis()  # validated at import — fails loudly on typo
 # ----------------------------------------------------------------------
 # Helpers
 # ----------------------------------------------------------------------
-def _read_face_normalised(meta: dict) -> np.ndarray | None:
+def _read_face_normalised(meta) -> np.ndarray | None:
+    from ._face_helpers import _is_aa_pose_meta, _meta_height, _meta_width
+
+    if _is_aa_pose_meta(meta):
+        kps = getattr(meta, "kps_face", None)
+        if kps is None:
+            return None
+        arr = np.asarray(kps, dtype=np.float32)
+        if arr.ndim != 2 or arr.shape[0] < _N_LM or arr.shape[1] < 2:
+            return None
+        w = max(_meta_width(meta), 1e-6)
+        h = max(_meta_height(meta), 1e-6)
+        out = arr[:_N_LM, :2].copy()
+        out[:, 0] /= w
+        out[:, 1] /= h
+        return out
+    if not isinstance(meta, dict):
+        return None
     arr = meta.get("keypoints_face")
     if arr is None:
         return None
@@ -215,7 +232,22 @@ def _read_face_normalised(meta: dict) -> np.ndarray | None:
     return arr[:_N_LM, :2].copy()
 
 
-def _write_face_normalised(meta: dict, xy_norm: np.ndarray) -> None:
+def _write_face_normalised(meta, xy_norm: np.ndarray) -> None:
+    from ._face_helpers import _is_aa_pose_meta, _meta_height, _meta_width
+
+    if _is_aa_pose_meta(meta):
+        kps = getattr(meta, "kps_face", None)
+        if kps is None:
+            return
+        src = np.asarray(kps, dtype=np.float32).copy()
+        w = max(_meta_width(meta), 1e-6)
+        h = max(_meta_height(meta), 1e-6)
+        src[:_N_LM, 0] = xy_norm[:, 0] * w
+        src[:_N_LM, 1] = xy_norm[:, 1] * h
+        meta.kps_face = src[:, :2]
+        return
+    if not isinstance(meta, dict):
+        return
     src = np.asarray(meta["keypoints_face"], dtype=np.float32).copy()
     src[:_N_LM, :2] = xy_norm
     meta["keypoints_face"] = src

@@ -103,8 +103,10 @@ def render_overlay_frame(
     img = Image.new("RGB", (W, H), _PAL["bg"])
     drw = ImageDraw.Draw(img, "RGBA")
 
-    src_w = float(meta.get("width", 1.0) or 1.0)
-    src_h = float(meta.get("height", 1.0) or 1.0)
+    from ._face_helpers import _meta_height, _meta_width
+
+    src_w = max(_meta_width(meta), 1e-6)
+    src_h = max(_meta_height(meta), 1e-6)
 
     # ── Body bones first (drawn behind dots) ────────────────────────
     if body_xy is not None and body_xy.shape[0] >= 18:
