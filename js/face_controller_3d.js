@@ -192,12 +192,12 @@ const FACS_BASIS = {
     lip_pucker: {48:[0.02,0],54:[-0.02,0],49:[0.01,0],53:[-0.01,0],51:[0,-0.005],57:[0,0.005],62:[0,-0.003],66:[0,0.003]},
 };
 
-const CANVAS_MIN_PX = 200;
-const CANVAS_MAX_PX = 420;
+const CANVAS_MIN_PX = 180;
+const CANVAS_MAX_PX = 900;       // was 420 — let the preview grow on big monitors
 const FC3D_CANVAS_VIEW_PX = 260;
 const FC3D_NODE_W = 300;
 const FC3D_MIN_H = 340;
-const FC3D_MAX_H = 680;
+const FC3D_MAX_H = 1400;         // was 680 — let users drag the node taller without snap-back
 const FC3D_CTX_SCROLL_MAX = 220;
 /** Per-tab canvas height caps — keeps total node under ~650px with context panels. */
 const FC3D_TAB_CANVAS_PX = { face: 260, expr: 240, gaze: 220, pose: 260, set: 200 };
