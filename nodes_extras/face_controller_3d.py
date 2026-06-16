@@ -124,6 +124,7 @@ _FC3D_DEFAULT_CFG: Dict[str, Any] = {
     "expression_coeffs_json": "",
     "expression_strength": 1.0,
     "expression_clamp": 1.5,
+    "expression_clamp_per_axis_json": "",
     "propagate_expression": "off",
     "head_pose_json": "",
     "head_yaw_deg": 0.0,
@@ -895,6 +896,97 @@ def _eye_box_norm(xy_norm: np.ndarray) -> Tuple[float, float]:
 
 
 # ----------------------------------------------------------------------
+# Per-AU dampening (Face-Director plan P2).
+#
+# The global ``expression_clamp`` ceilings every one of the 12 FACS axes
+# at the same absolute value. Real direction wants *per-axis* control:
+# pin a single AU's ceiling lower (e.g. cap eye-close so a blink never
+# fully shuts) or scale an axis down (gain) without touching the others.
+#
+# Schema (``expression_clamp_per_axis_json``), keyed by AU name
+# (see _AXIS_NAMES). Each value is either a bare number (= ceiling) or
+# an object with optional ``clamp``/``max`` and ``gain``/``scale``::
+#
+#     {
+#       "eye_close_L": 0.6,                       # ceiling ±0.6
+#       "smile":       {"clamp": 0.9, "gain": 0.8},
+#       "brow_furrow": {"gain": 0.0}              # fully damp this AU
+#     }
+#
+# Axes absent from the map keep the global clamp and unity gain, so an
+# empty / missing blob is a perfect no-op (identical to the old path).
+# ----------------------------------------------------------------------
+def _parse_per_axis_clamp_json(blob: Optional[str]) -> Dict[str, Dict[str, float]]:
+    """Parse ``expression_clamp_per_axis_json`` → ``{au_name: {gain, cap}}``.
+
+    Tolerant: invalid JSON, unknown keys, and non-numeric values are
+    skipped silently (returns ``{}`` rather than raising) so a typo in
+    the editor never breaks a render.
+    """
+    if not blob or not str(blob).strip():
+        return {}
+    try:
+        data = json.loads(blob)
+    except (json.JSONDecodeError, TypeError):
+        log.warning("expression_clamp_per_axis_json ignored — not valid JSON.")
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    valid = set(_AXIS_NAMES)
+    out: Dict[str, Dict[str, float]] = {}
+    for name, spec in data.items():
+        if name not in valid:
+            continue
+        entry: Dict[str, float] = {}
+        if isinstance(spec, dict):
+            cmax = spec.get("clamp", spec.get("max"))
+            if cmax is not None:
+                try:
+                    entry["cap"] = abs(float(cmax))
+                except (TypeError, ValueError):
+                    pass
+            gain = spec.get("gain", spec.get("scale"))
+            if gain is not None:
+                try:
+                    entry["gain"] = float(gain)
+                except (TypeError, ValueError):
+                    pass
+        else:
+            try:
+                entry["cap"] = abs(float(spec))
+            except (TypeError, ValueError):
+                continue
+        if entry:
+            out[name] = entry
+    return out
+
+
+def _apply_per_axis_clamp(
+    c: np.ndarray,
+    per_axis_map: Dict[str, Dict[str, float]],
+    global_clamp: float,
+) -> np.ndarray:
+    """Apply per-AU gain then per-AU ceiling (capped by the global clamp).
+
+    ``c`` is the (``_N_AXES``,) coefficient vector AFTER global strength.
+    Axes with no per-axis entry get unity gain and the global ceiling,
+    so this reduces exactly to ``np.clip(c, -g, g)`` when the map is
+    empty — preserving the legacy behaviour bit-for-bit.
+    """
+    g = abs(float(global_clamp))
+    out = np.asarray(c, dtype=np.float32).copy()
+    if not per_axis_map:
+        return np.clip(out, -g, g)
+    for k in range(_N_AXES):
+        name = _AXIS_NAMES[k]
+        spec = per_axis_map.get(name)
+        gain = float(spec.get("gain", 1.0)) if spec else 1.0
+        cap = min(g, float(spec["cap"])) if (spec and "cap" in spec) else g
+        out[k] = float(np.clip(out[k] * gain, -cap, cap))
+    return out
+
+
+# ----------------------------------------------------------------------
 # Preview outputs (P1.C): preview_image, overlay_video, keyframes_csv,
 # pose_diff_json. Built AFTER the per-frame edit loop runs so the
 # rendered overlay reflects the final edited bundle.
@@ -1063,21 +1155,53 @@ class WanFaceController3DV2:
         "Schemas: see source file docstring."
     )
     RETURN_TYPES = ("POSEDATA", "STRING", "STRING",
-                    "IMAGE", "IMAGE", "STRING", "STRING")
+                    "IMAGE", "IMAGE", "STRING", "STRING",
+                    "FLOAT", "FLOAT", "FLOAT", "FLOAT", "FLOAT")
     RETURN_NAMES = ("pose_data", "info", "coeff_time_series_json",
                     "preview_image", "overlay_video",
-                    "keyframes_csv", "pose_diff_json")
+                    "keyframes_csv", "pose_diff_json",
+                    "lp_rotate_pitch", "lp_rotate_yaw", "lp_rotate_roll",
+                    "lp_pupil_x", "lp_pupil_y")
+    OUTPUT_TOOLTIPS = (
+        "", "", "", "", "", "", "",
+        "Head pitch for LivePortrait ExpressionEditor (clamped ±20°). Wire to rotate_pitch.",
+        "Head yaw for ExpressionEditor (clamped ±20°). Wire to rotate_yaw.",
+        "Head roll for ExpressionEditor (clamped ±20°). Wire to rotate_roll.",
+        "Gaze→pupil_x for ExpressionEditor (clamped ±15). Wire to pupil_x.",
+        "Gaze→pupil_y for ExpressionEditor (clamped ±15). Wire to pupil_y.",
+    )
     FUNCTION     = "run"
 
     @classmethod
     def INPUT_TYPES(cls):
         return {
-            "required": {
-                "pose_data": ("POSEDATA", {
-                    "tooltip": "Pose bundle with iBUG-68 face landmarks.",
-                }),
-            },
+            "required": {},
             "optional": {
+                # Either wire a pre-detected POSEDATA bundle here, OR wire
+                # `images` + `model` below to run ViTPose detection INSIDE this
+                # node (one node: video -> detect -> edit). Both paths supported.
+                "pose_data": ("POSEDATA", {
+                    "tooltip": "Pre-detected pose bundle (iBUG-68 face landmarks). "
+                               "OPTIONAL if you wire `images` + `model` to detect inside this node.",
+                }),
+                "images": ("IMAGE", {
+                    "tooltip": "Video frames (B,H,W,3). Wire a video loader here to run ViTPose "
+                               "pose estimation INSIDE this node — no separate detector node needed.",
+                }),
+                "model": ("POSEMODEL", {
+                    "tooltip": "ViTPose+YOLO bundle from 'ONNX Detection Model Loader (V2)'. Used for "
+                               "internal detection (when `images` is wired and `pose_data` is empty).",
+                }),
+                "detection_threshold": ("FLOAT", {"default": 0.3, "min": 0.0, "max": 1.0, "step": 0.01,
+                    "tooltip": "Internal detection: YOLO person-detection confidence threshold."}),
+                "pose_threshold": ("FLOAT", {"default": 0.3, "min": 0.0, "max": 1.0, "step": 0.01,
+                    "tooltip": "Internal detection: per-keypoint confidence threshold."}),
+                "use_clahe": ("BOOLEAN", {"default": True,
+                    "tooltip": "Internal detection: CLAHE contrast enhancement on the pose crop."}),
+                "detect_rescale": ("FLOAT", {"default": 1.25, "min": 1.0, "max": 2.0, "step": 0.05,
+                    "tooltip": "Internal detection: bbox padding factor before the ViTPose crop."}),
+                "fallback_to_full_frame": ("BOOLEAN", {"default": True,
+                    "tooltip": "Internal detection: run ViTPose on the full frame when YOLO finds no person."}),
                 "reference_pose_data": ("POSEDATA", {
                     "tooltip": "Optional single-frame POSEDATA used as a region-wise shape target.",
                 }),
@@ -1116,9 +1240,179 @@ class WanFaceController3DV2:
         return _AXIS_NAMES
 
     # ------------------------------------------------------------------
+    # Cache key
+    # ------------------------------------------------------------------
+    @classmethod
+    def IS_CHANGED(cls, pose_data=None,
+                   images=None, model=None,
+                   detection_threshold: float = 0.3,
+                   pose_threshold: float = 0.3,
+                   use_clahe: bool = True,
+                   detect_rescale: float = 1.25,
+                   fallback_to_full_frame: bool = True,
+                   fc3d_config_json: str = "",
+                   reference_pose_data=None,
+                   landmark_overrides_json: str = "",
+                   pose_overrides_json: str = "",
+                   gaze_overrides_json: str = "",
+                   unique_id=None,
+                   **legacy_fc3d_kwargs) -> str:
+        """Stable content hash for ComfyUI's execution cache.
+
+        Returns a hex digest that changes IFF an output-affecting input
+        changed. This stops the expensive internal ViTPose detection
+        (triggered when ``images`` + ``model`` are wired and ``pose_data``
+        is empty) from re-running on every queue, while still recomputing
+        when the user edits the in-canvas config / overrides.
+
+        Never raises and never returns ``float("nan")``.
+        """
+        import hashlib
+
+        h = hashlib.md5()
+
+        def _feed(label: str, value) -> None:
+            h.update(label.encode("utf-8", "replace"))
+            h.update(b"\x00")
+            h.update(str(value).encode("utf-8", "replace"))
+            h.update(b"\x01")
+
+        # --- Editor-owned JSON blobs (the in-canvas editor syncs these). ---
+        _feed("fc3d_config_json", fc3d_config_json or "")
+        _feed("landmark_overrides_json", landmark_overrides_json or "")
+        _feed("pose_overrides_json", pose_overrides_json or "")
+        _feed("gaze_overrides_json", gaze_overrides_json or "")
+
+        # Legacy scalar/combo kwargs feed _resolve_fc3d_run_params(), so they
+        # affect the output and must be part of the key. Sort for stability.
+        try:
+            legacy_items = sorted(
+                (str(k), str(v)) for k, v in (legacy_fc3d_kwargs or {}).items()
+            )
+        except Exception:
+            legacy_items = []
+        _feed("legacy_fc3d_kwargs", legacy_items)
+
+        # --- Internal-detection parameters. ---
+        _feed("detection_threshold", detection_threshold)
+        _feed("pose_threshold", pose_threshold)
+        _feed("use_clahe", bool(use_clahe))
+        _feed("detect_rescale", detect_rescale)
+        _feed("fallback_to_full_frame", bool(fallback_to_full_frame))
+
+        # --- images: cheap-but-faithful tensor fingerprint (torch-free). ---
+        _feed("images", cls._fingerprint_tensor(images))
+
+        # --- model: stable identity (NOT id()/type, which vary per run). ---
+        _feed("model", cls._fingerprint_model(model))
+
+        # --- POSEDATA bundles: lightweight structural summary only. ---
+        _feed("pose_data", cls._fingerprint_posedata(pose_data))
+        _feed("reference_pose_data", cls._fingerprint_posedata(reference_pose_data))
+
+        return h.hexdigest()
+
+    @staticmethod
+    def _fingerprint_tensor(t) -> str:
+        """Cheap, deterministic fingerprint of an IMAGE tensor (or None).
+
+        Uses duck-typing so this module never has to import torch. Hashes
+        the full byte buffer when possible; falls back to a shape summary.
+        """
+        if t is None:
+            return "none"
+        try:
+            shape = tuple(getattr(t, "shape", ()) or ())
+            shape_str = str(shape)
+            # Prefer a content hash via the torch -> numpy -> bytes path.
+            if hasattr(t, "cpu") and hasattr(t, "numpy"):
+                try:
+                    arr = t.cpu().numpy()
+                    import hashlib
+                    return shape_str + ":" + hashlib.md5(arr.tobytes()).hexdigest()
+                except Exception:
+                    pass
+            # numpy array directly.
+            if hasattr(t, "tobytes"):
+                try:
+                    import hashlib
+                    return shape_str + ":" + hashlib.md5(t.tobytes()).hexdigest()
+                except Exception:
+                    pass
+            # Last resort: shape + dtype only (still stable for same input).
+            return shape_str + ":" + str(getattr(t, "dtype", ""))
+        except Exception:
+            return "unhashable_tensor"
+
+    @staticmethod
+    def _fingerprint_model(model) -> str:
+        """Stable identity for a POSEMODEL bundle (or None).
+
+        Avoids id()/type() (which change between runs). Prefers a path or
+        name attribute; falls back to a truncated repr.
+        """
+        if model is None:
+            return "none"
+        try:
+            for attr in ("path", "model_path", "name", "ckpt_name",
+                         "filename", "file", "model_name"):
+                val = getattr(model, attr, None)
+                if isinstance(val, str) and val:
+                    return attr + "=" + val
+            if isinstance(model, dict):
+                for key in ("path", "model_path", "name", "ckpt_name",
+                            "filename", "file", "model_name"):
+                    val = model.get(key)
+                    if isinstance(val, str) and val:
+                        return key + "=" + val
+                try:
+                    return "dictkeys=" + ",".join(sorted(str(k) for k in model.keys()))
+                except Exception:
+                    pass
+            return ("repr=" + repr(model))[:256]
+        except Exception:
+            return "unhashable_model"
+
+    @staticmethod
+    def _fingerprint_posedata(pd) -> str:
+        """Lightweight structural summary of a POSEDATA bundle (or None).
+
+        Does NOT serialise large landmark arrays naively. Summarises by
+        key set and per-frame metadata counts so it stays fast while still
+        changing when the structure changes.
+        """
+        if pd is None:
+            return "none"
+        try:
+            if isinstance(pd, dict):
+                summary: Dict[str, Any] = {}
+                for k in sorted(str(key) for key in pd.keys()):
+                    v = pd[k]
+                    if isinstance(v, (list, tuple)):
+                        summary[k] = "len=" + str(len(v))
+                    elif isinstance(v, dict):
+                        summary[k] = "keys=" + str(len(v))
+                    elif hasattr(v, "shape"):
+                        summary[k] = "shape=" + str(tuple(getattr(v, "shape", ()) or ()))
+                    else:
+                        summary[k] = ("scalar=" + str(v))[:64]
+                return json.dumps(summary, sort_keys=True, default=str)
+            if isinstance(pd, (list, tuple)):
+                return "seqlen=" + str(len(pd))
+            return ("repr=" + repr(pd))[:256]
+        except Exception:
+            return "unhashable_posedata"
+
+    # ------------------------------------------------------------------
     # Execution
     # ------------------------------------------------------------------
-    def run(self, pose_data,
+    def run(self, pose_data=None,
+            images=None, model=None,
+            detection_threshold: float = 0.3,
+            pose_threshold: float = 0.3,
+            use_clahe: bool = True,
+            detect_rescale: float = 1.25,
+            fallback_to_full_frame: bool = True,
             fc3d_config_json: str = "",
             reference_pose_data=None,
             landmark_overrides_json: str = "",
@@ -1131,6 +1425,7 @@ class WanFaceController3DV2:
         expression_coeffs_json = str(cfg.get("expression_coeffs_json", "") or "")
         expression_strength = float(cfg.get("expression_strength", 1.0))
         expression_clamp = float(cfg.get("expression_clamp", 1.5))
+        expression_clamp_per_axis_json = str(cfg.get("expression_clamp_per_axis_json", "") or "")
         propagate_expression = str(cfg.get("propagate_expression", "off"))
         head_pose_json = str(cfg.get("head_pose_json", "") or "")
         head_yaw_deg = float(cfg.get("head_yaw_deg", 0.0))
@@ -1160,8 +1455,73 @@ class WanFaceController3DV2:
         preview_size = int(cfg.get("preview_size", 512))
         preview_max_video_frames = int(cfg.get("preview_max_video_frames", 120))
 
+        # ── Input-frame backdrop cache (BEFORE detection) ───────────────
+        # Cache the INPUT frames for the editor's frame-by-frame backdrop as
+        # soon as we have them — independent of pose detection, so the
+        # input+pose overlay works even if detection later fails or is slow.
+        # Single image → 1 frame → constant backdrop. Best-effort.
+        _underlay_available = False
+        if unique_id is not None and images is not None:
+            try:
+                from . import _face_preview_server as _fps
+                imgs = images
+                if hasattr(imgs, "ndim") and imgs.ndim == 3:
+                    imgs = imgs[None]
+                n_img = int(imgs.shape[0])
+                cap = max(1, int(preview_max_video_frames))
+                if n_img > cap:
+                    step = (n_img + cap - 1) // cap
+                    idxs = list(range(0, n_img, step))[:cap]
+                else:
+                    idxs = list(range(n_img))
+                sub = imgs[idxs]
+                arr = sub.detach().cpu().numpy() if hasattr(sub, "detach") else np.asarray(sub)
+                arr = np.clip(arr * 255.0, 0, 255).astype(np.uint8)   # [n,H,W,3]
+                H0, W0 = int(arr.shape[1]), int(arr.shape[2])
+                if max(H0, W0) > 320:
+                    from PIL import Image as _PILImg
+                    sc = 320.0 / max(H0, W0)
+                    nh, nw = max(1, int(H0 * sc)), max(1, int(W0 * sc))
+                    small = np.empty((arr.shape[0], nh, nw, 3), dtype=np.uint8)
+                    for _i in range(arr.shape[0]):
+                        small[_i] = np.asarray(_PILImg.fromarray(arr[_i]).resize((nw, nh)))
+                    arr = small
+                _fps.underlay_put(str(unique_id), arr, idxs)
+                _underlay_available = True
+            except Exception as _exc:                                    # noqa: BLE001
+                log.debug("underlay cache skipped: %s", _exc)
+
+        # ── Internal pose estimation ────────────────────────────────────
+        # If no pre-detected pose_data was wired, run YOLO+ViTPose detection
+        # right here, so this single node covers video -> detect -> edit
+        # without a separate detector node.
         if not isinstance(pose_data, dict):
-            raise ValueError("pose_data is not a POSEDATA bundle (expected dict).")
+            if images is not None and model is not None:
+                try:
+                    from .pose_detect_vitpose import WanPoseDetectViTPoseV2
+                except Exception as _imp_exc:                            # noqa: BLE001
+                    raise ImportError(
+                        "WanFaceController3DV2 internal pose detection requires the "
+                        f"pose_detect_vitpose module, which failed to import: {_imp_exc}"
+                    )
+                log.info("WanFaceController3DV2: no pose_data wired — running internal "
+                         "ViTPose detection on the supplied images.")
+                det_bundle, _det_info = WanPoseDetectViTPoseV2().run(
+                    images, model,
+                    detection_threshold=float(detection_threshold),
+                    pose_threshold=float(pose_threshold),
+                    use_clahe=bool(use_clahe),
+                    rescale=float(detect_rescale),
+                    fallback_to_full_frame=bool(fallback_to_full_frame),
+                )
+                pose_data = det_bundle
+            else:
+                raise ValueError(
+                    "WanFaceController3DV2 has nothing to edit. Wire EITHER a POSEDATA "
+                    "bundle into 'pose_data', OR wire 'images' (video frames) + 'model' "
+                    "(POSEMODEL from 'ONNX Detection Model Loader (V2)') to run ViTPose "
+                    "detection inside this node."
+                )
 
         # Stash the RAW input bundle for the live-preview server route
         # so the JS gizmo can request single-frame recomputes between
@@ -1249,6 +1609,7 @@ class WanFaceController3DV2:
 
         clamp = float(expression_clamp)
         strn  = float(expression_strength)
+        per_axis_clamp_map = _parse_per_axis_clamp_json(expression_clamp_per_axis_json)
 
         for f_idx in range(n_frames):
             if f_idx < lo or f_idx > hi:
@@ -1273,7 +1634,7 @@ class WanFaceController3DV2:
             # (2) Expression coeffs.
             c_vec = expr_overrides.get(f_idx)
             if c_vec is not None:
-                c = np.clip(c_vec * strn, -clamp, clamp)
+                c = _apply_per_axis_clamp(c_vec * strn, per_axis_clamp_map, clamp)
                 if np.any(np.abs(c) > 1e-6):
                     bw, bh = _face_bbox_size(xy_norm)
                     delta_bbox = np.einsum("k,klc->lc", c, _BASIS)
@@ -1592,7 +1953,28 @@ class WanFaceController3DV2:
                 "max_pitch_rad": _GAZE_MAX_PITCH_RAD,
                 "frames":        gaze_overlay_frames_ui,
             },
+            # Input-frame backdrop for the editor (drawn behind the pose,
+            # frame-by-frame, fetched lazily from /c2c/fc3d_underlay).
+            "underlay": {
+                "available": bool(_underlay_available),
+                "node_id":   str(unique_id) if unique_id is not None else "",
+                "n_frames":  int(n_frames),
+            },
         }, separators=(",", ":"))
+
+        # ── LivePortrait ExpressionEditor bridge values ────────────────
+        # The editor's head/gaze degrees, mapped+clamped to ExpressionEditor's
+        # ranges (rotate ±20°, pupil ±15) so the user can wire these straight
+        # into an ExpressionEditor (AdvancedLivePortrait) to warp the actual
+        # face crop WAN reads. Constant (frame-0) values; per-frame warping is
+        # the next step.
+        def _clamp(v, lo_, hi_):
+            return float(max(lo_, min(hi_, float(v))))
+        lp_rotate_pitch = _clamp(head_pitch_deg, -20.0, 20.0)
+        lp_rotate_yaw   = _clamp(head_yaw_deg,   -20.0, 20.0)
+        lp_rotate_roll  = _clamp(head_roll_deg,  -20.0, 20.0)
+        lp_pupil_x      = _clamp(gaze_yaw_deg   * 0.5, -15.0, 15.0)
+        lp_pupil_y      = _clamp(gaze_pitch_deg * 0.5, -15.0, 15.0)
 
         return {
             "ui":     {"overlay_meta": [overlay_meta]},
@@ -1624,5 +2006,7 @@ class WanFaceController3DV2:
                            },
                            head_overrides=head_overrides,
                            gaze_overrides=gaze_overrides,
-                       )),
+                       ),
+                       lp_rotate_pitch, lp_rotate_yaw, lp_rotate_roll,
+                       lp_pupil_x, lp_pupil_y),
         }

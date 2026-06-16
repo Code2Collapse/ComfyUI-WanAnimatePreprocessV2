@@ -78,33 +78,111 @@ const IBUG_EDGES = (() => {
     return edges;
 })();
 
-// CDN base for Three.js. Pinned version for reproducibility.
-// unpkg serves the ESM bundle + jsm examples with correct MIME so dynamic
-// import() works directly without a bundler.
+// ── OpenPose-18 body skeleton (mirrors POSE18_NAMES / POSE18_EDGES_DEFAULT
+//    in face_controller_3d.js and _POSE18_* in the python node) ─────────
+// Joint order: 0 nose,1 neck,2 rShoulder,3 rElbow,4 rWrist,5 lShoulder,
+// 6 lElbow,7 lWrist,8 rHip,9 rKnee,10 rAnkle,11 lHip,12 lKnee,13 lAnkle,
+// 14 rEye,15 lEye,16 rEar,17 lEar.
+const POSE18_EDGES_FALLBACK = [
+    [1,2],[1,5],[2,3],[3,4],[5,6],[6,7],
+    [1,8],[8,9],[9,10],[1,11],[11,12],[12,13],
+    [1,0],[0,14],[14,16],[0,15],[15,17],
+];
+// Canonical depth profile (+z away from camera, -z toward viewer), small so
+// the skeleton starts near-planar; the user drags joints in z to add relief.
+const CANONICAL_BODY_Z = new Float32Array([
+    -0.05, 0.00, 0.00, -0.03, -0.06, 0.00, -0.03, -0.06,
+     0.02, 0.00, -0.02, 0.02, 0.00, -0.02, -0.06, -0.06, 0.00, 0.00,
+]);
+// Per-limb colours for readability (right side warm, left side cool).
+const BODY_JOINT_COLOR = 0x66e0a3;   // default body joint
+const BODY_EDGE_COLOR  = 0x9fe9c6;
+
+// Three.js source resolution order:
+//   1. Local vendored files alongside this module (three.module.js, three_orbit.js,
+//      three_transform.js). This lets the editor work offline.
+//   2. CDN fallback (unpkg → jsdelivr). Kept so the editor still works if the
+//      user has not vendored yet, but offline + slow networks now succeed.
+//
+// To vendor (one-time), from this directory:
+//   curl -L https://unpkg.com/three@0.158.0/build/three.module.js -o three.module.js
+//   curl -L https://unpkg.com/three@0.158.0/examples/jsm/controls/OrbitControls.js -o three_orbit.js
+//   curl -L https://unpkg.com/three@0.158.0/examples/jsm/controls/TransformControls.js -o three_transform.js
 const THREE_VERSION = "0.158.0";
 const CDN_BASES = [
     `https://unpkg.com/three@${THREE_VERSION}`,
     `https://cdn.jsdelivr.net/npm/three@${THREE_VERSION}`,
 ];
 
-async function loadThreeStack() {
+async function _tryLocalThreeStack() {
+    // import.meta.url lets us locate sibling files without hardcoding the
+    // ComfyUI extension path.
+    const here = new URL("./", import.meta.url).href;
+    const coreUrl = here + "three.module.js";
+    // HEAD first so we don't surface a noisy module load error when the file
+    // is absent — we want to fall through to CDN silently in that case.
+    const head = await fetch(coreUrl, { method: "HEAD" }).catch(() => null);
+    if (!head || !head.ok) return null;
+
+    const THREE = await import(/* @vite-ignore */ coreUrl);
+    const loadLocalCtrl = async (filename, exportName) => {
+        const url = here + filename;
+        const r = await fetch(url);
+        if (!r.ok) throw new Error(`HTTP ${r.status} for ${url}`);
+        const txt = await r.text();
+        const patched = txt.replace(/from\s*['"]three['"]/g, `from '${coreUrl}'`);
+        const blob = new Blob([patched], { type: "text/javascript" });
+        const blobUrl = URL.createObjectURL(blob);
+        try {
+            const mod = await import(/* @vite-ignore */ blobUrl);
+            return mod[exportName];
+        } finally {
+            setTimeout(() => URL.revokeObjectURL(blobUrl), 1000);
+        }
+    };
+    const OrbitControls = await loadLocalCtrl("three_orbit.js", "OrbitControls");
+    // TransformControls is optional — TransformControls vendoring is a nice-to-have,
+    // its absence shouldn't kill the editor since core falls back gracefully.
+    let TransformControls = null;
+    try { TransformControls = await loadLocalCtrl("three_transform.js", "TransformControls"); }
+    catch (_) { TransformControls = null; }
+    return { THREE, OrbitControls, TransformControls, cdnBase: "local" };
+}
+
+// Module-level cache: the ~1.2 MB three.module.js is parsed ONCE and reused
+// on every re-open (closing the editor destroys the DOM, not this promise),
+// so the second+ open is instant instead of re-fetching/re-parsing.
+let _threeStackPromise = null;
+function loadThreeStack() {
+    if (!_threeStackPromise) {
+        _threeStackPromise = _loadThreeStackUncached().catch((e) => {
+            _threeStackPromise = null;   // allow retry after a failure
+            throw e;
+        });
+    }
+    return _threeStackPromise;
+}
+
+async function _loadThreeStackUncached() {
+    // 1. Try vendored copy first.
+    try {
+        const local = await _tryLocalThreeStack();
+        if (local) return local;
+    } catch (_) {
+        // Local present but failed to load — fall through to CDN.
+    }
+
+    // 2. CDN fallback.
     let lastErr = null;
     for (const base of CDN_BASES) {
         try {
             const THREE = await import(/* @vite-ignore */ `${base}/build/three.module.js`);
-            // Import-map shim: OrbitControls/TransformControls import "three"
-            // by bare name. We resolve that to the same CDN URL by passing
-            // the THREE module directly into a wrapper that side-loads them
-            // as raw text + new Function. Simpler: fetch as text and exec
-            // with `three` already in scope.
             const fetchModule = async (path) => {
                 const url = `${base}/examples/jsm/${path}`;
                 const txt = await fetch(url).then((r) => {
                     if (!r.ok) throw new Error(`HTTP ${r.status} for ${url}`);
                     return r.text();
                 });
-                // Rewrite the bare `from "three"` import to the explicit CDN URL
-                // so the resulting module resolves cleanly.
                 const patched = txt.replace(
                     /from\s*['"]three['"]/g,
                     `from '${base}/build/three.module.js'`,
@@ -114,8 +192,6 @@ async function loadThreeStack() {
                 try {
                     return await import(/* @vite-ignore */ blobUrl);
                 } finally {
-                    // Free the blob after import resolution (the module is
-                    // cached by the browser by URL; revoking is safe).
                     setTimeout(() => URL.revokeObjectURL(blobUrl), 1000);
                 }
             };
@@ -129,10 +205,12 @@ async function loadThreeStack() {
             };
         } catch (e) {
             lastErr = e;
-            // Try the next CDN.
         }
     }
-    const err = new Error("Three.js CDN load failed: " + (lastErr ? lastErr.message : "unknown"));
+    const err = new Error(
+        "Three.js load failed (no vendored copy and no CDN reachable): " +
+        (lastErr ? lastErr.message : "unknown")
+    );
     err.code = "FACE3D_NO_THREE";
     throw err;
 }
@@ -183,9 +261,10 @@ export async function mount3DEditor(host, opts) {
     };
 
     // ── Top-level overlay frame ──────────────────────────────────────
+    const WRAP_H = Math.max(220, Number(opts.height) || 340);
     const wrap = document.createElement("div");
     wrap.style.cssText =
-        "position:relative;width:100%;height:340px;display:flex;flex-direction:column;" +
+        "position:relative;width:100%;height:" + WRAP_H + "px;display:flex;flex-direction:column;" +
         "background:" + C.canvas_bg + ";border:1px solid " + C.border + ";" +
         "border-radius:4px;overflow:hidden;font:11px ui-sans-serif;color:" + C.text + ";";
     host.appendChild(wrap);
@@ -200,7 +279,41 @@ export async function mount3DEditor(host, opts) {
     title.style.cssText = "font-weight:600;";
     const subtitle = document.createElement("span");
     subtitle.style.cssText = "color:" + C.dim + ";margin-left:4px;";
-    subtitle.textContent = "loading Three.js\u2026";
+    subtitle.textContent = "loading 3D engine\u2026";
+    // Editing-layer dropdown: choose what the 3D editor poses.
+    const layerSel = document.createElement("select");
+    layerSel.title = "Editing layer";
+    layerSel.style.cssText =
+        "margin-left:8px;background:" + C.canvas_bg + ";color:" + C.text + ";" +
+        "border:1px solid " + C.border + ";border-radius:3px;padding:1px 4px;" +
+        "font:11px ui-sans-serif;cursor:pointer;";
+    for (const [v, t] of [
+        ["face", "Face / Head"], ["body", "Body skeleton"],
+        ["camera", "Frame (pan·zoom·rot)"], ["hands", "Hands (soon)"],
+    ]) {
+        const o = document.createElement("option");
+        o.value = v; o.textContent = t; layerSel.appendChild(o);
+    }
+    layerSel.value = (opts.getLayer && opts.getLayer()) || "face";
+    // "Rotate limb" toggle (body layer only) — FK posing of a limb chain.
+    const rotChk = document.createElement("label");
+    rotChk.style.cssText =
+        "margin-left:8px;display:none;align-items:center;gap:3px;cursor:pointer;" +
+        "color:" + C.dim + ";font:11px ui-sans-serif;user-select:none;";
+    const rotBox = document.createElement("input");
+    rotBox.type = "checkbox";
+    rotBox.style.cssText = "accent-color:" + C.accent + ";cursor:pointer;";
+    rotChk.append(rotBox, document.createTextNode("Rotate limb"));
+    // "Persp" toggle (body layer only) — depth foreshortening in the 2D output.
+    const perspChk = document.createElement("label");
+    perspChk.title = "Perspective output: a joint's depth (z) foreshortens its 2D position";
+    perspChk.style.cssText =
+        "margin-left:8px;display:none;align-items:center;gap:3px;cursor:pointer;" +
+        "color:" + C.dim + ";font:11px ui-sans-serif;user-select:none;";
+    const perspBox = document.createElement("input");
+    perspBox.type = "checkbox";
+    perspBox.style.cssText = "accent-color:" + C.accent + ";cursor:pointer;";
+    perspChk.append(perspBox, document.createTextNode("Persp"));
     const closeBtn = document.createElement("button");
     closeBtn.textContent = "\u2715";
     closeBtn.title = "Close 3D editor";
@@ -208,14 +321,16 @@ export async function mount3DEditor(host, opts) {
         "margin-left:auto;background:transparent;color:" + C.text + ";" +
         "border:1px solid " + C.border + ";border-radius:3px;" +
         "padding:1px 6px;cursor:pointer;";
-    hdr.append(title, subtitle, closeBtn);
+    hdr.append(title, subtitle, layerSel, rotChk, perspChk, closeBtn);
     wrap.appendChild(hdr);
+    rotBox.addEventListener("change", () => { rotateLimb = rotBox.checked; });
+    perspBox.addEventListener("change", () => { outputPersp = perspBox.checked; _reprojectAll(); });
 
     // Loading placeholder (shown until Three.js resolves or fails).
     const loadingMsg = document.createElement("div");
     loadingMsg.style.cssText =
         "flex:1;display:flex;align-items:center;justify-content:center;color:" + C.dim + ";";
-    loadingMsg.textContent = "fetching three@" + THREE_VERSION + " from CDN\u2026";
+    loadingMsg.textContent = "loading 3D engine\u2026";
     wrap.appendChild(loadingMsg);
 
     let destroyed = false;
@@ -254,16 +369,24 @@ export async function mount3DEditor(host, opts) {
     if (destroyed) return { destroy, refresh: () => {} };
 
     const { THREE, OrbitControls, TransformControls, cdnBase } = stack;
-    subtitle.textContent = "three@" + THREE_VERSION + " \u00b7 " + cdnBase.replace(/^https?:\/\//, "");
+    subtitle.textContent = cdnBase === "local" ? "ready \u00b7 drag to orbit" : ("three@" + THREE_VERSION + " \u00b7 " + cdnBase.replace(/^https?:\/\//, ""));
     loadingMsg.remove();
+
+    // Active editing layer ("face" | "body" | "hands" | "camera").
+    let currentLayer = layerSel.value || "face";
+    let rotateLimb = false;   // body layer: rotate a limb (FK) vs. free-drag a joint
 
     // ── Three.js scene setup ─────────────────────────────────────────
     const sceneHost = document.createElement("div");
     sceneHost.style.cssText = "flex:1;position:relative;min-height:0;";
     wrap.appendChild(sceneHost);
 
-    const W0 = Math.max(160, sceneHost.clientWidth  || wrap.clientWidth || 320);
-    const H0 = Math.max(120, sceneHost.clientHeight || 240);
+    // clientHeight is 0 at mount (flex parent not laid out yet) — derive the
+    // initial size from the known wrap height minus the header; the
+    // ResizeObserver below corrects it once layout settles. Relying on
+    // clientHeight alone created a 0-tall canvas (the "3D vanishes" bug).
+    const W0 = Math.max(160, sceneHost.clientWidth  || wrap.clientWidth || host.clientWidth || 320);
+    const H0 = Math.max(160, sceneHost.clientHeight || (WRAP_H - 34));
 
     const scene = new THREE.Scene();
     scene.background = new THREE.Color(C.canvas_bg);
@@ -284,10 +407,13 @@ export async function mount3DEditor(host, opts) {
     });
 
     // Lights — soft ambient + one directional from front-right.
-    scene.add(new THREE.AmbientLight(0xffffff, 0.6));
-    const dir = new THREE.DirectionalLight(0xffffff, 0.6);
+    scene.add(new THREE.AmbientLight(0xffffff, 0.75));
+    const dir = new THREE.DirectionalLight(0xffffff, 0.95);
     dir.position.set(1, 1, 2);
     scene.add(dir);
+    const dir2 = new THREE.DirectionalLight(0xffffff, 0.35);
+    dir2.position.set(-1, 0.5, -1);
+    scene.add(dir2);
 
     // Reference axes (subtle, near origin) for orientation cues.
     const axes = new THREE.AxesHelper(0.25);
@@ -329,6 +455,129 @@ export async function mount3DEditor(host, opts) {
     const edgeLines = new THREE.LineSegments(edgeGeom, edgeMat);
     headGroup.add(edgeLines);
     cleanups.push(() => { edgeGeom.dispose(); edgeMat.dispose(); });
+
+    // ── Body skeleton group (OpenPose-18) ────────────────────────────
+    const bodyEdges = (Array.isArray(opts.bodyEdges) && opts.bodyEdges.length)
+        ? opts.bodyEdges : POSE18_EDGES_FALLBACK;
+    const bodyNames = Array.isArray(opts.bodyNames) ? opts.bodyNames : [];
+    const bodyGroup = new THREE.Group();
+    bodyGroup.visible = false;
+    scene.add(bodyGroup);
+    const bodyJointGeom = new THREE.SphereGeometry(0.02, 12, 10);
+    const bodyMat = new THREE.MeshLambertMaterial({ color: BODY_JOINT_COLOR });
+    const bodyHoverMat = new THREE.MeshLambertMaterial({ color: 0xffae42 });
+    const bodyMeshes = [];
+    for (let i = 0; i < 18; i++) {
+        const m = new THREE.Mesh(bodyJointGeom, bodyMat);
+        m.userData.bodyIndex = i;
+        m.visible = false;
+        bodyGroup.add(m);
+        bodyMeshes.push(m);
+    }
+    const bodyEdgeGeom = new THREE.BufferGeometry();
+    const bodyEdgePos = new Float32Array(bodyEdges.length * 2 * 3);
+    bodyEdgeGeom.setAttribute("position", new THREE.BufferAttribute(bodyEdgePos, 3));
+    const bodyEdgeMat = new THREE.LineBasicMaterial({
+        color: BODY_EDGE_COLOR, transparent: true, opacity: 0.7,
+    });
+    const bodyEdgeLines = new THREE.LineSegments(bodyEdgeGeom, bodyEdgeMat);
+    bodyGroup.add(bodyEdgeLines);
+    cleanups.push(() => {
+        bodyJointGeom.dispose(); bodyMat.dispose(); bodyHoverMat.dispose();
+        bodyEdgeGeom.dispose(); bodyEdgeMat.dispose();
+    });
+
+    // World<->image mapping for the 2D pose output. WYSIWYG, NOT mirrored (unlike
+    // the face cloud) so "drag right" moves the joint right both here AND in the
+    // 2D OpenPose fed to Wan; only Y is flipped (image Y down, world Y up).
+    //
+    // Two output projections (toggle in the header — default Ortho = the verified
+    // behavior, zero regression):
+    //   Ortho  : imgX = world.x+0.5,            imgY = 0.5-world.y     (depth ignored)
+    //   Persp  : s = camZ/(camZ+world.z);  imgX = 0.5+world.x*s, imgY = 0.5-world.y*s
+    //            → joints pushed back (z>0) foreshorten toward centre, pulled
+    //              forward (z<0) enlarge. Depth finally affects the 2D pose.
+    const OUT_CAM_Z = 2.4;          // output camera distance (front)
+    let outputPersp = false;        // false = orthographic (default)
+    let selJoint = -1;              // last-picked body joint (for the depth slider)
+    const _clamp01 = (v) => Math.max(0, Math.min(1, v));
+    const _perspScale = (wz) => (outputPersp ? OUT_CAM_Z / (OUT_CAM_Z + (wz || 0)) : 1);
+    const bodyXYZ = new Float32Array(18 * 3);
+    const bodyValid = new Array(18).fill(false);
+    const _imgToWorld = (x, y, wz) => { const s = _perspScale(wz); return [(x - 0.5) / s, -(y - 0.5) / s]; };
+    const _worldToImg = (wx, wy, wz) => { const s = _perspScale(wz); return [_clamp01(0.5 + wx * s), _clamp01(0.5 - wy * s)]; };
+    function _seedBody() {
+        let joints = null;
+        try { joints = opts.getBodyJoints?.(); } catch (_) {}
+        for (let i = 0; i < 18; i++) {
+            const p = Array.isArray(joints) ? joints[i] : null;
+            if (p && Number.isFinite(p[0]) && Number.isFinite(p[1])) {
+                const z = CANONICAL_BODY_Z[i] || 0;
+                const [wx, wy] = _imgToWorld(p[0], p[1], z);
+                bodyXYZ[i*3] = wx; bodyXYZ[i*3+1] = wy;
+                bodyXYZ[i*3+2] = z;
+                bodyValid[i] = true;
+            } else {
+                bodyValid[i] = false;
+            }
+        }
+        _syncBodyMeshes();
+    }
+    function _syncBodyMeshes() {
+        for (let i = 0; i < 18; i++) {
+            bodyMeshes[i].visible = bodyValid[i] && bodyGroup.visible;
+            if (bodyValid[i]) {
+                bodyMeshes[i].position.set(bodyXYZ[i*3], bodyXYZ[i*3+1], bodyXYZ[i*3+2]);
+            }
+        }
+        let w = 0;
+        for (const [a, b] of bodyEdges) {
+            if (!bodyValid[a] || !bodyValid[b]) { for (let k = 0; k < 6; k++) bodyEdgePos[w++] = 0; continue; }
+            bodyEdgePos[w++] = bodyXYZ[a*3]; bodyEdgePos[w++] = bodyXYZ[a*3+1]; bodyEdgePos[w++] = bodyXYZ[a*3+2];
+            bodyEdgePos[w++] = bodyXYZ[b*3]; bodyEdgePos[w++] = bodyXYZ[b*3+1]; bodyEdgePos[w++] = bodyXYZ[b*3+2];
+        }
+        bodyEdgeGeom.attributes.position.needsUpdate = true;
+    }
+
+    // FK skeleton for "Rotate limb" mode (neck=root). Dragging a joint rotates
+    // the bone parent→joint and carries its whole subtree, keeping bone lengths.
+    const BODY_PARENT = {
+        0:1, 14:0, 15:0, 16:14, 17:15,
+        2:1, 3:2, 4:3, 5:1, 6:5, 7:6,
+        8:1, 9:8, 10:9, 11:1, 12:11, 13:12,
+    };
+    const BODY_CHILDREN = (() => {
+        const c = {}; for (let i = 0; i < 18; i++) c[i] = [];
+        for (const k in BODY_PARENT) c[BODY_PARENT[k]].push(+k);
+        return c;
+    })();
+    function _subtree(j) {
+        const out = [], stack = [j];
+        while (stack.length) { const x = stack.pop(); out.push(x); for (const ch of (BODY_CHILDREN[x] || [])) stack.push(ch); }
+        return out;
+    }
+    const _qRot = new THREE.Quaternion();
+    const _vOld = new THREE.Vector3(), _vNew = new THREE.Vector3();
+    const _vPivot = new THREE.Vector3(), _vTmp = new THREE.Vector3();
+    function _applyLimbRotate(j, nx, ny, nz) {
+        const p = BODY_PARENT[j];
+        if (p === undefined || !bodyValid[p] || !bodyValid[j]) return false;
+        _vPivot.set(bodyXYZ[p*3], bodyXYZ[p*3+1], bodyXYZ[p*3+2]);
+        _vOld.set(bodyXYZ[j*3] - _vPivot.x, bodyXYZ[j*3+1] - _vPivot.y, bodyXYZ[j*3+2] - _vPivot.z);
+        _vNew.set(nx - _vPivot.x, ny - _vPivot.y, nz - _vPivot.z);
+        if (_vOld.lengthSq() < 1e-9 || _vNew.lengthSq() < 1e-9) return false;
+        _qRot.setFromUnitVectors(_vOld.clone().normalize(), _vNew.clone().normalize());
+        const map = {};
+        for (const idx of _subtree(j)) {
+            if (!bodyValid[idx]) continue;
+            _vTmp.set(bodyXYZ[idx*3] - _vPivot.x, bodyXYZ[idx*3+1] - _vPivot.y, bodyXYZ[idx*3+2] - _vPivot.z);
+            _vTmp.applyQuaternion(_qRot).add(_vPivot);
+            bodyXYZ[idx*3] = _vTmp.x; bodyXYZ[idx*3+1] = _vTmp.y; bodyXYZ[idx*3+2] = _vTmp.z;
+            map[idx] = _worldToImg(_vTmp.x, _vTmp.y, _vTmp.z);
+        }
+        try { opts.setBodyJoints?.(map); } catch (_) {}
+        return true;
+    }
 
     // ── Controls ─────────────────────────────────────────────────────
     const orbit = new OrbitControls(camera, renderer.domElement);
@@ -377,6 +626,7 @@ export async function mount3DEditor(host, opts) {
             : "hover a landmark";
     };
     const onMouseMove = (ev) => {
+        if (currentLayer !== "face") return;   // body layer has its own picker
         const rect = renderer.domElement.getBoundingClientRect();
         pickMouse.x = ((ev.clientX - rect.left) / rect.width)  * 2 - 1;
         pickMouse.y = -((ev.clientY - rect.top)  / rect.height) * 2 + 1;
@@ -435,6 +685,242 @@ export async function mount3DEditor(host, opts) {
     hoverLabel.textContent = "hover a landmark";
     wrap.appendChild(hoverLabel);
 
+    // ── Framing ("camera") controls: pan / zoom / rotate the whole figure
+    //    in the output frame. Works in image space, writes ALL body joints to
+    //    pose_overrides_json (so the figure is repositioned in the 2D pose Wan
+    //    receives). A true 3D output camera arrives with perspective (Slice 4).
+    const camBar = document.createElement("div");
+    camBar.style.cssText =
+        "display:none;padding:4px 6px;background:" + C.border + ";" +
+        "grid-template-columns:auto 1fr auto;gap:3px 6px;align-items:center;";
+    wrap.appendChild(camBar);
+    const _mkCamSlider = (label, min, max, step, init) => {
+        const lab = document.createElement("span"); lab.textContent = label;
+        const sl = document.createElement("input"); sl.type = "range";
+        sl.min = String(min); sl.max = String(max); sl.step = String(step); sl.value = String(init);
+        sl.style.cssText = "width:100%;accent-color:" + C.accent + ";";
+        const val = document.createElement("span");
+        val.style.cssText = "font:11px ui-monospace,monospace;color:" + C.dim + ";min-width:46px;text-align:right;";
+        val.textContent = Number(init).toFixed(2);
+        sl.addEventListener("input", () => { val.textContent = Number(sl.value).toFixed(2); _applyFraming(); });
+        camBar.append(lab, sl, val);
+        return sl;
+    };
+    const panXSl = _mkCamSlider("pan X", -0.5, 0.5, 0.005, 0);
+    const panYSl = _mkCamSlider("pan Y", -0.5, 0.5, 0.005, 0);
+    const zoomSl = _mkCamSlider("zoom", 0.3, 2.0, 0.01, 1);
+    const rotSl  = _mkCamSlider("rotate°", -180, 180, 1, 0);
+    const camReset = document.createElement("button");
+    camReset.textContent = "Reset framing";
+    camReset.style.cssText =
+        "grid-column:1 / -1;justify-self:start;background:transparent;color:" + C.text +
+        ";border:1px solid " + C.border + ";border-radius:3px;padding:1px 8px;cursor:pointer;";
+    camReset.addEventListener("click", () => {
+        panXSl.value = "0"; panYSl.value = "0"; zoomSl.value = "1"; rotSl.value = "0";
+        camBar.querySelectorAll("span:nth-child(3n)").forEach(() => {});
+        _captureCamBase(); _applyFraming();
+    });
+    camBar.appendChild(camReset);
+    let _camBase = null, _camCx = 0.5, _camCy = 0.5;
+    function _captureCamBase() {
+        let j = null; try { j = opts.getBodyJoints?.(); } catch (_) {}
+        _camBase = new Array(18).fill(null);
+        let sx = 0, sy = 0, nc = 0;
+        for (let i = 0; i < 18; i++) {
+            const p = Array.isArray(j) ? j[i] : null;
+            if (p && Number.isFinite(p[0]) && Number.isFinite(p[1])) { _camBase[i] = [p[0], p[1]]; sx += p[0]; sy += p[1]; nc++; }
+        }
+        _camCx = nc ? sx / nc : 0.5; _camCy = nc ? sy / nc : 0.5;
+    }
+    function _applyFraming() {
+        if (!_camBase) return;
+        const panX = +panXSl.value, panY = +panYSl.value, zoom = +zoomSl.value, rot = (+rotSl.value) * Math.PI / 180;
+        const cos = Math.cos(rot), sin = Math.sin(rot), map = {};
+        for (let i = 0; i < 18; i++) {
+            const b = _camBase[i]; if (!b) continue;
+            const dx = b[0] - _camCx, dy = b[1] - _camCy;
+            const rx = dx * cos - dy * sin, ry = dx * sin + dy * cos;
+            const nx = Math.max(0, Math.min(1, _camCx + rx * zoom + panX));
+            const ny = Math.max(0, Math.min(1, _camCy + ry * zoom + panY));
+            map[i] = [nx, ny];
+            const [wx, wy] = _imgToWorld(nx, ny, bodyXYZ[i*3+2]); bodyXYZ[i*3] = wx; bodyXYZ[i*3+1] = wy;
+        }
+        _syncBodyMeshes();
+        try { opts.setBodyJoints?.(map); } catch (_) {}
+    }
+
+    // Re-project every body joint through the current output projection and
+    // write the result (used when toggling Persp or resetting depths).
+    function _reprojectAll() {
+        const map = {};
+        for (let i = 0; i < 18; i++) {
+            if (!bodyValid[i]) continue;
+            map[i] = _worldToImg(bodyXYZ[i*3], bodyXYZ[i*3+1], bodyXYZ[i*3+2]);
+        }
+        _syncBodyMeshes();
+        try { opts.setBodyJoints?.(map); } catch (_) {}
+    }
+
+    // ── Body controls bar: depth (z) of the selected joint + reset ───
+    const bodyBar = document.createElement("div");
+    bodyBar.style.cssText =
+        "display:none;padding:4px 6px;background:" + C.border + ";" +
+        "grid-template-columns:auto 1fr auto;gap:3px 6px;align-items:center;";
+    wrap.appendChild(bodyBar);
+    const dLab = document.createElement("span"); dLab.textContent = "depth (sel)";
+    const depthSl = document.createElement("input");
+    depthSl.type = "range"; depthSl.min = "-0.6"; depthSl.max = "0.6"; depthSl.step = "0.01"; depthSl.value = "0";
+    depthSl.style.cssText = "width:100%;accent-color:" + C.accent + ";";
+    const depthVal = document.createElement("span");
+    depthVal.style.cssText = "font:11px ui-monospace,monospace;color:" + C.dim + ";min-width:46px;text-align:right;";
+    depthVal.textContent = "0.00";
+    depthSl.addEventListener("input", () => {
+        depthVal.textContent = Number(depthSl.value).toFixed(2);
+        if (selJoint >= 0 && bodyValid[selJoint]) {
+            bodyXYZ[selJoint*3+2] = +depthSl.value;
+            _syncBodyMeshes();
+            const m = {}; m[selJoint] = _worldToImg(bodyXYZ[selJoint*3], bodyXYZ[selJoint*3+1], bodyXYZ[selJoint*3+2]);
+            try { opts.setBodyJoints?.(m); } catch (_) {}
+        }
+    });
+    bodyBar.append(dLab, depthSl, depthVal);
+    const depthReset = document.createElement("button");
+    depthReset.textContent = "Reset depths";
+    depthReset.style.cssText =
+        "grid-column:1 / -1;justify-self:start;background:transparent;color:" + C.text +
+        ";border:1px solid " + C.border + ";border-radius:3px;padding:1px 8px;cursor:pointer;";
+    depthReset.addEventListener("click", () => {
+        for (let i = 0; i < 18; i++) if (bodyValid[i]) bodyXYZ[i*3+2] = CANONICAL_BODY_Z[i] || 0;
+        if (selJoint >= 0) { depthSl.value = String(bodyXYZ[selJoint*3+2] || 0); depthVal.textContent = Number(bodyXYZ[selJoint*3+2] || 0).toFixed(2); }
+        _reprojectAll();
+    });
+    bodyBar.appendChild(depthReset);
+
+    // ── Editing-layer switching ──────────────────────────────────────
+    function setLayer(layer) {
+        currentLayer = layer;
+        const isFace = layer === "face";
+        const isBody = layer === "body";
+        const isCamera = layer === "camera";
+        headGroup.visible = isFace;
+        edgeLines.visible = isFace;
+        for (const m of meshes) m.visible = isFace;
+        bodyGroup.visible = isBody || isCamera;   // show skeleton while framing too
+        // The head-translate gizmo + yaw/pitch/roll sliders apply to the face only.
+        try {
+            if (isFace) { xform.attach(headGroup); xform.visible = true; xform.enabled = true; }
+            else { xform.detach(); xform.visible = false; xform.enabled = false; }
+        } catch (_) {}
+        hud.style.display = isFace ? "" : "none";
+        rotChk.style.display = isBody ? "inline-flex" : "none";
+        perspChk.style.display = isBody ? "inline-flex" : "none";
+        bodyBar.style.display = isBody ? "grid" : "none";
+        camBar.style.display = isCamera ? "grid" : "none";
+        if (isBody || isCamera) _seedBody(); else _syncBodyMeshes();
+        if (isCamera) _captureCamBase();
+        title.textContent = isBody ? "3D body editor"
+            : isFace ? "3D head editor"
+            : isCamera ? "Framing · pan / zoom / rotate"
+            : "3D hands (coming soon)";
+        if (isBody) hoverLabel.textContent = "drag a body joint · right-click resets it";
+        else if (isCamera) hoverLabel.textContent = "pan / zoom / rotate the whole figure in frame";
+        else if (layer === "hands") hoverLabel.textContent = "hands editor needs the hand-keypoint channel — coming next";
+        else hoverLabel.textContent = "hover a landmark";
+        try { opts.onLayerChange?.(layer); } catch (_) {}
+    }
+    layerSel.addEventListener("change", () => setLayer(layerSel.value));
+    cleanups.push(() => layerSel.replaceWith(layerSel.cloneNode(true)));
+
+    // ── Body-joint picking + 3D drag (projects to 2D pose_overrides) ──
+    const _dragNDC = new THREE.Vector2();
+    const _dragPoint = new THREE.Vector3();
+    const _camDir = new THREE.Vector3();
+    // Grab state: a drag plane fixed at mousedown + the offset between the joint
+    // and the exact point grabbed, so the joint tracks the pointer with no jump
+    // and no axis inversion ("what you grab is what moves, where you point").
+    const _grabPlane = new THREE.Plane();
+    const _grabHit = new THREE.Vector3();
+    const _grabOffset = new THREE.Vector3();
+    let bodyDrag = -1;
+    const _setNDC = (ev) => {
+        const rect = renderer.domElement.getBoundingClientRect();
+        _dragNDC.x = ((ev.clientX - rect.left) / rect.width) * 2 - 1;
+        _dragNDC.y = -((ev.clientY - rect.top) / rect.height) * 2 + 1;
+    };
+    function _bodyPick(ev) {
+        _setNDC(ev);
+        raycaster.setFromCamera(_dragNDC, camera);
+        const targets = bodyMeshes.filter((m, i) => bodyValid[i]);
+        const hits = raycaster.intersectObjects(targets, false);
+        return hits.length ? hits[0].object.userData.bodyIndex : -1;
+    }
+    const onBodyDown = (ev) => {
+        if (currentLayer !== "body") return;
+        const j = _bodyPick(ev);
+        if (j < 0) return;
+        bodyDrag = j; orbit.enabled = false;
+        selJoint = j;
+        if (depthSl) { depthSl.value = String(bodyXYZ[j*3+2] || 0); depthVal.textContent = Number(bodyXYZ[j*3+2] || 0).toFixed(2); }
+        // Fix a camera-facing plane through the joint for the whole drag, and
+        // record the grab offset so the joint keeps its position under the
+        // pointer instead of snapping its centre to the cursor.
+        _dragPoint.set(bodyXYZ[j*3], bodyXYZ[j*3+1], bodyXYZ[j*3+2]);
+        camera.getWorldDirection(_camDir);
+        _grabPlane.setFromNormalAndCoplanarPoint(_camDir, _dragPoint.clone());
+        _setNDC(ev); raycaster.setFromCamera(_dragNDC, camera);
+        if (raycaster.ray.intersectPlane(_grabPlane, _grabHit)) _grabOffset.copy(_dragPoint).sub(_grabHit);
+        else _grabOffset.set(0, 0, 0);
+        ev.preventDefault(); ev.stopPropagation();
+    };
+    const onBodyMove = (ev) => {
+        if (currentLayer !== "body") return;
+        if (bodyDrag < 0) {
+            const j = _bodyPick(ev);
+            for (let i = 0; i < 18; i++) bodyMeshes[i].material = (i === j ? bodyHoverMat : bodyMat);
+            hoverLabel.textContent = j >= 0
+                ? `joint ${j} · ${bodyNames[j] || "?"}`
+                : "drag a body joint · right-click resets it";
+            return;
+        }
+        _setNDC(ev);
+        raycaster.setFromCamera(_dragNDC, camera);
+        // Intersect the FIXED grab plane; add the grab offset → exact pointer track.
+        if (raycaster.ray.intersectPlane(_grabPlane, _grabHit)) {
+            const nx = _grabHit.x + _grabOffset.x;
+            const ny = _grabHit.y + _grabOffset.y;
+            const nz = _grabHit.z + _grabOffset.z;
+            if (rotateLimb && _applyLimbRotate(bodyDrag, nx, ny, nz)) {
+                // subtree rotated in _applyLimbRotate
+            } else {
+                bodyXYZ[bodyDrag*3] = nx; bodyXYZ[bodyDrag*3+1] = ny; bodyXYZ[bodyDrag*3+2] = nz;
+                const [ix, iy] = _worldToImg(nx, ny, nz);
+                try { opts.setBodyJoints?.({ [bodyDrag]: [ix, iy] }); } catch (_) {}
+            }
+            _syncBodyMeshes();
+        }
+        ev.preventDefault(); ev.stopPropagation();
+    };
+    const onBodyUp = () => { if (bodyDrag >= 0) { bodyDrag = -1; orbit.enabled = true; } };
+    const onBodyContext = (ev) => {
+        if (currentLayer !== "body") return;
+        const j = _bodyPick(ev);
+        if (j < 0) return;
+        ev.preventDefault();
+        try { opts.clearBodyJoint?.(j); } catch (_) {}
+        _seedBody();
+    };
+    renderer.domElement.addEventListener("mousedown", onBodyDown);
+    renderer.domElement.addEventListener("mousemove", onBodyMove);
+    window.addEventListener("mouseup", onBodyUp);
+    renderer.domElement.addEventListener("contextmenu", onBodyContext);
+    cleanups.push(() => {
+        renderer.domElement.removeEventListener("mousedown", onBodyDown);
+        renderer.domElement.removeEventListener("mousemove", onBodyMove);
+        window.removeEventListener("mouseup", onBodyUp);
+        renderer.domElement.removeEventListener("contextmenu", onBodyContext);
+    });
+    setLayer(currentLayer);   // apply initial visibility
+
     // ── State plumbing ───────────────────────────────────────────────
     const _eulerState = {
         yaw:   headState.yaw   || 0,
@@ -459,6 +945,8 @@ export async function mount3DEditor(host, opts) {
 
     function refresh() {
         if (destroyed) return;
+        // Body layer: reseed the skeleton from the (possibly new) frame.
+        if (currentLayer === "body") { _seedBody(); return; }
         // Re-read landmarks + head pose from the host node and update.
         let lms = null;
         try { lms = opts.getLandmarks?.(); } catch (_) {}
@@ -495,13 +983,26 @@ export async function mount3DEditor(host, opts) {
     refresh();
 
     // ── Resize handling ──────────────────────────────────────────────
+    // rAF-debounced + threshold-guarded to prevent the "ResizeObserver loop
+    // completed with undelivered notifications" feedback storm — setSize on
+    // the WebGL renderer can reflow sceneHost's parent, which re-fires the
+    // observer with new dimensions.
+    let _roPending = false;
+    let _roLastW = 0, _roLastH = 0;
     const ro = new ResizeObserver(() => {
-        if (destroyed) return;
-        const w = Math.max(160, sceneHost.clientWidth);
-        const h = Math.max(120, sceneHost.clientHeight);
-        renderer.setSize(w, h, false);
-        camera.aspect = w / h;
-        camera.updateProjectionMatrix();
+        if (destroyed || _roPending) return;
+        _roPending = true;
+        requestAnimationFrame(() => {
+            _roPending = false;
+            if (destroyed) return;
+            const w = Math.max(160, sceneHost.clientWidth);
+            const h = Math.max(120, sceneHost.clientHeight);
+            if (Math.abs(w - _roLastW) < 2 && Math.abs(h - _roLastH) < 2) return;
+            _roLastW = w; _roLastH = h;
+            renderer.setSize(w, h, false);
+            camera.aspect = w / h;
+            camera.updateProjectionMatrix();
+        });
     });
     ro.observe(sceneHost);
     cleanups.push(() => ro.disconnect());

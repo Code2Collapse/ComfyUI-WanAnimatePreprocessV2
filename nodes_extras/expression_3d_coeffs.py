@@ -91,6 +91,22 @@ _AXIS_NAMES: Tuple[str, ...] = (
     "mouth_open",         # AU25
     "jaw_drop",           # AU26
     "lip_pucker",         # AU18
+    # ── full FACS facial set (user's AU grid) ──
+    "eye_wide",           # AU5  upper lid raiser
+    "lid_tighten",        # AU7  lid tightener
+    "upper_lip_raise",    # AU10 upper lip raiser
+    "nasolabial",         # AU11 nasolabial deepener
+    "sharp_lip_pull",     # AU13 sharp lip puller
+    "dimpler",            # AU14 dimpler (smirk/contempt)
+    "lower_lip_depress",  # AU16 lower lip depressor
+    "chin_raise",         # AU17 chin raiser
+    "lip_stretch",        # AU20 lip stretcher
+    "lip_funnel",         # AU22 lip funneler
+    "lip_tighten",        # AU23 lip tightener
+    "lip_press",          # AU24 lip pressor
+    "lip_suck",           # AU28 lip suck
+    "lid_droop",          # AU41 lid droop
+    "squint",             # AU44 squint
 )
 _N_AXES = len(_AXIS_NAMES)
 _N_LM   = 68
@@ -178,6 +194,89 @@ _BASIS_TABLE: Dict[str, Dict[int, Tuple[float, float]]] = {
         49: (+0.010, 0.0), 53: (-0.010, 0.0),
         51: (0.0, -0.005), 57: (0.0, +0.005),
         62: (0.0, -0.003), 66: (0.0, +0.003),
+    },
+    # --- AU5 upper lid raiser (eyes wide; upper lids up) ----------
+    "eye_wide": {
+        37: (0.0, -0.012), 38: (0.0, -0.012),
+        43: (0.0, -0.012), 44: (0.0, -0.012),
+    },
+    # --- AU7 lid tightener (lower lids up, slight upper down) -----
+    "lid_tighten": {
+        40: (0.0, -0.009), 41: (0.0, -0.009), 46: (0.0, -0.009), 47: (0.0, -0.009),
+        37: (0.0, +0.004), 38: (0.0, +0.004), 43: (0.0, +0.004), 44: (0.0, +0.004),
+    },
+    # --- AU10 upper lip raiser (upper lip up + nasolabial) --------
+    "upper_lip_raise": {
+        50: (0.0, -0.018), 51: (0.0, -0.020), 52: (0.0, -0.018),
+        49: (-0.004, -0.012), 53: (+0.004, -0.012),
+        31: (0.0, -0.006), 35: (0.0, -0.006),
+        61: (0.0, -0.012), 62: (0.0, -0.014), 63: (0.0, -0.012),
+    },
+    # --- AU11 nasolabial deepener (subtle upper corner + nose) ----
+    "nasolabial": {
+        49: (-0.003, -0.008), 53: (+0.003, -0.008),
+        31: (0.0, -0.004), 35: (0.0, -0.004),
+    },
+    # --- AU13 sharp lip puller (corners sharply up + out) ---------
+    "sharp_lip_pull": {
+        48: (-0.030, -0.035), 54: (+0.030, -0.035),
+        49: (-0.018, -0.024), 53: (+0.018, -0.024),
+    },
+    # --- AU14 dimpler (corners pull IN + tighten; smirk/contempt) -
+    "dimpler": {
+        48: (+0.012, -0.004), 54: (-0.012, -0.004),
+        49: (+0.006, 0.0), 53: (-0.006, 0.0),
+    },
+    # --- AU16 lower lip depressor (lower lip pulls DOWN) ----------
+    "lower_lip_depress": {
+        57: (0.0, +0.020), 56: (0.0, +0.015), 58: (0.0, +0.015),
+        66: (0.0, +0.014),
+    },
+    # --- AU17 chin raiser (chin + lower lip push UP) --------------
+    "chin_raise": {
+        57: (0.0, -0.018), 56: (0.0, -0.014), 58: (0.0, -0.014),
+        66: (0.0, -0.012), 8: (0.0, -0.010), 7: (0.0, -0.006), 9: (0.0, -0.006),
+    },
+    # --- AU20 lip stretcher (corners pull WIDE, out + slight down)-
+    "lip_stretch": {
+        48: (-0.022, +0.004), 54: (+0.022, +0.004),
+        49: (-0.012, +0.002), 53: (+0.012, +0.002),
+        60: (-0.012, 0.0), 64: (+0.012, 0.0),
+    },
+    # --- AU22 lip funneler (corners in, mid-lips push out) --------
+    "lip_funnel": {
+        48: (+0.014, 0.0), 54: (-0.014, 0.0),
+        51: (0.0, -0.004), 57: (0.0, +0.004),
+        50: (0.0, -0.003), 52: (0.0, -0.003),
+    },
+    # --- AU23 lip tightener (lips thin/tighten toward centre) -----
+    "lip_tighten": {
+        48: (+0.008, 0.0), 54: (-0.008, 0.0),
+        50: (0.0, +0.003), 52: (0.0, +0.003),
+        56: (0.0, -0.003), 58: (0.0, -0.003),
+        51: (0.0, +0.002), 57: (0.0, -0.002),
+    },
+    # --- AU24 lip pressor (lips press together, thin) -------------
+    "lip_press": {
+        50: (0.0, +0.004), 51: (0.0, +0.005), 52: (0.0, +0.004),
+        58: (0.0, -0.004), 57: (0.0, -0.005), 56: (0.0, -0.004),
+        62: (0.0, +0.003), 66: (0.0, -0.003),
+    },
+    # --- AU28 lip suck (lips roll IN toward mouth centre) ---------
+    "lip_suck": {
+        50: (0.0, +0.005), 51: (0.0, +0.006), 52: (0.0, +0.005),
+        56: (0.0, -0.005), 57: (0.0, -0.006), 58: (0.0, -0.005),
+        48: (+0.006, 0.0), 54: (-0.006, 0.0),
+    },
+    # --- AU41 lid droop (upper lids slightly down; sleepy) --------
+    "lid_droop": {
+        37: (0.0, +0.010), 38: (0.0, +0.010),
+        43: (0.0, +0.010), 44: (0.0, +0.010),
+    },
+    # --- AU44 squint (lower lids up + brow down) ------------------
+    "squint": {
+        40: (0.0, -0.012), 41: (0.0, -0.012), 46: (0.0, -0.012), 47: (0.0, -0.012),
+        19: (0.0, +0.008), 24: (0.0, +0.008),
     },
 }
 

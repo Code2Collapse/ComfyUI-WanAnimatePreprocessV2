@@ -83,6 +83,42 @@ def cache_size() -> int:
 
 
 # ----------------------------------------------------------------------
+# Underlay-frame cache (node_id → uint8 [N,H,W,3]) — the INPUT frames the
+# editor draws behind the pose, frame-by-frame. Downscaled + frame-capped
+# by the node before caching so this stays small. Served lazily one frame
+# at a time via GET /c2c/fc3d_underlay (no giant payloads, scales to long
+# shots). A single image batch → one frame → constant backdrop.
+# ----------------------------------------------------------------------
+_UNDERLAY_CACHE_MAX = 6
+_UNDERLAY_CACHE: "dict[str, np.ndarray]" = {}
+_UNDERLAY_CACHE_LOCK = threading.Lock()
+
+
+def underlay_put(node_id: str, frames_u8, idxs=None) -> None:
+    """Stash downscaled uint8 input frames [N,H,W,3] + their original frame
+    indices (for decimated long shots) for a node (LRU-capped)."""
+    if not node_id or frames_u8 is None:
+        return
+    n = int(getattr(frames_u8, "shape", [0])[0])
+    if idxs is None:
+        idxs = list(range(n))
+    with _UNDERLAY_CACHE_LOCK:
+        _UNDERLAY_CACHE.pop(node_id, None)
+        _UNDERLAY_CACHE[node_id] = {"frames": frames_u8, "idxs": list(idxs)}
+        while len(_UNDERLAY_CACHE) > _UNDERLAY_CACHE_MAX:
+            _UNDERLAY_CACHE.pop(next(iter(_UNDERLAY_CACHE)), None)
+
+
+def underlay_get(node_id: str):
+    with _UNDERLAY_CACHE_LOCK:
+        a = _UNDERLAY_CACHE.get(node_id)
+        if a is not None:           # refresh LRU
+            _UNDERLAY_CACHE.pop(node_id, None)
+            _UNDERLAY_CACHE[node_id] = a
+        return a
+
+
+# ----------------------------------------------------------------------
 # Whitelist of run() kwargs that the route accepts. We deliberately
 # enumerate them so junk fields in the POST body cannot reach run().
 # ----------------------------------------------------------------------
@@ -284,6 +320,50 @@ def register_routes() -> bool:
             )
 
         per_frame = _extract_frame_overlay(out_bundle, frame_idx)
+
+        # Optional rendered preview (Face-Director plan P5): when the JS panel
+        # asks for `return_image`, render the edited frame through the same
+        # overlay renderer used by run()'s preview_image output and inline it
+        # as base64 PNG so the node body can show a live WYSIWYG thumbnail.
+        image_b64 = None
+        if body.get("return_image"):
+            try:
+                import base64
+                import io as _io
+
+                from PIL import Image as _PILImage
+
+                from . import _face_overlay_render as _r
+                from ._face_helpers import _get_body_kps
+                from .expression_3d_coeffs import _read_face_normalised
+                from .face_controller_3d import _POSE18_EDGES_UI
+
+                metas = out_bundle.get("pose_metas") or []
+                if 0 <= frame_idx < len(metas):
+                    meta = metas[frame_idx]
+                    iris = out_bundle.get("iris_data") or []
+                    iris_entry = (
+                        iris[frame_idx]
+                        if frame_idx < len(iris) and isinstance(iris[frame_idx], dict)
+                        else None
+                    )
+                    size = max(96, min(512, int(body.get("preview_size", 256))))
+                    frame_u8 = _r.render_overlay_frame(
+                        meta=meta,
+                        iris_entry=iris_entry,
+                        body_xy=_get_body_kps(meta),
+                        out_size=size,
+                        edges=_POSE18_EDGES_UI,
+                        face_norm=_read_face_normalised(meta),
+                        frame_idx=frame_idx,
+                        n_frames=len(metas),
+                    )
+                    buf = _io.BytesIO()
+                    _PILImage.fromarray(frame_u8).save(buf, format="PNG")
+                    image_b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+            except Exception as exc:                                    # noqa: BLE001
+                log.debug("[fc3d_preview] image render skipped: %s", exc)
+
         return web.json_response({
             "ok": True,
             "node_id": node_id,
@@ -292,6 +372,7 @@ def register_routes() -> bool:
             "face_norm": per_frame["face"],
             "body_kps":  per_frame["body"],
             "gaze":      per_frame["gaze"],
+            "image_b64": image_b64,
         })
 
     @routes.get("/c2c/fc3d_preview/status")
@@ -301,6 +382,44 @@ def register_routes() -> bool:
             "cached_nodes": cache_size(),
             "max": _BUNDLE_CACHE_MAX,
         })
+
+    @routes.get("/c2c/fc3d_underlay")
+    async def _underlay(req):                                           # noqa: ANN001
+        """Serve one cached INPUT frame as PNG for the editor's backdrop.
+
+        Query: node_id, frame (clamped to range). The editor draws this
+        behind the pose so you see input + pose aligned, frame-by-frame.
+        Cache miss → 412 (queue the node once).
+        """
+        node_id = str(req.query.get("node_id", "")).strip()
+        data = underlay_get(node_id) if node_id else None
+        frames = data["frames"] if data else None
+        if frames is None or len(frames) == 0:
+            return web.json_response(
+                {"error": "no_underlay",
+                 "message": "Wire `images` and queue the node once."},
+                status=412,
+            )
+        try:
+            want = int(req.query.get("frame", 0))
+        except (TypeError, ValueError):
+            want = 0
+        # Map the requested ORIGINAL frame index to the nearest cached frame
+        # (cache may be decimated for long shots). Single image → always 0.
+        idxs = data.get("idxs") or list(range(len(frames)))
+        f = min(range(len(idxs)), key=lambda k: abs(idxs[k] - want))
+        try:
+            import io as _io
+
+            from PIL import Image as _PILImage
+            buf = _io.BytesIO()
+            _PILImage.fromarray(frames[f]).save(buf, format="PNG")
+            return web.Response(body=buf.getvalue(), content_type="image/png",
+                                headers={"Cache-Control": "no-store"})
+        except Exception as exc:                                        # noqa: BLE001
+            return web.json_response(
+                {"error": "encode_failed", "message": str(exc)}, status=500,
+            )
 
     @routes.post("/c2c/fc3d_cache_seed")
     async def _cache_seed(req):                                         # noqa: ANN001
