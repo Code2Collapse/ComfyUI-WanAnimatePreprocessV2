@@ -28,14 +28,9 @@ from typing import Optional
 
 import cv2
 import numpy as np
+import torch
 
-try:
-    from comfy.utils import ProgressBar                              # type: ignore
-except Exception:                                                    # tests
-    class ProgressBar:                                               # type: ignore
-        def __init__(self, n): self.n = n
-        def update_absolute(self, k): pass
-
+from .._is_changed_util import hash_args_and_kwargs
 from ..pose_utils.pose2d_utils import (
     load_pose_metas_from_kp2ds_seq,
     bbox_from_detector,
@@ -46,6 +41,14 @@ log = logging.getLogger(__name__)
 
 _IMG_NORM_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 _IMG_NORM_STD  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+
+
+try:
+    from comfy.utils import ProgressBar                              # type: ignore
+except Exception:                                                    # tests
+    class ProgressBar:                                               # type: ignore
+        def __init__(self, n): self.n = n
+        def update_absolute(self, k): pass
 
 
 def _preprocess_for_pose(img: np.ndarray, use_clahe: bool) -> np.ndarray:
@@ -125,7 +128,33 @@ class WanPoseDetectViTPoseV2:
             },
         }
 
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        return hash_args_and_kwargs(**kwargs)
+
     def run(self, images, model,
+            detection_threshold: float = 0.3,
+            pose_threshold: float = 0.3,
+            use_clahe: bool = True,
+            use_blur_for_pose: bool = False,
+            blur_radius: int = 2,
+            blur_sigma: float = 1.5,
+            rescale: float = 1.25,
+            fallback_to_full_frame: bool = True):
+        if isinstance(images, torch.Tensor):
+            if images.ndim != 4 or images.shape[-1] != 3:
+                raise ValueError(
+                    f"WanPoseDetectViTPoseV2: expected IMAGE (B,H,W,3); got {tuple(images.shape)}"
+                )
+        with torch.inference_mode():
+            return self._run_impl(
+                images, model,
+                detection_threshold, pose_threshold, use_clahe,
+                use_blur_for_pose, blur_radius, blur_sigma,
+                rescale, fallback_to_full_frame,
+            )
+
+    def _run_impl(self, images, model,
             detection_threshold: float = 0.3,
             pose_threshold: float = 0.3,
             use_clahe: bool = True,
