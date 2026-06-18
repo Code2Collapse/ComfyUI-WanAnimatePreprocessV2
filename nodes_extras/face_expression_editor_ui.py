@@ -82,6 +82,9 @@ import logging
 from copy import deepcopy
 
 import numpy as np
+import torch
+
+from .._is_changed_util import hash_args_and_kwargs
 
 # Helpers + gaze constants now live in a neutral module to keep the
 # import graph acyclic and to avoid coupling controller code to this
@@ -281,8 +284,34 @@ class WanFaceExpressionEditorUI:
             },
         }
 
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        return hash_args_and_kwargs(**kwargs)
+
     # ── core ──────────────────────────────────────────────────────────
     def run(self, pose_data, reference_pose_data, strength,
+            affect_mouth, affect_brows, affect_eyes, affect_jaw,
+            landmark_overrides_json: str = "",
+            pose_overrides_json: str = "",
+            gaze_overrides_json: str = "",
+            reference_image=None):
+
+        if reference_image is not None and isinstance(reference_image, torch.Tensor):
+            if reference_image.ndim != 4 or reference_image.shape[-1] != 3:
+                raise ValueError(
+                    f"WanFaceExpressionEditorUI: reference_image expected (B,H,W,3); "
+                    f"got {tuple(reference_image.shape)}"
+                )
+
+        with torch.inference_mode():
+            return self._run_impl(
+                pose_data, reference_pose_data, strength,
+                affect_mouth, affect_brows, affect_eyes, affect_jaw,
+                landmark_overrides_json, pose_overrides_json,
+                gaze_overrides_json, reference_image,
+            )
+
+    def _run_impl(self, pose_data, reference_pose_data, strength,
             affect_mouth, affect_brows, affect_eyes, affect_jaw,
             landmark_overrides_json: str = "",
             pose_overrides_json: str = "",
