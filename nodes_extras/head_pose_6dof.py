@@ -50,6 +50,8 @@ from typing import Optional
 import numpy as np
 import torch
 
+from .._is_changed_util import hash_args_and_kwargs
+
 
 # Canonical 3D model points (iBUG-68 indices, mm)
 _LM_INDICES = [30, 8, 36, 45, 39, 42, 48, 54, 6, 10, 27, 0, 16, 33]
@@ -177,7 +179,19 @@ class WanHeadPose6DoFV2:
             },
         }
 
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        return hash_args_and_kwargs(**kwargs)
+
     def execute(self, landmarks_json, image=None, image_width_override=0,
+                image_height_override=0, axis_length=6.0):
+        with torch.inference_mode():
+            return self._execute_impl(
+                landmarks_json, image, image_width_override,
+                image_height_override, axis_length,
+            )
+
+    def _execute_impl(self, landmarks_json, image=None, image_width_override=0,
                 image_height_override=0, axis_length=6.0):
         import cv2
 
@@ -189,6 +203,10 @@ class WanHeadPose6DoFV2:
             frames = [frames]
 
         if image is not None and image.numel() > 0:
+            if not isinstance(image, torch.Tensor) or image.ndim != 4 or image.shape[-1] != 3:
+                raise ValueError(
+                    f"WanHeadPose6DoFV2: image expected (B,H,W,3); got {tuple(image.shape)}"
+                )
             B, H, W, _ = image.shape
         else:
             H = int(image_height_override) or 720
