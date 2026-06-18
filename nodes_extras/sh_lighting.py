@@ -42,6 +42,7 @@ from typing import Optional
 import numpy as np
 import torch
 
+from .._is_changed_util import hash_args_and_kwargs
 
 # SH basis (real-valued, L=2, 9 components)
 # Coefficients from Ramamoorthi & Hanrahan 2001
@@ -161,7 +162,24 @@ class WanSHLightingTransferV2:
             },
         }
 
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        return hash_args_and_kwargs(**kwargs)
+
     def execute(self, source_image, source_normal, operation, rotate_yaw_deg, intensity,
+                source_albedo=None, target_image=None, target_normal=None, target_albedo=None):
+        for label, img in (("source_image", source_image), ("source_normal", source_normal)):
+            if not isinstance(img, torch.Tensor) or img.ndim != 4 or img.shape[-1] != 3:
+                raise ValueError(
+                    f"WanSHLightingTransferV2: {label} expected (B,H,W,3); got {tuple(getattr(img, 'shape', ()))}"
+                )
+        with torch.inference_mode():
+            return self._execute_impl(
+                source_image, source_normal, operation, rotate_yaw_deg, intensity,
+                source_albedo, target_image, target_normal, target_albedo,
+            )
+
+    def _execute_impl(self, source_image, source_normal, operation, rotate_yaw_deg, intensity,
                 source_albedo=None, target_image=None, target_normal=None, target_albedo=None):
 
         src_img = source_image.detach().cpu().numpy().astype(np.float32)
