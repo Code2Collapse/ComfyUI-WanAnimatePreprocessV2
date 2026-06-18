@@ -32,8 +32,7 @@ import json
 import math
 from typing import Optional
 
-
-def _kps_xy(kps):
+from .._is_changed_util import hash_args_and_kwargs(kps):
     if not isinstance(kps, list):
         return []
     out = []
@@ -125,6 +124,10 @@ class WanQualityScorerJitterV2:
                 "expression_coeffs_json": ("STRING", {"multiline": True, "default": ""}),
             },
         }
+
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        return hash_args_and_kwargs(**kwargs)
 
     def execute(self, pose_data_json, image_diagonal_px, confidence_threshold,
                 max_velocity_px, expression_window, bad_velocity_thr_px,
