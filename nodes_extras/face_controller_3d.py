@@ -68,7 +68,7 @@ import json
 import logging
 import math
 from copy import deepcopy
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 
@@ -83,12 +83,15 @@ from .expression_3d_coeffs import (
     _parse_coeffs_json,
     _read_face_normalised,
     _write_face_normalised,
+    propagate_expression_keyframes,
 )
 from ._face_helpers import (
     _parse_overrides as _parse_face_overrides_ui,
     _parse_gaze_overrides as _parse_gaze_overrides_ui,
     _apply_gaze_override_to_iris_entry,
     _get_body_kps,
+    _meta_height,
+    _meta_width,
     _set_body_kps,
 )
 
@@ -115,6 +118,65 @@ _POSE18_EDGES_UI: Tuple[Tuple[int, int], ...] = (
 )
 _GAZE_MAX_YAW_RAD   = math.radians(30.0)
 _GAZE_MAX_PITCH_RAD = math.radians(25.0)
+
+# Default editor-owned config (mirrors js/face_controller_3d.js FC3D_DEFAULT_CFG).
+_FC3D_DEFAULT_CFG: Dict[str, Any] = {
+    "expression_coeffs_json": "",
+    "expression_strength": 1.0,
+    "expression_clamp": 1.5,
+    "expression_clamp_per_axis_json": "",
+    "propagate_expression": "off",
+    "head_pose_json": "",
+    "head_yaw_deg": 0.0,
+    "head_pitch_deg": 0.0,
+    "head_roll_deg": 0.0,
+    "head_tx": 0.0,
+    "head_ty": 0.0,
+    "head_tz": 0.0,
+    "head_scale": 1.0,
+    "jaw_rot_deg": 0.0,
+    "neck_yaw_deg": 0.0,
+    "neck_pitch_deg": 0.0,
+    "propagate_head": "off",
+    "propagate_gaze": "off",
+    "gaze_json": "",
+    "gaze_yaw_deg": 0.0,
+    "gaze_pitch_deg": 0.0,
+    "blend_strength": 0.0,
+    "blend_mouth": True,
+    "blend_brows": False,
+    "blend_eyes": False,
+    "blend_jaw": False,
+    "use_metas": "edited",
+    "frame_start": -1,
+    "frame_end": -1,
+    "preview_frame_idx": 0,
+    "preview_size": 512,
+    "preview_max_video_frames": 120,
+}
+
+
+def _fc3d_default_config_json() -> str:
+    return json.dumps(_FC3D_DEFAULT_CFG, separators=(",", ":"))
+
+
+def _resolve_fc3d_run_params(
+    fc3d_config_json: str = "",
+    **legacy: Any,
+) -> Dict[str, Any]:
+    """Merge fc3d_config_json with legacy per-widget kwargs (old workflows)."""
+    cfg = dict(_FC3D_DEFAULT_CFG)
+    if fc3d_config_json and fc3d_config_json.strip():
+        try:
+            loaded = json.loads(fc3d_config_json)
+            if isinstance(loaded, dict):
+                cfg.update(loaded)
+        except json.JSONDecodeError as exc:
+            log.warning("fc3d_config_json ignored — not valid JSON: %s", exc)
+    for key in _FC3D_DEFAULT_CFG:
+        if key in legacy and legacy[key] is not None:
+            cfg[key] = legacy[key]
+    return cfg
 
 
 def _parse_pose_overrides_ui(blob: Optional[str]) -> Dict[int, Dict[int, Tuple[float, float]]]:
@@ -178,7 +240,7 @@ def _parse_range_deltas(
     every covered frame.  Per-frame absolute overrides (the ``frames``
     section) are applied *after* these and therefore win on conflicts.
     Coordinates are in the SAME normalised space as the per-frame section
-    (face: bbox-normalised, pose: image-normalised).
+    (face: image-normalised [0,1], pose: image-normalised).
     """
     if not blob or not blob.strip():
         return {}
@@ -352,6 +414,138 @@ def _apply_head_translation(
     return out
 
 
+# ----------------------------------------------------------------------
+# Additional rigid-edit helpers (head_scale, jaw rotation, neck rotation)
+# Plan ref: Phase 1.A — 4 new DOF for Face Director real-time editor.
+# ----------------------------------------------------------------------
+def _apply_head_scale(xy_norm: np.ndarray, scale: float) -> np.ndarray:
+    """Uniformly scale the 68 landmarks around the face centroid.
+
+    Distinct from `head_tz` which uses a perspective-style ``1/(1+tz)``
+    factor; `head_scale` is a direct linear multiplier (1.0 = no-op,
+    >1.0 = bigger face, <1.0 = smaller face). Clamped to [0.25, 4.0] so
+    the face never collapses to a point or explodes.
+    """
+    if abs(scale - 1.0) < 1e-4:
+        return xy_norm
+    s = float(np.clip(scale, 0.25, 4.0))
+    cx = float(xy_norm[:, 0].mean())
+    cy = float(xy_norm[:, 1].mean())
+    out = xy_norm.copy()
+    out[:, 0] = (out[:, 0] - cx) * s + cx
+    out[:, 1] = (out[:, 1] - cy) * s + cy
+    return out
+
+
+# iBUG-68 jaw region is landmarks 0..16 (the chin contour). The jaw
+# "hinge" sits roughly at the two outermost jaw points (0 and 16). We
+# rotate jaw landmarks 5..11 (the lower-chin arc) about the midpoint of
+# 0-16 to simulate jaw open/close. Positive jaw_rot_deg = open (chin
+# down in image), negative = close.
+_JAW_HINGE_LEFT_IDX  = 0
+_JAW_HINGE_RIGHT_IDX = 16
+_JAW_LOWER_IDX       = tuple(range(5, 12))   # 5..11 — the bottom arc
+# Mouth lower also follows the jaw a bit (50% weight) so closing the
+# jaw closes the lips realistically. Indices 56..58 = lower-lip outer,
+# 65..67 = lower-lip inner.
+_JAW_FOLLOW_MOUTH_IDX = (56, 57, 58, 65, 66, 67)
+
+
+def _apply_jaw_rotation(xy_norm: np.ndarray, jaw_deg: float) -> np.ndarray:
+    """Rotate the lower-jaw landmarks about the ear-to-ear hinge.
+
+    Models jaw open/close as a 2D rotation in image space (since the
+    hinge axis is essentially the line through the two ears, and we
+    don't have separate 3D depth for the jaw region beyond the canonical
+    model). Positive = open. Clamped to ±25° (anatomical limit for a
+    healthy adult ~45° max, we cap at 25 to stay visually plausible).
+    """
+    if abs(jaw_deg) < 1e-3:
+        return xy_norm
+    deg = float(np.clip(jaw_deg, -25.0, 25.0))
+    rad = math.radians(deg)
+    cos_t = math.cos(rad)
+    sin_t = math.sin(rad)
+    hx = 0.5 * float(xy_norm[_JAW_HINGE_LEFT_IDX, 0] + xy_norm[_JAW_HINGE_RIGHT_IDX, 0])
+    hy = 0.5 * float(xy_norm[_JAW_HINGE_LEFT_IDX, 1] + xy_norm[_JAW_HINGE_RIGHT_IDX, 1])
+    out = xy_norm.copy()
+    for idx in _JAW_LOWER_IDX:
+        dx = float(out[idx, 0]) - hx
+        dy = float(out[idx, 1]) - hy
+        out[idx, 0] = hx + dx * cos_t - dy * sin_t
+        out[idx, 1] = hy + dx * sin_t + dy * cos_t
+    # Lower-lip points follow the jaw at half weight so mouth tracks.
+    half = 0.5
+    for idx in _JAW_FOLLOW_MOUTH_IDX:
+        dx = float(out[idx, 0]) - hx
+        dy = float(out[idx, 1]) - hy
+        rx = hx + dx * cos_t - dy * sin_t
+        ry = hy + dx * sin_t + dy * cos_t
+        out[idx, 0] = float(out[idx, 0]) * (1.0 - half) + rx * half
+        out[idx, 1] = float(out[idx, 1]) * (1.0 - half) + ry * half
+    return out
+
+
+def _apply_neck_rotation_body(
+    body_xy: np.ndarray,
+    yaw_deg: float,
+    pitch_deg: float,
+) -> np.ndarray:
+    """Rotate the head-cluster body keypoints about the neck joint.
+
+    Operates on the OpenPose-18 keypoint layout (see _POSE18_JOINT_NAMES_UI):
+      neck         = idx 1  (rotation pivot)
+      nose         = idx 0
+      reye/leye    = idx 14, 15
+      rear/lear    = idx 16, 17
+
+    Positive yaw   → subject turns head to their LEFT (image right).
+    Positive pitch → subject looks UP (chin lifts; head-cluster Y
+                     decreases in image coords).
+    Clamped to ±60° yaw / ±45° pitch (anatomical comfort range).
+
+    Returns a NEW (18, 2) array (NaN values for missing joints are
+    preserved unchanged). Skips the rotation if both inputs are ~0.
+    """
+    if abs(yaw_deg) < 1e-3 and abs(pitch_deg) < 1e-3:
+        return body_xy
+    if body_xy is None or body_xy.shape[0] < 18:
+        return body_xy
+    yaw   = math.radians(float(np.clip(yaw_deg,   -60.0,  60.0)))
+    pitch = math.radians(float(np.clip(pitch_deg, -45.0,  45.0)))
+    # 2D approximation: yaw shrinks horizontal offset by cos(yaw);
+    # pitch shifts vertical offset by sin(pitch) * neck-to-joint distance.
+    # This is the same orthographic-projection trick as _apply_head_rotation
+    # but with NO canonical z (the head cluster has no per-joint z map),
+    # so yaw becomes a pure horizontal scale about the neck and pitch
+    # becomes a vertical translation proportional to the distance from
+    # the neck. Visually identical to a small head rotation for the
+    # range we allow.
+    neck = body_xy[1]
+    if np.isnan(neck[0]) or np.isnan(neck[1]):
+        return body_xy
+    nx, ny = float(neck[0]), float(neck[1])
+    out = body_xy.copy()
+    head_cluster = (0, 14, 15, 16, 17)
+    cos_y = math.cos(yaw)
+    sin_p = math.sin(pitch)
+    cos_p = math.cos(pitch)
+    for idx in head_cluster:
+        x, y = float(out[idx, 0]), float(out[idx, 1])
+        if np.isnan(x) or np.isnan(y):
+            continue
+        dx = x - nx
+        dy = y - ny
+        # Yaw scales x about neck; pitch rotates dy upward (subject looks
+        # up = chin lifts = head-cluster Y decreases since image Y grows
+        # downward, so we subtract sin_p * (-dy) ≈ +sin_p * dy).
+        new_dx = dx * cos_y
+        new_dy = dy * cos_p - sin_p * abs(dy)  # pitch lifts head up
+        out[idx, 0] = nx + new_dx
+        out[idx, 1] = ny + new_dy
+    return out
+
+
 def _propagate_head_overrides(
     base: Dict[int, Dict[str, float]],
     n_frames: int,
@@ -488,7 +682,11 @@ def _apply_head_rotation(
 # ----------------------------------------------------------------------
 # Pose-JSON parsing
 # ----------------------------------------------------------------------
-_POSE_KEYS = ("yaw", "pitch", "roll", "tx", "ty", "tz")
+# Plan ref: Phase 1.A — added "scale" (head_scale), "jaw" (jaw_rot_deg),
+# "nyaw"/"npitch" (neck yaw/pitch) so per-frame JSON pins can drive
+# every DOF the widgets expose.
+_POSE_KEYS = ("yaw", "pitch", "roll", "tx", "ty", "tz",
+              "scale", "jaw", "nyaw", "npitch")
 _GAZE_KEYS = ("yaw", "pitch")
 
 
@@ -698,6 +896,245 @@ def _eye_box_norm(xy_norm: np.ndarray) -> Tuple[float, float]:
 
 
 # ----------------------------------------------------------------------
+# Per-AU dampening (Face-Director plan P2).
+#
+# The global ``expression_clamp`` ceilings every one of the 12 FACS axes
+# at the same absolute value. Real direction wants *per-axis* control:
+# pin a single AU's ceiling lower (e.g. cap eye-close so a blink never
+# fully shuts) or scale an axis down (gain) without touching the others.
+#
+# Schema (``expression_clamp_per_axis_json``), keyed by AU name
+# (see _AXIS_NAMES). Each value is either a bare number (= ceiling) or
+# an object with optional ``clamp``/``max`` and ``gain``/``scale``::
+#
+#     {
+#       "eye_close_L": 0.6,                       # ceiling ±0.6
+#       "smile":       {"clamp": 0.9, "gain": 0.8},
+#       "brow_furrow": {"gain": 0.0}              # fully damp this AU
+#     }
+#
+# Axes absent from the map keep the global clamp and unity gain, so an
+# empty / missing blob is a perfect no-op (identical to the old path).
+# ----------------------------------------------------------------------
+def _parse_per_axis_clamp_json(blob: Optional[str]) -> Dict[str, Dict[str, float]]:
+    """Parse ``expression_clamp_per_axis_json`` → ``{au_name: {gain, cap}}``.
+
+    Tolerant: invalid JSON, unknown keys, and non-numeric values are
+    skipped silently (returns ``{}`` rather than raising) so a typo in
+    the editor never breaks a render.
+    """
+    if not blob or not str(blob).strip():
+        return {}
+    try:
+        data = json.loads(blob)
+    except (json.JSONDecodeError, TypeError):
+        log.warning("expression_clamp_per_axis_json ignored — not valid JSON.")
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    valid = set(_AXIS_NAMES)
+    out: Dict[str, Dict[str, float]] = {}
+    for name, spec in data.items():
+        if name not in valid:
+            continue
+        entry: Dict[str, float] = {}
+        if isinstance(spec, dict):
+            cmax = spec.get("clamp", spec.get("max"))
+            if cmax is not None:
+                try:
+                    entry["cap"] = abs(float(cmax))
+                except (TypeError, ValueError):
+                    pass
+            gain = spec.get("gain", spec.get("scale"))
+            if gain is not None:
+                try:
+                    entry["gain"] = float(gain)
+                except (TypeError, ValueError):
+                    pass
+        else:
+            try:
+                entry["cap"] = abs(float(spec))
+            except (TypeError, ValueError):
+                continue
+        if entry:
+            out[name] = entry
+    return out
+
+
+def _apply_per_axis_clamp(
+    c: np.ndarray,
+    per_axis_map: Dict[str, Dict[str, float]],
+    global_clamp: float,
+) -> np.ndarray:
+    """Apply per-AU gain then per-AU ceiling (capped by the global clamp).
+
+    ``c`` is the (``_N_AXES``,) coefficient vector AFTER global strength.
+    Axes with no per-axis entry get unity gain and the global ceiling,
+    so this reduces exactly to ``np.clip(c, -g, g)`` when the map is
+    empty — preserving the legacy behaviour bit-for-bit.
+    """
+    g = abs(float(global_clamp))
+    out = np.asarray(c, dtype=np.float32).copy()
+    if not per_axis_map:
+        return np.clip(out, -g, g)
+    for k in range(_N_AXES):
+        name = _AXIS_NAMES[k]
+        spec = per_axis_map.get(name)
+        gain = float(spec.get("gain", 1.0)) if spec else 1.0
+        cap = min(g, float(spec["cap"])) if (spec and "cap" in spec) else g
+        out[k] = float(np.clip(out[k] * gain, -cap, cap))
+    return out
+
+
+# ----------------------------------------------------------------------
+# Preview outputs (P1.C): preview_image, overlay_video, keyframes_csv,
+# pose_diff_json. Built AFTER the per-frame edit loop runs so the
+# rendered overlay reflects the final edited bundle.
+# ----------------------------------------------------------------------
+def _build_preview_outputs(
+    *,
+    metas: list,
+    iris_data: list,
+    input_face_snap: dict,
+    input_body_snap: dict,
+    n_frames: int,
+    lo: int,
+    hi: int,
+    preview_frame_idx: int,
+    preview_size: int,
+    preview_max_video_frames: int,
+    edges,
+    constants: dict,
+    head_overrides: dict,
+    gaze_overrides: dict,
+):
+    """Return ``(preview_image, overlay_video, keyframes_csv, pose_diff_json)``.
+
+    Imported lazily to keep module load fast and to avoid pulling
+    Pillow/torch on environments that only need the headless node.
+    """
+    from . import _face_overlay_render as _r
+
+    # ── Frame-range selection for the video batch ───────────────────
+    start = max(0, min(n_frames - 1, int(lo)))
+    end   = max(start, min(n_frames - 1, int(hi)))
+    vid_frames = list(range(start, end + 1))
+    if len(vid_frames) > preview_max_video_frames:
+        # Uniform decimation to stay under the cap.
+        step = (len(vid_frames) + preview_max_video_frames - 1) // preview_max_video_frames
+        vid_frames = vid_frames[::max(1, step)][:preview_max_video_frames]
+
+    # ── Render each frame in the chosen range ───────────────────────
+    rendered: list = []
+    for f_idx in vid_frames:
+        if f_idx >= len(metas):
+            continue
+        meta = metas[f_idx]
+        face_xy = _read_face_normalised(meta)
+        body_xy = _get_body_kps(meta)
+        iris_entry = iris_data[f_idx] if (
+            isinstance(iris_data, list) and f_idx < len(iris_data)
+        ) else None
+        frame_u8 = _r.render_overlay_frame(
+            meta=meta,
+            iris_entry=iris_entry if isinstance(iris_entry, dict) else None,
+            body_xy=body_xy,
+            out_size=preview_size,
+            edges=edges,
+            face_norm=face_xy,
+            frame_idx=f_idx,
+            n_frames=n_frames,
+        )
+        rendered.append(frame_u8)
+
+    overlay_video = _r.stack_to_batch(rendered)
+
+    # ── Single preview frame ────────────────────────────────────────
+    pidx = max(0, min(n_frames - 1, int(preview_frame_idx)))
+    if pidx in vid_frames:
+        # Reuse the already-rendered tile to avoid double work.
+        prev_u8 = rendered[vid_frames.index(pidx)]
+    elif 0 <= pidx < len(metas):
+        meta = metas[pidx]
+        face_xy = _read_face_normalised(meta)
+        body_xy = _get_body_kps(meta)
+        iris_entry = iris_data[pidx] if (
+            isinstance(iris_data, list) and pidx < len(iris_data)
+        ) else None
+        prev_u8 = _r.render_overlay_frame(
+            meta=meta,
+            iris_entry=iris_entry if isinstance(iris_entry, dict) else None,
+            body_xy=body_xy,
+            out_size=preview_size,
+            edges=edges,
+            face_norm=face_xy,
+            frame_idx=pidx,
+            n_frames=n_frames,
+        )
+    else:
+        # Empty bundle — render a blank tile so downstream image
+        # consumers don't crash.
+        prev_u8 = np.zeros((preview_size, preview_size, 3), dtype=np.uint8)
+    preview_image = _r.render_to_tensor(prev_u8)
+
+    # ── keyframes_csv: per-frame resolved DOF values ────────────────
+    # Columns: frame, yaw, pitch, roll, scale, jaw, neck_yaw,
+    #          neck_pitch, tx, ty, tz, gaze_yaw, gaze_pitch.
+    csv_lines = ["frame,yaw,pitch,roll,scale,jaw,neck_yaw,neck_pitch,"
+                 "tx,ty,tz,gaze_yaw,gaze_pitch"]
+    for f_idx in range(n_frames):
+        h = head_overrides.get(f_idx, {}) if isinstance(head_overrides, dict) else {}
+        g = gaze_overrides.get(f_idx, {}) if isinstance(gaze_overrides, dict) else {}
+        # Constants + per-frame deltas (scale multiplies; others add).
+        yaw    = constants["yaw"]    + float(h.get("yaw",    0.0))
+        pitch  = constants["pitch"]  + float(h.get("pitch",  0.0))
+        roll   = constants["roll"]   + float(h.get("roll",   0.0))
+        scale  = constants["scale"]  * float(h.get("scale",  1.0))
+        jaw    = constants["jaw"]    + float(h.get("jaw",    0.0))
+        nyaw   = constants["nyaw"]   + float(h.get("nyaw",   0.0))
+        npitch = constants["npitch"] + float(h.get("npitch", 0.0))
+        tx     = constants["tx"]     + float(h.get("tx",     0.0))
+        ty     = constants["ty"]     + float(h.get("ty",     0.0))
+        tz     = constants["tz"]     + float(h.get("tz",     0.0))
+        gyaw   = constants["gyaw"]   + float(g.get("yaw",    0.0))
+        gpitch = constants["gpitch"] + float(g.get("pitch",  0.0))
+        csv_lines.append(
+            f"{f_idx},{yaw:.4f},{pitch:.4f},{roll:.4f},{scale:.4f},"
+            f"{jaw:.4f},{nyaw:.4f},{npitch:.4f},"
+            f"{tx:.4f},{ty:.4f},{tz:.4f},{gyaw:.4f},{gpitch:.4f}"
+        )
+    keyframes_csv = "\n".join(csv_lines) + "\n"
+
+    # ── pose_diff_json: per-frame edit magnitude vs input ──────────
+    diffs: list = []
+    for f_idx in range(n_frames):
+        meta = metas[f_idx] if f_idx < len(metas) else None
+        entry: dict = {"i": f_idx}
+        if meta is not None:
+            face_now = _read_face_normalised(meta)
+            face_in = input_face_snap.get(f_idx)
+            if face_now is not None and face_in is not None and face_now.shape == face_in.shape:
+                d = np.linalg.norm(face_now - face_in, axis=1)
+                entry["face_max"]  = round(float(d.max()),  6)
+                entry["face_mean"] = round(float(d.mean()), 6)
+            body_now = _get_body_kps(meta)
+            body_in  = input_body_snap.get(f_idx)
+            if body_now is not None and body_in is not None and body_now.shape == body_in.shape:
+                mask = ~(np.isnan(body_now[:, 0]) | np.isnan(body_now[:, 1])
+                         | np.isnan(body_in[:, 0]) | np.isnan(body_in[:, 1]))
+                if mask.any():
+                    d = np.linalg.norm(body_now[mask] - body_in[mask], axis=1)
+                    entry["body_max"]  = round(float(d.max()),  6)
+                    entry["body_mean"] = round(float(d.mean()), 6)
+        diffs.append(entry)
+    pose_diff_json = json.dumps(
+        {"n_frames": n_frames, "frames": diffs}, separators=(",", ":"),
+    )
+
+    return preview_image, overlay_video, keyframes_csv, pose_diff_json
+
+
+# ----------------------------------------------------------------------
 # Node
 # ----------------------------------------------------------------------
 class WanFaceController3DV2:
@@ -717,132 +1154,84 @@ class WanFaceController3DV2:
         "no-op, so the same node covers any subset.\n\n"
         "Schemas: see source file docstring."
     )
-    RETURN_TYPES = ("POSEDATA", "STRING", "STRING")
-    RETURN_NAMES = ("pose_data", "info", "coeff_time_series_json")
+    RETURN_TYPES = ("POSEDATA", "STRING", "STRING",
+                    "IMAGE", "IMAGE", "STRING", "STRING",
+                    "FLOAT", "FLOAT", "FLOAT", "FLOAT", "FLOAT")
+    RETURN_NAMES = ("pose_data", "info", "coeff_time_series_json",
+                    "preview_image", "overlay_video",
+                    "keyframes_csv", "pose_diff_json",
+                    "lp_rotate_pitch", "lp_rotate_yaw", "lp_rotate_roll",
+                    "lp_pupil_x", "lp_pupil_y")
+    OUTPUT_TOOLTIPS = (
+        "", "", "", "", "", "", "",
+        "Head pitch for LivePortrait ExpressionEditor (clamped ±20°). Wire to rotate_pitch.",
+        "Head yaw for ExpressionEditor (clamped ±20°). Wire to rotate_yaw.",
+        "Head roll for ExpressionEditor (clamped ±20°). Wire to rotate_roll.",
+        "Gaze→pupil_x for ExpressionEditor (clamped ±15). Wire to pupil_x.",
+        "Gaze→pupil_y for ExpressionEditor (clamped ±15). Wire to pupil_y.",
+    )
     FUNCTION     = "run"
 
     @classmethod
     def INPUT_TYPES(cls):
         return {
-            "required": {
-                "pose_data": ("POSEDATA", {
-                    "tooltip": "Pose bundle with iBUG-68 face landmarks.",
-                }),
-            },
+            "required": {},
             "optional": {
-                # ── (2) Expression coeffs ────────────────────────────
-                "expression_coeffs_json": ("STRING", {
-                    "multiline": True, "default": "",
-                    "tooltip": "Per-frame and/or range expression coefficient JSON. "
-                               "Keys: " + ", ".join(_AXIS_NAMES),
+                # Either wire a pre-detected POSEDATA bundle here, OR wire
+                # `images` + `model` below to run ViTPose detection INSIDE this
+                # node (one node: video -> detect -> edit). Both paths supported.
+                "pose_data": ("POSEDATA", {
+                    "tooltip": "Pre-detected pose bundle (iBUG-68 face landmarks). "
+                               "OPTIONAL if you wire `images` + `model` to detect inside this node.",
                 }),
-                "expression_strength": ("FLOAT", {
-                    "default": 1.0, "min": -3.0, "max": 3.0, "step": 0.05,
-                    "tooltip": "Global multiplier on expression coefficients.",
+                "images": ("IMAGE", {
+                    "tooltip": "Video frames (B,H,W,3). Wire a video loader here to run ViTPose "
+                               "pose estimation INSIDE this node — no separate detector node needed.",
                 }),
-                "expression_clamp": ("FLOAT", {
-                    "default": 1.5, "min": 0.1, "max": 3.0, "step": 0.05,
-                    "tooltip": "Symmetric clamp on each expression coefficient.",
+                "model": ("POSEMODEL", {
+                    "tooltip": "ViTPose+YOLO bundle from 'ONNX Detection Model Loader (V2)'. Used for "
+                               "internal detection (when `images` is wired and `pose_data` is empty).",
                 }),
-                # ── (3) Head pose ────────────────────────────────────
-                "head_pose_json": ("STRING", {
-                    "multiline": True, "default": "",
-                    "tooltip": "Per-frame head pose JSON. Keys: yaw, pitch, roll (degrees).",
-                }),
-                "head_yaw_deg": ("FLOAT", {
-                    "default": 0.0, "min": -90.0, "max": 90.0, "step": 0.5,
-                    "tooltip": "Constant yaw applied to every frame (added to JSON).",
-                }),
-                "head_pitch_deg": ("FLOAT", {
-                    "default": 0.0, "min": -60.0, "max": 60.0, "step": 0.5,
-                }),
-                "head_roll_deg": ("FLOAT", {
-                    "default": 0.0, "min": -60.0, "max": 60.0, "step": 0.5,
-                }),
-                # ── (3b) Head translation (rigid 5-DOF extension) ────
-                # tx/ty in FACE-BBOX-WIDTH units (±0.5 ≈ half-face shift).
-                # tz is a depth-zoom signal: +tz pushes the face away
-                # (face shrinks); -tz brings it forward (grows). Clamped
-                # in _apply_head_translation so the zoom factor stays in
-                # [0.25x .. 4.0x].
-                "head_tx": ("FLOAT", {
-                    "default": 0.0, "min": -2.0, "max": 2.0, "step": 0.01,
-                    "tooltip": "Horizontal head shift in face-width units (+ = image right).",
-                }),
-                "head_ty": ("FLOAT", {
-                    "default": 0.0, "min": -2.0, "max": 2.0, "step": 0.01,
-                    "tooltip": "Vertical head shift in face-width units (+ = image down).",
-                }),
-                "head_tz": ("FLOAT", {
-                    "default": 0.0, "min": -0.75, "max": 3.0, "step": 0.01,
-                    "tooltip": "Depth shift: + pushes the face away (smaller), - brings it forward (larger).",
-                }),
-                # ── (3c) Rigid-pose propagation across the timeline ──
-                "propagate_head": (["off", "hold_last", "interpolate", "broadcast_first"], {
-                    "default": "off",
-                    "tooltip": (
-                        "How to fill timeline gaps between explicit head_pose_json pins:\n"
-                        "  off            – use pins where given, constants elsewhere.\n"
-                        "  hold_last      – step-function: each gap holds the previous pin.\n"
-                        "  interpolate    – DAW-style linear interpolation between pins.\n"
-                        "  broadcast_first – apply the first pin to every gap frame."
-                    ),
-                }),
-                "propagate_gaze": (["off", "hold_last", "interpolate", "broadcast_first"], {
-                    "default": "off",
-                    "tooltip": "Same propagation semantics for gaze_json pins.",
-                }),
-                # ── (4) Gaze ─────────────────────────────────────────
-                "gaze_json": ("STRING", {
-                    "multiline": True, "default": "",
-                    "tooltip": "Per-frame gaze JSON. Keys: yaw, pitch (degrees, ±30 saturates).",
-                }),
-                "gaze_yaw_deg": ("FLOAT", {
-                    "default": 0.0, "min": -30.0, "max": 30.0, "step": 0.5,
-                }),
-                "gaze_pitch_deg": ("FLOAT", {
-                    "default": 0.0, "min": -30.0, "max": 30.0, "step": 0.5,
-                }),
-                # ── (1) Reference blend ──────────────────────────────
+                "detection_threshold": ("FLOAT", {"default": 0.3, "min": 0.0, "max": 1.0, "step": 0.01,
+                    "tooltip": "Internal detection: YOLO person-detection confidence threshold."}),
+                "pose_threshold": ("FLOAT", {"default": 0.3, "min": 0.0, "max": 1.0, "step": 0.01,
+                    "tooltip": "Internal detection: per-keypoint confidence threshold."}),
+                "use_clahe": ("BOOLEAN", {"default": True,
+                    "tooltip": "Internal detection: CLAHE contrast enhancement on the pose crop."}),
+                "detect_rescale": ("FLOAT", {"default": 1.25, "min": 1.0, "max": 2.0, "step": 0.05,
+                    "tooltip": "Internal detection: bbox padding factor before the ViTPose crop."}),
+                "fallback_to_full_frame": ("BOOLEAN", {"default": True,
+                    "tooltip": "Internal detection: run ViTPose on the full frame when YOLO finds no person."}),
                 "reference_pose_data": ("POSEDATA", {
                     "tooltip": "Optional single-frame POSEDATA used as a region-wise shape target.",
                 }),
-                "blend_strength": ("FLOAT", {
-                    "default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05,
-                    "tooltip": "Reference-blend strength (0 = no blend, 1 = fully match reference).",
+                # All scalar / combo / multiline tunables live here; the in-canvas
+                # editor syncs this blob. Keeps LiteGraph node height minimal.
+                "fc3d_config_json": ("STRING", {
+                    "default": _fc3d_default_config_json(),
+                    "tooltip": "Editor-owned JSON for expression/head/gaze/blend/preview params. "
+                               "Synced automatically by face_controller_3d.js.",
                 }),
-                "blend_mouth": ("BOOLEAN", {"default": True}),
-                "blend_brows": ("BOOLEAN", {"default": False}),
-                "blend_eyes":  ("BOOLEAN", {"default": False}),
-                "blend_jaw":   ("BOOLEAN", {"default": False}),
-                # ── Common ───────────────────────────────────────────
-                "use_metas": (["edited", "original"], {
-                    "default": "edited",
-                    "tooltip": "'edited' = stack on pose_metas. 'original' = restart from pose_metas_original.",
-                }),
-                "frame_start": ("INT", {
-                    "default": -1, "min": -1, "max": 999999, "step": 1,
-                    "tooltip": "If >=0, only frames in [frame_start..frame_end] are touched. -1 = no clamp.",
-                }),
-                "frame_end": ("INT", {
-                    "default": -1, "min": -1, "max": 999999, "step": 1,
-                }),
-                # ── Hidden override JSON inputs driven by the in-canvas
-                #    viewer UI (face landmark drags, body-joint drags,
-                #    gaze-handle drags). All face-bbox-normalised /
-                #    image-normalised / radian-encoded — see js/face_controller_3d.js.
                 "landmark_overrides_json": ("STRING", {
-                    "multiline": True, "default": "",
-                    "tooltip": 'JSON {"frames":{"<idx>":{"<lm>":[x_bbox_norm,y_bbox_norm]}}} from the in-canvas face viewer. Empty = no override.',
+                    "default": "",
+                    "tooltip": 'JSON {"frames":{"<idx>":{"<lm>":[x_img_norm,y_img_norm]}}} from the in-canvas face viewer (image-normalised 0..1). Empty = no override.',
                 }),
                 "pose_overrides_json": ("STRING", {
-                    "multiline": True, "default": "",
+                    "default": "",
                     "tooltip": 'JSON {"frames":{"<idx>":{"<joint>":[x_img_norm,y_img_norm]}}} from the in-canvas pose viewer (OpenPose-18).',
                 }),
                 "gaze_overrides_json": ("STRING", {
-                    "multiline": True, "default": "",
+                    "default": "",
                     "tooltip": 'JSON {"frames":{"<idx>":{"l":[yaw_rad,pitch_rad],"r":[yaw_rad,pitch_rad]}}} from the in-canvas gaze handles.',
                 }),
+            },
+            # ComfyUI standard hidden inputs. ``unique_id`` is the
+            # graph-side node id (string). Required by the
+            # ``/c2c/fc3d_preview`` route to key the bundle cache so
+            # the JS layer can request a live single-frame recompute
+            # without re-queueing the whole graph.
+            "hidden": {
+                "unique_id": "UNIQUE_ID",
             },
         }
 
@@ -851,39 +1240,312 @@ class WanFaceController3DV2:
         return _AXIS_NAMES
 
     # ------------------------------------------------------------------
+    # Cache key
+    # ------------------------------------------------------------------
+    @classmethod
+    def IS_CHANGED(cls, pose_data=None,
+                   images=None, model=None,
+                   detection_threshold: float = 0.3,
+                   pose_threshold: float = 0.3,
+                   use_clahe: bool = True,
+                   detect_rescale: float = 1.25,
+                   fallback_to_full_frame: bool = True,
+                   fc3d_config_json: str = "",
+                   reference_pose_data=None,
+                   landmark_overrides_json: str = "",
+                   pose_overrides_json: str = "",
+                   gaze_overrides_json: str = "",
+                   unique_id=None,
+                   **legacy_fc3d_kwargs) -> str:
+        """Stable content hash for ComfyUI's execution cache.
+
+        Returns a hex digest that changes IFF an output-affecting input
+        changed. This stops the expensive internal ViTPose detection
+        (triggered when ``images`` + ``model`` are wired and ``pose_data``
+        is empty) from re-running on every queue, while still recomputing
+        when the user edits the in-canvas config / overrides.
+
+        Never raises and never returns ``float("nan")``.
+        """
+        import hashlib
+
+        h = hashlib.md5()
+
+        def _feed(label: str, value) -> None:
+            h.update(label.encode("utf-8", "replace"))
+            h.update(b"\x00")
+            h.update(str(value).encode("utf-8", "replace"))
+            h.update(b"\x01")
+
+        # --- Editor-owned JSON blobs (the in-canvas editor syncs these). ---
+        _feed("fc3d_config_json", fc3d_config_json or "")
+        _feed("landmark_overrides_json", landmark_overrides_json or "")
+        _feed("pose_overrides_json", pose_overrides_json or "")
+        _feed("gaze_overrides_json", gaze_overrides_json or "")
+
+        # Legacy scalar/combo kwargs feed _resolve_fc3d_run_params(), so they
+        # affect the output and must be part of the key. Sort for stability.
+        try:
+            legacy_items = sorted(
+                (str(k), str(v)) for k, v in (legacy_fc3d_kwargs or {}).items()
+            )
+        except Exception:
+            legacy_items = []
+        _feed("legacy_fc3d_kwargs", legacy_items)
+
+        # --- Internal-detection parameters. ---
+        _feed("detection_threshold", detection_threshold)
+        _feed("pose_threshold", pose_threshold)
+        _feed("use_clahe", bool(use_clahe))
+        _feed("detect_rescale", detect_rescale)
+        _feed("fallback_to_full_frame", bool(fallback_to_full_frame))
+
+        # --- images: cheap-but-faithful tensor fingerprint (torch-free). ---
+        _feed("images", cls._fingerprint_tensor(images))
+
+        # --- model: stable identity (NOT id()/type, which vary per run). ---
+        _feed("model", cls._fingerprint_model(model))
+
+        # --- POSEDATA bundles: lightweight structural summary only. ---
+        _feed("pose_data", cls._fingerprint_posedata(pose_data))
+        _feed("reference_pose_data", cls._fingerprint_posedata(reference_pose_data))
+
+        return h.hexdigest()
+
+    @staticmethod
+    def _fingerprint_tensor(t) -> str:
+        """Cheap, deterministic fingerprint of an IMAGE tensor (or None).
+
+        Uses duck-typing so this module never has to import torch. Hashes
+        the full byte buffer when possible; falls back to a shape summary.
+        """
+        if t is None:
+            return "none"
+        try:
+            shape = tuple(getattr(t, "shape", ()) or ())
+            shape_str = str(shape)
+            # Prefer a content hash via the torch -> numpy -> bytes path.
+            if hasattr(t, "cpu") and hasattr(t, "numpy"):
+                try:
+                    arr = t.cpu().numpy()
+                    import hashlib
+                    return shape_str + ":" + hashlib.md5(arr.tobytes()).hexdigest()
+                except Exception:
+                    pass
+            # numpy array directly.
+            if hasattr(t, "tobytes"):
+                try:
+                    import hashlib
+                    return shape_str + ":" + hashlib.md5(t.tobytes()).hexdigest()
+                except Exception:
+                    pass
+            # Last resort: shape + dtype only (still stable for same input).
+            return shape_str + ":" + str(getattr(t, "dtype", ""))
+        except Exception:
+            return "unhashable_tensor"
+
+    @staticmethod
+    def _fingerprint_model(model) -> str:
+        """Stable identity for a POSEMODEL bundle (or None).
+
+        Avoids id()/type() (which change between runs). Prefers a path or
+        name attribute; falls back to a truncated repr.
+        """
+        if model is None:
+            return "none"
+        try:
+            for attr in ("path", "model_path", "name", "ckpt_name",
+                         "filename", "file", "model_name"):
+                val = getattr(model, attr, None)
+                if isinstance(val, str) and val:
+                    return attr + "=" + val
+            if isinstance(model, dict):
+                for key in ("path", "model_path", "name", "ckpt_name",
+                            "filename", "file", "model_name"):
+                    val = model.get(key)
+                    if isinstance(val, str) and val:
+                        return key + "=" + val
+                try:
+                    return "dictkeys=" + ",".join(sorted(str(k) for k in model.keys()))
+                except Exception:
+                    pass
+            return ("repr=" + repr(model))[:256]
+        except Exception:
+            return "unhashable_model"
+
+    @staticmethod
+    def _fingerprint_posedata(pd) -> str:
+        """Lightweight structural summary of a POSEDATA bundle (or None).
+
+        Does NOT serialise large landmark arrays naively. Summarises by
+        key set and per-frame metadata counts so it stays fast while still
+        changing when the structure changes.
+        """
+        if pd is None:
+            return "none"
+        try:
+            if isinstance(pd, dict):
+                summary: Dict[str, Any] = {}
+                for k in sorted(str(key) for key in pd.keys()):
+                    v = pd[k]
+                    if isinstance(v, (list, tuple)):
+                        summary[k] = "len=" + str(len(v))
+                    elif isinstance(v, dict):
+                        summary[k] = "keys=" + str(len(v))
+                    elif hasattr(v, "shape"):
+                        summary[k] = "shape=" + str(tuple(getattr(v, "shape", ()) or ()))
+                    else:
+                        summary[k] = ("scalar=" + str(v))[:64]
+                return json.dumps(summary, sort_keys=True, default=str)
+            if isinstance(pd, (list, tuple)):
+                return "seqlen=" + str(len(pd))
+            return ("repr=" + repr(pd))[:256]
+        except Exception:
+            return "unhashable_posedata"
+
+    # ------------------------------------------------------------------
     # Execution
     # ------------------------------------------------------------------
-    def run(self, pose_data,
-            expression_coeffs_json: str = "",
-            expression_strength: float = 1.0,
-            expression_clamp: float = 1.5,
-            head_pose_json: str = "",
-            head_yaw_deg: float = 0.0,
-            head_pitch_deg: float = 0.0,
-            head_roll_deg: float = 0.0,
-            head_tx: float = 0.0,
-            head_ty: float = 0.0,
-            head_tz: float = 0.0,
-            propagate_head: str = "off",
-            propagate_gaze: str = "off",
-            gaze_json: str = "",
-            gaze_yaw_deg: float = 0.0,
-            gaze_pitch_deg: float = 0.0,
+    def run(self, pose_data=None,
+            images=None, model=None,
+            detection_threshold: float = 0.3,
+            pose_threshold: float = 0.3,
+            use_clahe: bool = True,
+            detect_rescale: float = 1.25,
+            fallback_to_full_frame: bool = True,
+            fc3d_config_json: str = "",
             reference_pose_data=None,
-            blend_strength: float = 0.0,
-            blend_mouth: bool = True,
-            blend_brows: bool = False,
-            blend_eyes: bool = False,
-            blend_jaw: bool = False,
-            use_metas: str = "edited",
-            frame_start: int = -1,
-            frame_end: int = -1,
             landmark_overrides_json: str = "",
             pose_overrides_json: str = "",
-            gaze_overrides_json: str = ""):
+            gaze_overrides_json: str = "",
+            unique_id: Optional[str] = None,
+            **legacy_fc3d_kwargs):
 
+        cfg = _resolve_fc3d_run_params(fc3d_config_json, **legacy_fc3d_kwargs)
+        expression_coeffs_json = str(cfg.get("expression_coeffs_json", "") or "")
+        expression_strength = float(cfg.get("expression_strength", 1.0))
+        expression_clamp = float(cfg.get("expression_clamp", 1.5))
+        expression_clamp_per_axis_json = str(cfg.get("expression_clamp_per_axis_json", "") or "")
+        propagate_expression = str(cfg.get("propagate_expression", "off"))
+        head_pose_json = str(cfg.get("head_pose_json", "") or "")
+        head_yaw_deg = float(cfg.get("head_yaw_deg", 0.0))
+        head_pitch_deg = float(cfg.get("head_pitch_deg", 0.0))
+        head_roll_deg = float(cfg.get("head_roll_deg", 0.0))
+        head_tx = float(cfg.get("head_tx", 0.0))
+        head_ty = float(cfg.get("head_ty", 0.0))
+        head_tz = float(cfg.get("head_tz", 0.0))
+        head_scale = float(cfg.get("head_scale", 1.0))
+        jaw_rot_deg = float(cfg.get("jaw_rot_deg", 0.0))
+        neck_yaw_deg = float(cfg.get("neck_yaw_deg", 0.0))
+        neck_pitch_deg = float(cfg.get("neck_pitch_deg", 0.0))
+        propagate_head = str(cfg.get("propagate_head", "off"))
+        propagate_gaze = str(cfg.get("propagate_gaze", "off"))
+        gaze_json = str(cfg.get("gaze_json", "") or "")
+        gaze_yaw_deg = float(cfg.get("gaze_yaw_deg", 0.0))
+        gaze_pitch_deg = float(cfg.get("gaze_pitch_deg", 0.0))
+        blend_strength = float(cfg.get("blend_strength", 0.0))
+        blend_mouth = bool(cfg.get("blend_mouth", True))
+        blend_brows = bool(cfg.get("blend_brows", False))
+        blend_eyes = bool(cfg.get("blend_eyes", False))
+        blend_jaw = bool(cfg.get("blend_jaw", False))
+        use_metas = str(cfg.get("use_metas", "edited"))
+        frame_start = int(cfg.get("frame_start", -1))
+        frame_end = int(cfg.get("frame_end", -1))
+        preview_frame_idx = int(cfg.get("preview_frame_idx", 0))
+        preview_size = int(cfg.get("preview_size", 512))
+        preview_max_video_frames = int(cfg.get("preview_max_video_frames", 120))
+
+        # ── Input-frame backdrop cache (BEFORE detection) ───────────────
+        # Cache the INPUT frames for the editor's frame-by-frame backdrop as
+        # soon as we have them — independent of pose detection, so the
+        # input+pose overlay works even if detection later fails or is slow.
+        # Single image → 1 frame → constant backdrop. Best-effort.
+        _underlay_available = False
+        if unique_id is not None and images is not None:
+            try:
+                from . import _face_preview_server as _fps
+                imgs = images
+                if hasattr(imgs, "ndim") and imgs.ndim == 3:
+                    imgs = imgs[None]
+                n_img = int(imgs.shape[0])
+                cap = max(1, int(preview_max_video_frames))
+                if n_img > cap:
+                    step = (n_img + cap - 1) // cap
+                    idxs = list(range(0, n_img, step))[:cap]
+                else:
+                    idxs = list(range(n_img))
+                sub = imgs[idxs]
+                arr = sub.detach().cpu().numpy() if hasattr(sub, "detach") else np.asarray(sub)
+                arr = np.clip(arr * 255.0, 0, 255).astype(np.uint8)   # [n,H,W,3]
+                H0, W0 = int(arr.shape[1]), int(arr.shape[2])
+                if max(H0, W0) > 320:
+                    from PIL import Image as _PILImg
+                    sc = 320.0 / max(H0, W0)
+                    nh, nw = max(1, int(H0 * sc)), max(1, int(W0 * sc))
+                    small = np.empty((arr.shape[0], nh, nw, 3), dtype=np.uint8)
+                    for _i in range(arr.shape[0]):
+                        small[_i] = np.asarray(_PILImg.fromarray(arr[_i]).resize((nw, nh)))
+                    arr = small
+                _fps.underlay_put(str(unique_id), arr, idxs)
+                _underlay_available = True
+            except Exception as _exc:                                    # noqa: BLE001
+                log.debug("underlay cache skipped: %s", _exc)
+
+        # ── Internal pose estimation ────────────────────────────────────
+        # If no pre-detected pose_data was wired, run YOLO+ViTPose detection
+        # right here, so this single node covers video -> detect -> edit
+        # without a separate detector node.
         if not isinstance(pose_data, dict):
-            raise ValueError("pose_data is not a POSEDATA bundle (expected dict).")
+            if images is not None and model is not None:
+                try:
+                    from .pose_detect_vitpose import WanPoseDetectViTPoseV2
+                except Exception as _imp_exc:                            # noqa: BLE001
+                    raise ImportError(
+                        "WanFaceController3DV2 internal pose detection requires the "
+                        f"pose_detect_vitpose module, which failed to import: {_imp_exc}"
+                    )
+                log.info("WanFaceController3DV2: no pose_data wired — running internal "
+                         "ViTPose detection on the supplied images.")
+                det_bundle, _det_info = WanPoseDetectViTPoseV2().run(
+                    images, model,
+                    detection_threshold=float(detection_threshold),
+                    pose_threshold=float(pose_threshold),
+                    use_clahe=bool(use_clahe),
+                    rescale=float(detect_rescale),
+                    fallback_to_full_frame=bool(fallback_to_full_frame),
+                )
+                pose_data = det_bundle
+            else:
+                raise ValueError(
+                    "WanFaceController3DV2 has nothing to edit. Wire EITHER a POSEDATA "
+                    "bundle into 'pose_data', OR wire 'images' (video frames) + 'model' "
+                    "(POSEMODEL from 'ONNX Detection Model Loader (V2)') to run ViTPose "
+                    "detection inside this node."
+                )
+
+        # Stash the RAW input bundle for the live-preview server route
+        # so the JS gizmo can request single-frame recomputes between
+        # full queues. Best-effort: import failures must never break run.
+        if unique_id is not None:
+            try:
+                from . import _face_preview_server as _fps
+                _fps.cache_put(str(unique_id), pose_data)
+            except Exception as _exc:                                    # noqa: BLE001
+                log.debug("fc3d_preview cache_put skipped: %s", _exc)
+
+        # Snapshot input face landmarks + body kps per frame BEFORE
+        # editing — drives the pose_diff_json output (P1.C). Stored as
+        # plain numpy arrays so we don't deepcopy the whole bundle twice.
+        _input_face_snap: dict = {}
+        _input_body_snap: dict = {}
+        _src_metas_in = pose_data.get("pose_metas") or pose_data.get("pose_metas_original") or []
+        for _i, _m in enumerate(_src_metas_in):
+            _fxy = _read_face_normalised(_m)
+            if _fxy is not None:
+                _input_face_snap[_i] = _fxy.astype(np.float32, copy=True)
+            _bxy = _get_body_kps(_m)
+            if _bxy is not None:
+                _input_body_snap[_i] = _bxy.astype(np.float32, copy=True)
 
         bundle = deepcopy(pose_data)
         key = "pose_metas" if use_metas == "edited" else "pose_metas_original"
@@ -901,6 +1563,9 @@ class WanFaceController3DV2:
         expr_per_frame = _parse_coeffs_json(expression_coeffs_json, n_frames)
         expr_ranges    = _expand_range_overrides(expression_coeffs_json, n_frames)
         expr_overrides = _merge_overrides(expr_per_frame, expr_ranges)
+        expr_overrides = propagate_expression_keyframes(
+            expr_overrides, n_frames, str(propagate_expression),
+        )
 
         head_overrides = _parse_keyed_json(
             head_pose_json, n_frames, _POSE_KEYS, range_field="pose",
@@ -944,6 +1609,7 @@ class WanFaceController3DV2:
 
         clamp = float(expression_clamp)
         strn  = float(expression_strength)
+        per_axis_clamp_map = _parse_per_axis_clamp_json(expression_clamp_per_axis_json)
 
         for f_idx in range(n_frames):
             if f_idx < lo or f_idx > hi:
@@ -968,7 +1634,7 @@ class WanFaceController3DV2:
             # (2) Expression coeffs.
             c_vec = expr_overrides.get(f_idx)
             if c_vec is not None:
-                c = np.clip(c_vec * strn, -clamp, clamp)
+                c = _apply_per_axis_clamp(c_vec * strn, per_axis_clamp_map, clamp)
                 if np.any(np.abs(c) > 1e-6):
                     bw, bh = _face_bbox_size(xy_norm)
                     delta_bbox = np.einsum("k,klc->lc", c, _BASIS)
@@ -1007,9 +1673,39 @@ class WanFaceController3DV2:
                 n_rotated += 1  # counted under rigid edits
                 changed = True
 
+            # (3c) Head uniform scale around face centroid (linear,
+            # non-perspective). Distinct from tz.
+            hs = float(head_scale) * float(h_entry.get("scale", 1.0)) \
+                if "scale" in h_entry else float(head_scale)
+            if abs(hs - 1.0) > 1e-4:
+                xy_norm = _apply_head_scale(xy_norm, hs)
+                n_rotated += 1
+                changed = True
+
+            # (3d) Jaw rotation about ear-to-ear hinge.
+            jaw = float(jaw_rot_deg) + float(h_entry.get("jaw", 0.0))
+            if abs(jaw) > 1e-3:
+                xy_norm = _apply_jaw_rotation(xy_norm, jaw)
+                n_rotated += 1
+                changed = True
+
             if changed:
                 _write_face_normalised(meta, xy_norm.astype(np.float32))
                 affected += 1
+
+            # (3e) Neck rotation — affects BODY keypoints, not face
+            # landmarks. Applied AFTER the face write so that
+            # subsequent overlay rendering picks up both edits. Per-frame
+            # additive overrides under "nyaw"/"npitch" in head_pose_json
+            # are honoured.
+            nyaw = float(neck_yaw_deg)   + float(h_entry.get("nyaw",   0.0))
+            npitch = float(neck_pitch_deg) + float(h_entry.get("npitch", 0.0))
+            if abs(nyaw) > 1e-3 or abs(npitch) > 1e-3:
+                body_xy = _get_body_kps(meta)
+                if body_xy is not None:
+                    body_new = _apply_neck_rotation_body(body_xy, nyaw, npitch)
+                    _set_body_kps(meta, body_new)
+                    n_rotated += 1
 
             # (4) Gaze — operates on iris_data, independent of landmark
             # writes. Compute eye dimensions from the (potentially updated)
@@ -1043,6 +1739,10 @@ class WanFaceController3DV2:
             "constant_translation": {"tx": float(head_tx),
                                       "ty": float(head_ty),
                                       "tz": float(head_tz)},
+            "constant_extras": {"head_scale":   float(head_scale),
+                                 "jaw_rot_deg":  float(jaw_rot_deg),
+                                 "neck_yaw_deg": float(neck_yaw_deg),
+                                 "neck_pitch_deg": float(neck_pitch_deg)},
             "propagate_mode": str(propagate_head),
             "per_frame": {str(k): v for k, v in head_overrides.items()},
         }
@@ -1080,11 +1780,7 @@ class WanFaceController3DV2:
         n_face_ov = n_pose_ov = n_gaze_ov_u = 0
         n_face_delta = n_pose_delta = 0
 
-        # (5a) Range-delta propagation — a single-frame edit broadcast as a
-        #      delta across every frame in its range.  Applied BEFORE the
-        #      per-frame absolute overrides so explicit pins always win.
-        #      Face deltas are bbox-normalised → scaled by each frame's own
-        #      face bbox so the edit tracks scale/pose changes per frame.
+        # (5a) Range-delta propagation — image-normalised deltas (same as JS canvas).
         for f_idx, lm_map in face_delta.items():
             if not (0 <= f_idx < n_frames):
                 continue
@@ -1092,14 +1788,11 @@ class WanFaceController3DV2:
             xy_now = _read_face_normalised(meta)
             if xy_now is None:
                 continue
-            mn = xy_now.min(axis=0); mx = xy_now.max(axis=0)
-            bw = max(float(mx[0] - mn[0]), 1e-6)
-            bh = max(float(mx[1] - mn[1]), 1e-6)
             for lm_idx, (dxn, dyn) in lm_map.items():
                 if not (0 <= lm_idx < _N_LM):
                     continue
-                xy_now[lm_idx, 0] = float(xy_now[lm_idx, 0] + dxn * bw)
-                xy_now[lm_idx, 1] = float(xy_now[lm_idx, 1] + dyn * bh)
+                xy_now[lm_idx, 0] = float(min(1.0, max(0.0, xy_now[lm_idx, 0] + dxn)))
+                xy_now[lm_idx, 1] = float(min(1.0, max(0.0, xy_now[lm_idx, 1] + dyn)))
                 n_face_delta += 1
             _write_face_normalised(meta, xy_now.astype(np.float32))
 
@@ -1126,14 +1819,12 @@ class WanFaceController3DV2:
             xy_now = _read_face_normalised(meta)
             if xy_now is None:
                 continue
-            mn = xy_now.min(axis=0); mx = xy_now.max(axis=0)
-            bw = max(float(mx[0] - mn[0]), 1e-6)
-            bh = max(float(mx[1] - mn[1]), 1e-6)
             for lm_idx, (xn, yn) in lm_map.items():
                 if not (0 <= lm_idx < _N_LM):
                     continue
-                xy_now[lm_idx, 0] = float(mn[0] + xn * bw)
-                xy_now[lm_idx, 1] = float(mn[1] + yn * bh)
+                # JS canvas stores image-normalised [0,1] absolute landmark coords.
+                xy_now[lm_idx, 0] = float(min(1.0, max(0.0, xn)))
+                xy_now[lm_idx, 1] = float(min(1.0, max(0.0, yn)))
                 n_face_ov += 1
             _write_face_normalised(meta, xy_now.astype(np.float32))
 
@@ -1188,8 +1879,8 @@ class WanFaceController3DV2:
                         body_list.append([round(float(x), 5), round(float(y), 5)])
                 body_frames_ui.append({
                     "i": f_idx, "ok": True,
-                    "w": float(meta.get("width", 1.0)),
-                    "h": float(meta.get("height", 1.0)),
+                    "w": float(_meta_width(meta)),
+                    "h": float(_meta_height(meta)),
                     "kps": body_list,
                 })
             else:
@@ -1234,11 +1925,22 @@ class WanFaceController3DV2:
             + list(range(36, 48))            # eyes
             + list(range(48, 68))            # mouth
         )
+        face_frames_ui: list = []
+        for f_idx, meta in enumerate(metas):
+            xy_ui = _read_face_normalised(meta)
+            ent: dict = {"i": f_idx, "ok": xy_ui is not None}
+            if xy_ui is not None:
+                ent["lms"] = [
+                    [round(float(xy_ui[j, 0]), 5), round(float(xy_ui[j, 1]), 5)]
+                    for j in range(int(xy_ui.shape[0]))
+                ]
+            face_frames_ui.append(ent)
+
         overlay_meta = json.dumps({
             "selected": selectable_lms,
             "eye_emph": list(_EYE_EMPH_IDX),
             "d_norm":   [[0.0, 0.0] for _ in range(_N_LM)],
-            "frames":   [{"i": i, "ok": True} for i in range(n_frames)],
+            "frames":   face_frames_ui,
             "strength": 1.0,
             "pose": {
                 "format":      "openpose_18",
@@ -1251,9 +1953,60 @@ class WanFaceController3DV2:
                 "max_pitch_rad": _GAZE_MAX_PITCH_RAD,
                 "frames":        gaze_overlay_frames_ui,
             },
+            # Input-frame backdrop for the editor (drawn behind the pose,
+            # frame-by-frame, fetched lazily from /c2c/fc3d_underlay).
+            "underlay": {
+                "available": bool(_underlay_available),
+                "node_id":   str(unique_id) if unique_id is not None else "",
+                "n_frames":  int(n_frames),
+            },
         }, separators=(",", ":"))
+
+        # ── LivePortrait ExpressionEditor bridge values ────────────────
+        # The editor's head/gaze degrees, mapped+clamped to ExpressionEditor's
+        # ranges (rotate ±20°, pupil ±15) so the user can wire these straight
+        # into an ExpressionEditor (AdvancedLivePortrait) to warp the actual
+        # face crop WAN reads. Constant (frame-0) values; per-frame warping is
+        # the next step.
+        def _clamp(v, lo_, hi_):
+            return float(max(lo_, min(hi_, float(v))))
+        lp_rotate_pitch = _clamp(head_pitch_deg, -20.0, 20.0)
+        lp_rotate_yaw   = _clamp(head_yaw_deg,   -20.0, 20.0)
+        lp_rotate_roll  = _clamp(head_roll_deg,  -20.0, 20.0)
+        lp_pupil_x      = _clamp(gaze_yaw_deg   * 0.5, -15.0, 15.0)
+        lp_pupil_y      = _clamp(gaze_pitch_deg * 0.5, -15.0, 15.0)
 
         return {
             "ui":     {"overlay_meta": [overlay_meta]},
-            "result": (bundle, info, ts_json),
+            "result": (bundle, info, ts_json,
+                       *_build_preview_outputs(
+                           metas=metas,
+                           iris_data=iris_data,
+                           input_face_snap=_input_face_snap,
+                           input_body_snap=_input_body_snap,
+                           n_frames=n_frames,
+                           lo=lo, hi=hi,
+                           preview_frame_idx=int(preview_frame_idx),
+                           preview_size=int(preview_size),
+                           preview_max_video_frames=int(preview_max_video_frames),
+                           edges=_POSE18_EDGES_UI,
+                           constants={
+                               "yaw":    float(head_yaw_deg),
+                               "pitch":  float(head_pitch_deg),
+                               "roll":   float(head_roll_deg),
+                               "tx":     float(head_tx),
+                               "ty":     float(head_ty),
+                               "tz":     float(head_tz),
+                               "scale":  float(head_scale),
+                               "jaw":    float(jaw_rot_deg),
+                               "nyaw":   float(neck_yaw_deg),
+                               "npitch": float(neck_pitch_deg),
+                               "gyaw":   float(gaze_yaw_deg),
+                               "gpitch": float(gaze_pitch_deg),
+                           },
+                           head_overrides=head_overrides,
+                           gaze_overrides=gaze_overrides,
+                       ),
+                       lp_rotate_pitch, lp_rotate_yaw, lp_rotate_roll,
+                       lp_pupil_x, lp_pupil_y),
         }

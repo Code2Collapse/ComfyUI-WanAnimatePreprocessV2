@@ -31,6 +31,35 @@ import numpy as np
 
 log = logging.getLogger(__name__)
 
+_N_BODY_JOINTS = 18
+
+
+def _is_aa_pose_meta(meta) -> bool:
+    """True when *meta* is an :class:`~pose_utils.pose2d_utils.AAPoseMeta`."""
+    return (
+        meta is not None
+        and not isinstance(meta, dict)
+        and hasattr(meta, "kps_face")
+        and hasattr(meta, "width")
+        and hasattr(meta, "height")
+    )
+
+
+def _meta_width(meta, default: float = 1.0) -> float:
+    if isinstance(meta, dict):
+        return float(meta.get("width", default) or default)
+    if _is_aa_pose_meta(meta):
+        return float(getattr(meta, "width", default) or default)
+    return default
+
+
+def _meta_height(meta, default: float = 1.0) -> float:
+    if isinstance(meta, dict):
+        return float(meta.get("height", default) or default)
+    if _is_aa_pose_meta(meta):
+        return float(getattr(meta, "height", default) or default)
+    return default
+
 
 # Canonical max-gaze angle constants — must match gaze_blendshape.py so that
 # the JS drag offset (which is bbox-normalised) maps to the SAME (yaw, pitch)
@@ -47,7 +76,27 @@ def _get_body_kps(meta) -> np.ndarray | None:
     each item is either ``None`` (joint missing) or ``[x_norm, y_norm,
     (confidence?)]``. Missing joints are preserved as NaN so the JS
     overlay can hide them.
+
+    ``PoseAndFaceDetectionV2`` stores edited metas as
+    :class:`~pose_utils.pose2d_utils.AAPoseMeta` (pixel-space ``kps_body``);
+    those are normalised here on read.
     """
+    if _is_aa_pose_meta(meta):
+        kps = getattr(meta, "kps_body", None)
+        if kps is None:
+            return None
+        kps = np.asarray(kps, dtype=np.float32)
+        p_arr = getattr(meta, "kps_body_p", None)
+        w = max(_meta_width(meta), 1e-6)
+        h = max(_meta_height(meta), 1e-6)
+        out = np.full((_N_BODY_JOINTS, 2), np.nan, dtype=np.float32)
+        for i in range(min(_N_BODY_JOINTS, kps.shape[0])):
+            conf = float(p_arr[i]) if p_arr is not None and i < len(p_arr) else 1.0
+            if conf < 0.5:
+                continue
+            out[i, 0] = float(kps[i, 0]) / w
+            out[i, 1] = float(kps[i, 1]) / h
+        return out
     if not isinstance(meta, dict):
         return None
     arr = meta.get("keypoints_body")
@@ -66,13 +115,30 @@ def _get_body_kps(meta) -> np.ndarray | None:
     return out
 
 
-def _set_body_kps(meta: dict, xy_norm: np.ndarray) -> None:
+def _set_body_kps(meta, xy_norm: np.ndarray) -> None:
     """Write back (18, 2) image-normalised body keypoints into ``meta``.
 
     Preserves the original confidence (3rd component) when present, and
     keeps NaN-slots as None so downstream renderers can distinguish
     "edited" from "missing".
     """
+    if _is_aa_pose_meta(meta):
+        kps = getattr(meta, "kps_body", None)
+        if kps is None:
+            return
+        kps = np.asarray(kps, dtype=np.float32)
+        w = max(_meta_width(meta), 1e-6)
+        h = max(_meta_height(meta), 1e-6)
+        for i in range(min(_N_BODY_JOINTS, kps.shape[0], xy_norm.shape[0])):
+            x, y = float(xy_norm[i, 0]), float(xy_norm[i, 1])
+            if np.isnan(x) or np.isnan(y):
+                continue
+            kps[i, 0] = x * w
+            kps[i, 1] = y * h
+        meta.kps_body = kps
+        return
+    if not isinstance(meta, dict):
+        return
     src = meta.get("keypoints_body")
     if not isinstance(src, list):
         return
@@ -210,6 +276,9 @@ def _apply_gaze_override_to_iris_entry(entry: dict, eye_key: str,
 __all__ = [
     "_GAZE_MAX_YAW_RAD",
     "_GAZE_MAX_PITCH_RAD",
+    "_is_aa_pose_meta",
+    "_meta_width",
+    "_meta_height",
     "_get_body_kps",
     "_set_body_kps",
     "_parse_overrides",

@@ -197,8 +197,10 @@ export const i18n = Object.freeze({
     t, getLocale, setLocale, listLocales, addBundle, onLocaleChange,
 });
 
-// ── ComfyUI setting registration ──────────────────────────────────────────
-try {
+// ── ComfyUI setting registration (main CustomNodePacks copy only) ─────────
+const _C2C_I18N_SATELLITE = typeof import.meta?.url === "string"
+    && import.meta.url.includes("WanAnimatePreprocessV2");
+if (!_C2C_I18N_SATELLITE && !window.__C2C_I18N_REG__) { window.__C2C_I18N_REG__ = true; try {
     app.registerExtension({
         name: "C2C.I18n",
         settings: [
@@ -238,4 +240,4 @@ try {
             },
         ],
     });
-} catch (__c2cErr) { __c2cReport("_c2c_i18n", __c2cErr); }
+} catch (__c2cErr) { __c2cReport("_c2c_i18n", __c2cErr); } }

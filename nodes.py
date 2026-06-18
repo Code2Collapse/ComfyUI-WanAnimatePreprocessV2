@@ -477,6 +477,114 @@ offload_device = mm.unet_offload_device()
 
 folder_paths.add_model_folder_path("detection", os.path.join(folder_paths.models_dir, "detection"))
 
+
+def _ensure_onnx_detection_support():
+    """Make our nodes detect `.onnx` even when ComfyUI's folder extension
+    filter omits it. ComfyUI's `get_filename_list` only returns files whose
+    extension is registered for the folder; `.onnx` is not in the default set,
+    so detection models silently fail to list. We force-register `.onnx`
+    (plus the usual weight extensions) for the `detection` folder, creating the
+    entry and the directory if needed, and bust the filename cache.
+    """
+    exts = {".onnx", ".pt", ".pth", ".safetensors", ".bin"}
+    extra_dirs = []
+    try:
+        det = os.path.join(folder_paths.models_dir, "detection")
+        os.makedirs(det, exist_ok=True)
+        extra_dirs.append(det)
+        # also surface a couple of common alt locations users drop ONNX into
+        for alt in ("onnx", "ultralytics", "vitpose", "yolo"):
+            p = os.path.join(folder_paths.models_dir, alt)
+            if os.path.isdir(p):
+                extra_dirs.append(p)
+    except Exception:
+        pass
+    try:
+        entry = folder_paths.folder_names_and_paths.get("detection")
+        if entry is None:
+            folder_paths.folder_names_and_paths["detection"] = (list(extra_dirs), set(exts))
+        else:
+            paths, e = entry[0], entry[1]
+            for d in extra_dirs:
+                if d not in paths:
+                    paths.append(d)
+            try:
+                e.update(exts)                      # mutate existing set
+            except (AttributeError, TypeError):
+                folder_paths.folder_names_and_paths["detection"] = (paths, set(e) | exts)
+    except Exception as _e:
+        print(f"[WanAnimateV2] .onnx detection registration warning: {_e}")
+    # bust caches so the new extension takes effect immediately
+    for attr in ("filename_list_cache", "cache_helper"):
+        try:
+            c = getattr(folder_paths, attr, None)
+            if isinstance(c, dict):
+                c.pop("detection", None)
+        except Exception:
+            pass
+
+
+_ensure_onnx_detection_support()
+
+
+def list_onnx_detection_models():
+    """Robust model list for the detection dropdowns: prefer ComfyUI's
+    `get_filename_list("detection")`, but ALSO scan the detection folder(s) on
+    disk for `*.onnx` directly — so files show up even if folder_paths refuses
+    to (the user's explicit requirement: ours must detect `.onnx` regardless).
+    """
+    names = []
+    seen = set()
+
+    def _add(n):
+        if not n:
+            return
+        n = n.replace("\\", "/")          # normalise so disk-scan + folder_paths dedupe
+        if n not in seen:
+            seen.add(n)
+            names.append(n)
+
+    try:
+        for n in folder_paths.get_filename_list("detection"):
+            _add(n)
+    except Exception:
+        pass
+    try:
+        for base in folder_paths.get_folder_paths("detection"):
+            if not base or not os.path.isdir(base):
+                continue
+            for root, _dirs, files in os.walk(base):
+                for f in files:
+                    if f.lower().endswith((".onnx", ".pt", ".pth", ".safetensors")):
+                        rel = os.path.relpath(os.path.join(root, f), base)
+                        _add(rel.replace("\\", "/"))
+    except Exception:
+        pass
+    return names if names else ["(place .onnx models in ComfyUI/models/detection)"]
+
+
+def _resolve_detection_path(name):
+    """Path resolver that tolerates names discovered by the disk scan even if
+    folder_paths can't map them (mirrors list_onnx_detection_models)."""
+    try:
+        p = folder_paths.get_full_path("detection", name)
+        if p and os.path.exists(p):
+            return p
+    except Exception:
+        pass
+    try:
+        for base in folder_paths.get_folder_paths("detection"):
+            cand = os.path.join(base, name.replace("/", os.sep))
+            if os.path.exists(cand):
+                return cand
+    except Exception:
+        pass
+    raise FileNotFoundError(
+        f"Detection model {name!r} not found under ComfyUI/models/detection/. "
+        f"Place the .onnx file there (or check the name)."
+    )
+
+
 from .models.onnx_models import ViTPose, Yolo
 from .pose_utils.pose2d_utils import load_pose_metas_from_kp2ds_seq, crop, bbox_from_detector
 from .utils import (
@@ -951,8 +1059,8 @@ class OnnxDetectionModelLoaderV2:
     def INPUT_TYPES(s):
         return {
             "required": {
-                "vitpose_model": (folder_paths.get_filename_list("detection"), {"tooltip": "ViTPose ONNX file (e.g. vitpose-h.onnx). Place in ComfyUI/models/detection/."}),
-                "yolo_model":    (folder_paths.get_filename_list("detection"), {"tooltip": "YOLO person-detector ONNX file. Place in ComfyUI/models/detection/."}),
+                "vitpose_model": (list_onnx_detection_models(), {"tooltip": "ViTPose ONNX file (e.g. vitpose-h.onnx). Place in ComfyUI/models/detection/. .onnx is always listed here even if ComfyUI hides it elsewhere."}),
+                "yolo_model":    (list_onnx_detection_models(), {"tooltip": "YOLO person-detector ONNX file. Place in ComfyUI/models/detection/. .onnx always listed."}),
                 "onnx_device":   (["CUDAExecutionProvider", "CPUExecutionProvider"], {"default": "CUDAExecutionProvider", "tooltip": "Execution provider for ONNX Runtime. CUDA is much faster; CPU is the safe fallback."}),
             },
         }
@@ -964,8 +1072,8 @@ class OnnxDetectionModelLoaderV2:
     CATEGORY = "WanAnimatePreprocess_V2"
 
     def loadmodel(self, vitpose_model, yolo_model, onnx_device):
-        vitpose_model_path = folder_paths.get_full_path_or_raise("detection", vitpose_model)
-        yolo_model_path = folder_paths.get_full_path_or_raise("detection", yolo_model)
+        vitpose_model_path = _resolve_detection_path(vitpose_model)
+        yolo_model_path = _resolve_detection_path(yolo_model)
 
         # ─── Pre-flight: validate that each file has the expected input shape ──
         # The detection pipeline hard-codes input sizes per role:
@@ -2148,6 +2256,12 @@ class PoseAndFaceDetectionV2:
                                 pass
                         e['magnitude'] = float(math.hypot(e['yaw_rad'], e['pitch_rad']))
                         iris_result[f'{eye_name}_gaze'] = e
+                        # Eye-socket reference frame for the 3D→2D iris
+                        # projection in the gaze-repaint step (C0.1).
+                        iris_result[f'{eye_name}_eye_ref'] = {
+                            'cx': float(ref['cx']), 'cy': float(ref['cy']),
+                            'hw': float(ref['hw']),
+                        }
                     iris_result['blendshapes'] = mp_result.get('blendshapes', {})
                 else:
                     # Legacy fallback: 2D iris-offset gaze (kept for
@@ -2199,6 +2313,12 @@ class PoseAndFaceDetectionV2:
                                 'pitch_rad': 0.0,
                                 'source': 'iris_offset_2d',
                             }
+                        # Eye-socket reference frame for the 3D→2D iris
+                        # projection in the gaze-repaint step (C0.1).
+                        iris_result[f'{eye_name}_eye_ref'] = {
+                            'cx': float(ref['cx']), 'cy': float(ref['cy']),
+                            'hw': float(ref['hw']),
+                        }
                 all_iris.append(iris_result)
                 all_lip_ratios.append(float(mp_result['lip_openness_ratio']))
             else:
@@ -2414,19 +2534,59 @@ class PoseAndFaceDetectionV2:
                         _dx  = float(_gaze.get("dx", 0.0))
                         _dy  = float(_gaze.get("dy", 0.0))
                         _mn  = float(_gaze.get("magnitude_norm", 0.0))
-                        _cx0 = int(round((_ipx - float(_x1)) * _sx))
-                        _cy0 = int(round((_ipy - float(_y1)) * _sy))
+                        _yaw   = float(_gaze.get("yaw_rad", 0.0))
+                        _pitch = float(_gaze.get("pitch_rad", 0.0))
+                        _ref = _it.get(f"{_eye}_eye_ref") if isinstance(_it, dict) else None
                         _cr  = max(2, int(round(_ir * 0.5 * (_sx + _sy))))
-                        _shift = _cr * _GAIN * _mn
-                        _cx1 = int(round(_cx0 + _dx * _shift))
-                        _cy1 = int(round(_cy0 + _dy * _shift))
+                        # Detected iris position in crop coords (erased in
+                        # "replace" mode so two pupils never coexist).
+                        _ex0 = int(round((_ipx - float(_x1)) * _sx))
+                        _ey0 = int(round((_ipy - float(_y1)) * _sy))
+                        if _ref and float(_ref.get("hw", 0.0)) > 1.0:
+                            # 3D→2D eyeball projection (user spec): anchor at
+                            # the eye-SOCKET centre and place the iris at
+                            # R_eye·sin(gaze_angle) along the head-corrected
+                            # gaze direction — the absolute position a real
+                            # eyeball shows. The old code shifted the DETECTED
+                            # iris (which already encodes gaze) even further —
+                            # double-counting — by the arbitrary scale
+                            # iris_radius×3, so Wan Animate received wrong
+                            # eyeball directions.
+                            _ecx = (float(_ref["cx"]) - float(_x1)) * _sx
+                            _ecy = (float(_ref["cy"]) - float(_y1)) * _sy
+                            _hw_px = float(_ref["hw"]) * 0.5 * (_sx + _sy)
+                            _R = _hw_px * 1.04        # eyeball radius ≈ socket half-width
+                            _ang = math.hypot(_yaw, _pitch)
+                            if _ang > 1e-6:
+                                _off = _R * math.sin(min(_ang, 1.2))
+                            else:
+                                # legacy 2D source: magnitude_norm is defined
+                                # as offset/half-width — reconstruct directly.
+                                _off = _hw_px * _mn
+                            _ux, _uy, _un = _dx, _dy, math.hypot(_dx, _dy)
+                            if _un < 1e-6 and _ang > 1e-6:
+                                _ux, _uy = math.sin(_yaw), -math.sin(_pitch)
+                                _un = math.hypot(_ux, _uy)
+                            if _un > 1e-6:
+                                _ux, _uy = _ux / _un, _uy / _un
+                            # Clamp inside the palpebral opening so the iris
+                            # is never painted over the eyelids.
+                            _u = max(-0.92 * _hw_px, min(0.92 * _hw_px, _ux * _off))
+                            _v = max(-0.55 * _hw_px, min(0.55 * _hw_px, _uy * _off))
+                            _cx1 = int(round(_ecx + _u))
+                            _cy1 = int(round(_ecy + _v))
+                        else:
+                            # Old bundles without eye_ref: keep legacy shift.
+                            _shift = _cr * _GAIN * _mn
+                            _cx1 = int(round(_ex0 + _dx * _shift))
+                            _cy1 = int(round(_ey0 + _dy * _shift))
                         # Clamp to crop interior.
-                        _cx0 = max(_cr, min(511 - _cr, _cx0))
-                        _cy0 = max(_cr, min(511 - _cr, _cy0))
+                        _ex0 = max(_cr, min(511 - _cr, _ex0))
+                        _ey0 = max(_cr, min(511 - _cr, _ey0))
                         _cx1 = max(_cr, min(511 - _cr, _cx1))
                         _cy1 = max(_cr, min(511 - _cr, _cy1))
                         if _gaze_paint_mode == "replace":
-                            cv2.circle(_crop, (_cx0, _cy0), _cr, _EYE_WHITE, -1, lineType=cv2.LINE_AA)
+                            cv2.circle(_crop, (_ex0, _ey0), _cr, _EYE_WHITE, -1, lineType=cv2.LINE_AA)
                         cv2.circle(_crop, (_cx1, _cy1), _cr, _IRIS_COLOR, -1, lineType=cv2.LINE_AA)
                 # face_images_tensor shares memory with face_images_np;
                 # rebind defensively in case cv2 returned a new array.
