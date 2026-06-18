@@ -72,6 +72,8 @@ from typing import Dict, Tuple
 
 import numpy as np
 
+from .._is_changed_util import hash_args_and_kwargs
+
 log = logging.getLogger(__name__)
 
 
@@ -586,6 +588,10 @@ class WanExpression3DCoeffsV2:
     def axis_names(cls) -> Tuple[str, ...]:
         """Public accessor so JS / editor UI can ask for the canonical list."""
         return _AXIS_NAMES
+
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        return hash_args_and_kwargs(**kwargs)
 
     def run(self, pose_data,
             expression_coeffs_json: str = "",
