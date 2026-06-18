@@ -51,6 +51,8 @@ from typing import Optional
 import numpy as np
 import torch
 
+from .._is_changed_util import hash_args_and_kwargs
+
 try:
     import folder_paths  # type: ignore
 except Exception:                              # ComfyUI not in path (tests)
@@ -374,8 +376,28 @@ class WanGazeETHXGazeV2:
             },
         }
 
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        return hash_args_and_kwargs(**kwargs)
+
     # ── core ──
     def run(self, pose_data, images, checkpoint,
+            checkpoint_path_override: str = "",
+            device: str = "auto",
+            blend: float = 1.0,
+            batch_size: int = 8):
+        if isinstance(images, torch.Tensor):
+            if images.ndim != 4 or images.shape[-1] != 3:
+                raise ValueError(
+                    f"WanGazeETHXGazeV2: images expected (B,H,W,3); got {tuple(images.shape)}"
+                )
+        with torch.inference_mode():
+            return self._run_impl(
+                pose_data, images, checkpoint,
+                checkpoint_path_override, device, blend, batch_size,
+            )
+
+    def _run_impl(self, pose_data, images, checkpoint,
             checkpoint_path_override: str = "",
             device: str = "auto",
             blend: float = 1.0,
@@ -459,33 +481,32 @@ class WanGazeETHXGazeV2:
 
         # 2) Batched inference.
         n_pred = 0
-        with torch.inference_mode():
-            for i0 in range(0, len(crops), b):
-                batch = crops[i0:i0 + b]
-                if not batch:
-                    break
-                ts = [_to_input_tensor(c, dev) for c in batch]
-                x = torch.cat(ts, dim=0)
-                y = net(x).detach().cpu().numpy()
-                for k, (pitch_yaw) in enumerate(y):
-                    pitch_rad = float(pitch_yaw[0])
-                    yaw_rad   = float(pitch_yaw[1])
-                    fi = crop_fi[i0 + k]
-                    entry = new_iris[fi]
-                    # Blend with existing gaze if the user wants partial replacement.
-                    if blend < 1.0:
-                        prev_l = entry.get("left_gaze")  or {}
-                        prev_r = entry.get("right_gaze") or {}
-                        py = (1.0 - blend) * float(prev_l.get("yaw_rad",   0.0)) + blend * yaw_rad
-                        pp = (1.0 - blend) * float(prev_l.get("pitch_rad", 0.0)) + blend * pitch_rad
-                        _patch_gaze_entry(entry, "left",  py, pp)
-                        ry = (1.0 - blend) * float(prev_r.get("yaw_rad",   0.0)) + blend * yaw_rad
-                        rp = (1.0 - blend) * float(prev_r.get("pitch_rad", 0.0)) + blend * pitch_rad
-                        _patch_gaze_entry(entry, "right", ry, rp)
-                    else:
-                        _patch_gaze_entry(entry, "left",  yaw_rad, pitch_rad)
-                        _patch_gaze_entry(entry, "right", yaw_rad, pitch_rad)
-                    n_pred += 1
+        for i0 in range(0, len(crops), b):
+            batch = crops[i0:i0 + b]
+            if not batch:
+                break
+            ts = [_to_input_tensor(c, dev) for c in batch]
+            x = torch.cat(ts, dim=0)
+            y = net(x).detach().cpu().numpy()
+            for k, (pitch_yaw) in enumerate(y):
+                pitch_rad = float(pitch_yaw[0])
+                yaw_rad   = float(pitch_yaw[1])
+                fi = crop_fi[i0 + k]
+                entry = new_iris[fi]
+                # Blend with existing gaze if the user wants partial replacement.
+                if blend < 1.0:
+                    prev_l = entry.get("left_gaze")  or {}
+                    prev_r = entry.get("right_gaze") or {}
+                    py = (1.0 - blend) * float(prev_l.get("yaw_rad",   0.0)) + blend * yaw_rad
+                    pp = (1.0 - blend) * float(prev_l.get("pitch_rad", 0.0)) + blend * pitch_rad
+                    _patch_gaze_entry(entry, "left",  py, pp)
+                    ry = (1.0 - blend) * float(prev_r.get("yaw_rad",   0.0)) + blend * yaw_rad
+                    rp = (1.0 - blend) * float(prev_r.get("pitch_rad", 0.0)) + blend * pitch_rad
+                    _patch_gaze_entry(entry, "right", ry, rp)
+                else:
+                    _patch_gaze_entry(entry, "left",  yaw_rad, pitch_rad)
+                    _patch_gaze_entry(entry, "right", yaw_rad, pitch_rad)
+                n_pred += 1
 
         out_bundle = dict(pose_data)
         out_bundle["iris_data"] = new_iris
