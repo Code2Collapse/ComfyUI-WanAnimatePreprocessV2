@@ -46,6 +46,7 @@ import math
 from typing import Any, Dict, List, Optional, Tuple
 
 from . import _interrupt_check as _IC
+from ._is_changed_util import hash_args_and_kwargs
 script_directory = os.path.dirname(os.path.abspath(__file__))
 
 # ---------------------------------------------------
@@ -1071,6 +1072,10 @@ class OnnxDetectionModelLoaderV2:
     FUNCTION = "loadmodel"
     CATEGORY = "WanAnimatePreprocess_V2"
 
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        return hash_args_and_kwargs(**kwargs)
+
     def loadmodel(self, vitpose_model, yolo_model, onnx_device):
         vitpose_model_path = _resolve_detection_path(vitpose_model)
         yolo_model_path = _resolve_detection_path(yolo_model)
@@ -1413,7 +1418,112 @@ class PoseAndFaceDetectionV2:
     FUNCTION = "process"
     CATEGORY = "WanAnimatePreprocess_V2"
 
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        return hash_args_and_kwargs(**kwargs)
+
     def process(
+        self,
+        model,
+        images,
+        width,
+        height,
+        detection_threshold,
+        pose_threshold,
+        use_clahe,
+        use_blur_for_pose,
+        blur_radius,
+        blur_sigma,
+        use_face_smoothing,
+        face_smoothing_strength,
+        use_constant_face_box,
+        face_box_size_px,
+        use_iris_smoothing,
+        iris_smoothing_strength,
+        iris_smoothing_method="one_euro",
+        iris_one_euro_min_cutoff=1.0,
+        iris_one_euro_beta=0.05,
+        gaze_lock_eyes=True,
+        gaze_lock_strength=0.7,
+        use_mediapipe_face=True,
+        use_blendshape_gaze=True,
+        gaze_engine="blendshape_head_corrected",
+        gaze_kalman_meas_std_deg=3.0,
+        gaze_kalman_process_std=0.8,
+        gaze_fps=30.0,
+        gaze_one_euro_min_cutoff=1.7,
+        gaze_one_euro_beta=0.3,
+        gaze_max_yaw_deg=30.0,
+        gaze_max_pitch_deg=25.0,
+        crop_mode="default",
+        frame0_cx=-1,
+        frame0_cy=-1,
+        frame0_size=0,
+        keyframes_json="[]",
+        smoothing_method="one_euro",
+        crop_one_euro_min_cutoff=1.0,
+        crop_one_euro_beta=0.05,
+        crop_gaussian_window=7,
+        eye_align_mode="default",
+        eye_y_fraction=0.30,
+        face_cfg_scale=1.0,
+        apply_gaze_to_face_image="off",
+        bbox_override=None,
+    ):
+        if not isinstance(images, torch.Tensor) or images.ndim != 4 or images.shape[-1] != 3:
+            raise ValueError(
+                f"PoseAndFaceDetectionV2: expected IMAGE (B,H,W,3); got {tuple(getattr(images, 'shape', ()))}"
+            )
+        with torch.inference_mode():
+            return self._process_impl(
+                model,
+                images,
+                width,
+                height,
+                detection_threshold,
+                pose_threshold,
+                use_clahe,
+                use_blur_for_pose,
+                blur_radius,
+                blur_sigma,
+                use_face_smoothing,
+                face_smoothing_strength,
+                use_constant_face_box,
+                face_box_size_px,
+                use_iris_smoothing,
+                iris_smoothing_strength,
+                iris_smoothing_method,
+                iris_one_euro_min_cutoff,
+                iris_one_euro_beta,
+                gaze_lock_eyes,
+                gaze_lock_strength,
+                use_mediapipe_face,
+                use_blendshape_gaze,
+                gaze_engine,
+                gaze_kalman_meas_std_deg,
+                gaze_kalman_process_std,
+                gaze_fps,
+                gaze_one_euro_min_cutoff,
+                gaze_one_euro_beta,
+                gaze_max_yaw_deg,
+                gaze_max_pitch_deg,
+                crop_mode,
+                frame0_cx,
+                frame0_cy,
+                frame0_size,
+                keyframes_json,
+                smoothing_method,
+                crop_one_euro_min_cutoff,
+                crop_one_euro_beta,
+                crop_gaussian_window,
+                eye_align_mode,
+                eye_y_fraction,
+                face_cfg_scale,
+                apply_gaze_to_face_image,
+                bbox_override,
+            )
+
+    def _process_impl(
         self,
         model,
         images,
@@ -2791,6 +2901,10 @@ class DrawViTPoseV2:
     FUNCTION = "process"
     CATEGORY = "WanAnimatePreprocess_V2"
 
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        return hash_args_and_kwargs(**kwargs)
+
     @staticmethod
     def _padding_resize_transform(src_h, src_w, out_h, out_w):
         """Replicate utils.padding_resize math as a (scale, ox, oy) transform.
@@ -2863,6 +2977,22 @@ class DrawViTPoseV2:
                                         color_bgr, 2, cv2.LINE_AA, tipLength=0.3)
 
     def process(self, pose_data, width, height, body_stick_width, hand_stick_width,
+                draw_head, pose_draw_threshold, retarget_padding=64,
+                draw_iris=True, draw_gaze=True,
+                iris_radius=4, gaze_arrow_len=30,
+                iris_min_confidence=0.05, iris_color="white",
+                face_images=None, face_cfg_scale=1.0, enforce_512_face=True):
+        with torch.inference_mode():
+            return self._process_impl(
+                pose_data, width, height, body_stick_width, hand_stick_width,
+                draw_head, pose_draw_threshold, retarget_padding,
+                draw_iris, draw_gaze,
+                iris_radius, gaze_arrow_len,
+                iris_min_confidence, iris_color,
+                face_images, face_cfg_scale, enforce_512_face,
+            )
+
+    def _process_impl(self, pose_data, width, height, body_stick_width, hand_stick_width,
                 draw_head, pose_draw_threshold, retarget_padding=64,
                 draw_iris=True, draw_gaze=True,
                 iris_radius=4, gaze_arrow_len=30,
@@ -2942,27 +3072,24 @@ class DrawViTPoseV2:
                     _fi = face_images
                 else:
                     _fi = torch.from_numpy(np.asarray(face_images))
-                if _fi.ndim != 4 or _fi.shape[-1] != 3:
-                    logging.getLogger(__name__).warning(
-                        "DrawViTPoseV2: face_images has unexpected shape %s; passing through unmodified.",
-                        tuple(_fi.shape),
+                if not isinstance(_fi, torch.Tensor) or _fi.ndim != 4 or _fi.shape[-1] != 3:
+                    raise ValueError(
+                        f"DrawViTPoseV2: face_images expected (B,H,W,3); got {tuple(_fi.shape)}"
                     )
-                    face_video_out = _fi
+                if _fi.shape[0] != pose_images_tensor.shape[0]:
+                    logging.getLogger(__name__).warning(
+                        "DrawViTPoseV2: face_images frame count (%d) != pose frame count (%d); forwarding face_images as-is.",
+                        int(_fi.shape[0]), int(pose_images_tensor.shape[0]),
+                    )
+                if bool(enforce_512_face) and (int(_fi.shape[1]) != 512 or int(_fi.shape[2]) != 512):
+                    # (B,H,W,3) -> (B,3,H,W) -> resize -> (B,H,W,3)
+                    _t = _fi.permute(0, 3, 1, 2).float()
+                    _t = torch.nn.functional.interpolate(
+                        _t, size=(512, 512), mode="bilinear", align_corners=False,
+                    )
+                    face_video_out = _t.permute(0, 2, 3, 1).contiguous().clamp(0.0, 1.0)
                 else:
-                    if _fi.shape[0] != pose_images_tensor.shape[0]:
-                        logging.getLogger(__name__).warning(
-                            "DrawViTPoseV2: face_images frame count (%d) != pose frame count (%d); forwarding face_images as-is.",
-                            int(_fi.shape[0]), int(pose_images_tensor.shape[0]),
-                        )
-                    if bool(enforce_512_face) and (int(_fi.shape[1]) != 512 or int(_fi.shape[2]) != 512):
-                        # (B,H,W,3) -> (B,3,H,W) -> resize -> (B,H,W,3)
-                        _t = _fi.permute(0, 3, 1, 2).float()
-                        _t = torch.nn.functional.interpolate(
-                            _t, size=(512, 512), mode="bilinear", align_corners=False,
-                        )
-                        face_video_out = _t.permute(0, 2, 3, 1).contiguous().clamp(0.0, 1.0)
-                    else:
-                        face_video_out = _fi
+                    face_video_out = _fi
             except Exception as e:
                 logging.getLogger(__name__).warning(
                     "DrawViTPoseV2: face passthrough failed (%s); forwarding original face_images.", e,
@@ -3010,6 +3137,10 @@ class WanAnimateFaceQualityCheckV2:
     FUNCTION = "process"
     CATEGORY = "WanAnimatePreprocess_V2"
 
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        return hash_args_and_kwargs(**kwargs)
+
     def _unsharp(self, frame_np):
         # Frame is float32 [0,1].
         u8 = (np.clip(frame_np, 0.0, 1.0) * 255.0).astype(np.uint8)
@@ -3018,6 +3149,18 @@ class WanAnimateFaceQualityCheckV2:
         return np.clip(sharp.astype(np.float32) / 255.0, 0.0, 1.0)
 
     def process(self, face_images, blur_threshold, min_eye_brightness,
+                auto_repair_bad_frames, repair_strategy):
+        if not isinstance(face_images, torch.Tensor) or face_images.ndim != 4 or face_images.shape[-1] != 3:
+            raise ValueError(
+                f"WanAnimateFaceQualityCheckV2: expected (B,H,W,3); got {tuple(getattr(face_images, 'shape', ()))}"
+            )
+        with torch.inference_mode():
+            return self._process_impl(
+                face_images, blur_threshold, min_eye_brightness,
+                auto_repair_bad_frames, repair_strategy,
+            )
+
+    def _process_impl(self, face_images, blur_threshold, min_eye_brightness,
                 auto_repair_bad_frames, repair_strategy):
         if hasattr(face_images, "detach"):
             arr = face_images.detach().cpu().numpy()
@@ -3157,6 +3300,10 @@ class DepthPoseCannyCombinedV2:
     )
     FUNCTION = "process"
     CATEGORY = "WanAnimatePreprocess_V2"
+
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        return hash_args_and_kwargs(**kwargs)
 
     # ---------- helpers ----------
     @staticmethod
@@ -3721,6 +3868,47 @@ class DepthPoseCannyCombinedV2:
         depthcrafter_steps=5, depthcrafter_guidance=1.0,
         depthcrafter_window=110, depthcrafter_overlap=25,
     ):
+        if isinstance(images, torch.Tensor):
+            if images.ndim != 4 or images.shape[-1] != 3:
+                raise ValueError(
+                    f"DepthPoseCannyCombinedV2: expected (B,H,W,3); got {tuple(images.shape)}"
+                )
+        with torch.inference_mode():
+            return self._process_impl(
+                images, width, height,
+                enable_depth, enable_pose, enable_canny,
+                canny_threshold1, canny_threshold2, canny_aperture,
+                depth_colorize, depth_invert,
+                pose_detection_threshold, pose_draw_threshold,
+                combined_layout,
+                depth_backend, enable_normal, normal_strength,
+                blend_mode,
+                depth_weight, pose_weight, canny_weight, normal_weight,
+                external_depth_map,
+                damodel_v2, da3_model,
+                depthcrafter_model, depth_pro_model,
+                posemodel, external_pose_map,
+                depthcrafter_steps, depthcrafter_guidance,
+                depthcrafter_window, depthcrafter_overlap,
+            )
+
+    def _process_impl(
+        self, images, width, height,
+        enable_depth, enable_pose, enable_canny,
+        canny_threshold1, canny_threshold2, canny_aperture,
+        depth_colorize, depth_invert,
+        pose_detection_threshold, pose_draw_threshold,
+        combined_layout,
+        depth_backend="auto", enable_normal=True, normal_strength=1.0,
+        blend_mode="weighted_avg",
+        depth_weight=1.0, pose_weight=1.0, canny_weight=1.0, normal_weight=0.5,
+        external_depth_map=None,
+        damodel_v2=None, da3_model=None,
+        depthcrafter_model=None, depth_pro_model=None,
+        posemodel=None, external_pose_map=None,
+        depthcrafter_steps=5, depthcrafter_guidance=1.0,
+        depthcrafter_window=110, depthcrafter_overlap=25,
+    ):
         images_np = self._to_np(images)
         if images_np.ndim != 4 or images_np.shape[-1] != 3:
             raise ValueError(
@@ -3918,7 +4106,18 @@ class EARBlinkDetectorC2C:
     FUNCTION = "detect"
     CATEGORY = "WanAnimatePreprocess_V2/KANIBUS"
 
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        return hash_args_and_kwargs(**kwargs)
+
     def detect(self, pose_data, threshold, min_consecutive_frames, fps,
+               smooth_window):
+        with torch.inference_mode():
+            return self._detect_impl(
+                pose_data, threshold, min_consecutive_frames, fps, smooth_window,
+            )
+
+    def _detect_impl(self, pose_data, threshold, min_consecutive_frames, fps,
                smooth_window):
         metas, _iris, (H, W) = _coerce_pose_data(pose_data)
         ear_r: List[float] = []
@@ -4030,7 +4229,19 @@ class SaccadeClassifierC2C:
     FUNCTION = "classify"
     CATEGORY = "WanAnimatePreprocess_V2/KANIBUS"
 
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        return hash_args_and_kwargs(**kwargs)
+
     def classify(self, pose_data, fps, velocity_threshold_deg_s,
+                 min_consecutive_frames, one_euro_min_cutoff, one_euro_beta):
+        with torch.inference_mode():
+            return self._classify_impl(
+                pose_data, fps, velocity_threshold_deg_s,
+                min_consecutive_frames, one_euro_min_cutoff, one_euro_beta,
+            )
+
+    def _classify_impl(self, pose_data, fps, velocity_threshold_deg_s,
                  min_consecutive_frames, one_euro_min_cutoff, one_euro_beta):
         _metas, iris_seq, _ = _coerce_pose_data(pose_data)
         if not iris_seq:
@@ -4161,6 +4372,10 @@ class PupilDilationTrackerC2C:
     FUNCTION = "track"
     CATEGORY = "WanAnimatePreprocess_V2/KANIBUS"
 
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        return hash_args_and_kwargs(**kwargs)
+
     def _scale_eye_width(self, face_kps, W, H) -> float:
         if face_kps is None or face_kps.ndim < 2:
             return float('nan')
@@ -4181,6 +4396,15 @@ class PupilDilationTrackerC2C:
         return float(np.mean(widths))
 
     def track(self, pose_data, normaliser, event_threshold,
+              min_consecutive_frames, smooth_window, fps,
+              face_bboxes=None):
+        with torch.inference_mode():
+            return self._track_impl(
+                pose_data, normaliser, event_threshold,
+                min_consecutive_frames, smooth_window, fps, face_bboxes,
+            )
+
+    def _track_impl(self, pose_data, normaliser, event_threshold,
               min_consecutive_frames, smooth_window, fps,
               face_bboxes=None):
         metas, iris_seq, (H, W) = _coerce_pose_data(pose_data)
