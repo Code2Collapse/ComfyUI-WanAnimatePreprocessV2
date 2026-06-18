@@ -25,7 +25,7 @@ from .sh_lighting import WanSHLightingTransferV2
 from .quality_scorer_jitter import WanQualityScorerJitterV2
 from .pose_format_convert import WanPoseFormatConvertV2
 from .pose_detect_vitpose import WanPoseDetectViTPoseV2
-# WanFaceController3DV2 excluded from main (still under review on feat/v2-ai-spine).
+from .face_controller_3d import WanFaceController3DV2
 
 # Phase 1.B — live preview route for the Face Director real-time editor.
 # Registers POST /c2c/fc3d_preview against ComfyUI's aiohttp server.
@@ -61,6 +61,7 @@ EXTRA_NODE_CLASS_MAPPINGS = {
     "WanQualityScorerJitterV2": WanQualityScorerJitterV2,
     "WanPoseFormatConvertV2":   WanPoseFormatConvertV2,
     "WanPoseDetectViTPoseV2":   WanPoseDetectViTPoseV2,
+    "WanFaceController3DV2":    WanFaceController3DV2,
 }
 if _ETHXGAZE_OK:
     EXTRA_NODE_CLASS_MAPPINGS["WanGazeETHXGazeV2"] = WanGazeETHXGazeV2
@@ -71,6 +72,7 @@ EXTRA_NODE_DISPLAY_NAME_MAPPINGS = {
     "WanQualityScorerJitterV2": "Wan Quality Scorer — Temporal Jitter (V2)",
     "WanPoseFormatConvertV2":   "Wan Pose Format Convert — OP18 → BODY-25 / COCO-17 / MP-33 (V2)",
     "WanPoseDetectViTPoseV2":   "Wan Pose Detect — YOLO + ViTPose (V2)",
+    "WanFaceController3DV2":    "Wan Face Controller 3D",
 }
 if _ETHXGAZE_OK:
     EXTRA_NODE_DISPLAY_NAME_MAPPINGS["WanGazeETHXGazeV2"] = (
