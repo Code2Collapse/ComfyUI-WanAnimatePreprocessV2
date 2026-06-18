@@ -39,6 +39,8 @@ from typing import Optional
 
 import numpy as np
 
+from .._is_changed_util import hash_args_and_kwargs
+
 log = logging.getLogger(__name__)
 
 
@@ -272,6 +274,10 @@ class WanPoseFormatConvertV2:
                 "emit_hands":     ("BOOLEAN", {"default": True}),
             },
         }
+
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        return hash_args_and_kwargs(**kwargs)
 
     def run(self, pose_data,
             target_format: str,
