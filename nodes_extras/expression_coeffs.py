@@ -34,6 +34,8 @@ import json
 import math
 from typing import Optional
 
+from .._is_changed_util import hash_args_and_kwargs
+
 
 # ARKit 52 blendshape names (Apple/MediaPipe standard order)
 ARKIT_52 = [
@@ -131,6 +133,10 @@ class WanExpressionCoefficientsV2:
                                  "tooltip": "0 = keep all; >0 = keep top-K by variance."}),
             },
         }
+
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        return hash_args_and_kwargs(**kwargs)
 
     def execute(self, iris_data_json, fps, smooth_min_cutoff, smooth_beta,
                 active_threshold, topk):
