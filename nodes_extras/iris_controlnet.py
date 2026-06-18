@@ -39,6 +39,8 @@ from typing import Optional
 import numpy as np
 import torch
 
+from .._is_changed_util import hash_args_and_kwargs
+
 
 def _draw_gradient_disc(canvas: np.ndarray, cx: int, cy: int, r: int,
                         color_outer: tuple[float, float, float],
@@ -137,7 +139,21 @@ class WanIrisControlNetV2:
             },
         }
 
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        return hash_args_and_kwargs(**kwargs)
+
     def execute(self, iris_data_json, image_width, image_height, render_style,
+                iris_radius_px, arrow_scale_px, heatmap_sigma_px, background,
+                face_bboxes=None, reference_image=None, overlay_alpha=0.0):
+        with torch.inference_mode():
+            return self._execute_impl(
+                iris_data_json, image_width, image_height, render_style,
+                iris_radius_px, arrow_scale_px, heatmap_sigma_px, background,
+                face_bboxes, reference_image, overlay_alpha,
+            )
+
+    def _execute_impl(self, iris_data_json, image_width, image_height, render_style,
                 iris_radius_px, arrow_scale_px, heatmap_sigma_px, background,
                 face_bboxes=None, reference_image=None, overlay_alpha=0.0):
         try:
@@ -151,6 +167,10 @@ class WanIrisControlNetV2:
 
         # Determine canvas size
         if reference_image is not None and reference_image.numel() > 0:
+            if not isinstance(reference_image, torch.Tensor) or reference_image.ndim != 4 or reference_image.shape[-1] != 3:
+                raise ValueError(
+                    f"WanIrisControlNetV2: reference_image expected (B,H,W,3); got {tuple(reference_image.shape)}"
+                )
             B, H, W, _ = reference_image.shape
             n_frames = max(B, len(data) or 1)
         else:
