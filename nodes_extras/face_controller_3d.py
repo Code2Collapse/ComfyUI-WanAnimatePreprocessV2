@@ -72,6 +72,8 @@ from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 
+from .._is_changed_util import hash_args_and_kwargs
+
 from .expression_3d_coeffs import (
     _AXIS_NAMES,
     _BASIS,
@@ -1243,74 +1245,19 @@ class WanFaceController3DV2:
     # Cache key
     # ------------------------------------------------------------------
     @classmethod
-    def IS_CHANGED(cls, pose_data=None,
-                   images=None, model=None,
-                   detection_threshold: float = 0.3,
-                   pose_threshold: float = 0.3,
-                   use_clahe: bool = True,
-                   detect_rescale: float = 1.25,
-                   fallback_to_full_frame: bool = True,
-                   fc3d_config_json: str = "",
-                   reference_pose_data=None,
-                   landmark_overrides_json: str = "",
-                   pose_overrides_json: str = "",
-                   gaze_overrides_json: str = "",
-                   unique_id=None,
-                   **legacy_fc3d_kwargs) -> str:
-        """Stable content hash for ComfyUI's execution cache.
-
-        Returns a hex digest that changes IFF an output-affecting input
-        changed. This stops the expensive internal ViTPose detection
-        (triggered when ``images`` + ``model`` are wired and ``pose_data``
-        is empty) from re-running on every queue, while still recomputing
-        when the user edits the in-canvas config / overrides.
-
-        Never raises and never returns ``float("nan")``.
-        """
-        import hashlib
-
-        h = hashlib.md5()
-
-        def _feed(label: str, value) -> None:
-            h.update(label.encode("utf-8", "replace"))
-            h.update(b"\x00")
-            h.update(str(value).encode("utf-8", "replace"))
-            h.update(b"\x01")
-
-        # --- Editor-owned JSON blobs (the in-canvas editor syncs these). ---
-        _feed("fc3d_config_json", fc3d_config_json or "")
-        _feed("landmark_overrides_json", landmark_overrides_json or "")
-        _feed("pose_overrides_json", pose_overrides_json or "")
-        _feed("gaze_overrides_json", gaze_overrides_json or "")
-
-        # Legacy scalar/combo kwargs feed _resolve_fc3d_run_params(), so they
-        # affect the output and must be part of the key. Sort for stability.
-        try:
-            legacy_items = sorted(
-                (str(k), str(v)) for k, v in (legacy_fc3d_kwargs or {}).items()
-            )
-        except Exception:
-            legacy_items = []
-        _feed("legacy_fc3d_kwargs", legacy_items)
-
-        # --- Internal-detection parameters. ---
-        _feed("detection_threshold", detection_threshold)
-        _feed("pose_threshold", pose_threshold)
-        _feed("use_clahe", bool(use_clahe))
-        _feed("detect_rescale", detect_rescale)
-        _feed("fallback_to_full_frame", bool(fallback_to_full_frame))
-
-        # --- images: cheap-but-faithful tensor fingerprint (torch-free). ---
-        _feed("images", cls._fingerprint_tensor(images))
-
-        # --- model: stable identity (NOT id()/type, which vary per run). ---
-        _feed("model", cls._fingerprint_model(model))
-
-        # --- POSEDATA bundles: lightweight structural summary only. ---
-        _feed("pose_data", cls._fingerprint_posedata(pose_data))
-        _feed("reference_pose_data", cls._fingerprint_posedata(reference_pose_data))
-
-        return h.hexdigest()
+    def IS_CHANGED(cls, **kwargs) -> str:
+        """Stable content hash for ComfyUI's execution cache."""
+        images = kwargs.pop("images", None)
+        model = kwargs.pop("model", None)
+        pose_data = kwargs.pop("pose_data", None)
+        reference_pose_data = kwargs.pop("reference_pose_data", None)
+        return hash_args_and_kwargs(
+            images_fingerprint=cls._fingerprint_tensor(images),
+            model_fingerprint=cls._fingerprint_model(model),
+            pose_data_fingerprint=cls._fingerprint_posedata(pose_data),
+            reference_pose_data_fingerprint=cls._fingerprint_posedata(reference_pose_data),
+            **kwargs,
+        )
 
     @staticmethod
     def _fingerprint_tensor(t) -> str:
@@ -1407,6 +1354,40 @@ class WanFaceController3DV2:
     # Execution
     # ------------------------------------------------------------------
     def run(self, pose_data=None,
+            images=None, model=None,
+            detection_threshold: float = 0.3,
+            pose_threshold: float = 0.3,
+            use_clahe: bool = True,
+            detect_rescale: float = 1.25,
+            fallback_to_full_frame: bool = True,
+            fc3d_config_json: str = "",
+            reference_pose_data=None,
+            landmark_overrides_json: str = "",
+            pose_overrides_json: str = "",
+            gaze_overrides_json: str = "",
+            unique_id: Optional[str] = None,
+            **legacy_fc3d_kwargs):
+
+        import torch
+
+        if images is not None and isinstance(images, torch.Tensor):
+            if images.ndim != 4 or images.shape[-1] != 3:
+                raise ValueError(
+                    f"WanFaceController3DV2: images expected (B,H,W,3); got {tuple(images.shape)}"
+                )
+
+        with torch.inference_mode():
+            return self._run_impl(
+                pose_data, images, model,
+                detection_threshold, pose_threshold, use_clahe,
+                detect_rescale, fallback_to_full_frame,
+                fc3d_config_json, reference_pose_data,
+                landmark_overrides_json, pose_overrides_json,
+                gaze_overrides_json, unique_id,
+                **legacy_fc3d_kwargs,
+            )
+
+    def _run_impl(self, pose_data=None,
             images=None, model=None,
             detection_threshold: float = 0.3,
             pose_threshold: float = 0.3,
