@@ -32,7 +32,10 @@ import json
 import math
 from typing import Optional
 
-from .._is_changed_util import hash_args_and_kwargs(kps):
+from .._is_changed_util import hash_args_and_kwargs
+
+
+def _kps_xy(kps):
     if not isinstance(kps, list):
         return []
     out = []
