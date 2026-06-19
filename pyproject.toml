@@ -11,7 +11,7 @@ dependencies = [
     "onnx>=1.15",
     "numpy>=1.24",
     "pillow>=10.0",
-    "mediapipe>=0.10",
+    "mediapipe>=0.10.18",
 ]
 
 [project.urls]
