@@ -45,11 +45,21 @@ function clamp(v, lo, hi) { return v < lo ? lo : (v > hi ? hi : v); }
 
 function drawOverlay(ctx, node, meta) {
     if (!meta || !Array.isArray(meta.frames) || meta.frames.length === 0) {
+        // Place the placeholder text just below the last widget so it never
+        // overlaps widget content, and grow the node if there isn't room.
+        const widgets = node.widgets || [];
+        const last_w = widgets.length ? widgets[widgets.length - 1] : null;
+        const y = (last_w && typeof last_w.last_y === "number")
+            ? last_w.last_y + 20
+            : node.size[1] - 28;
+        if (y > node.size[1] - 24) {
+            node.size[1] = y + 32;
+            node.setDirtyCanvas(true, false);
+        }
         ctx.save();
         ctx.font = "11px sans-serif";
         ctx.fillStyle = C.dim;
-        ctx.fillText("gaze viewer: no data yet — queue the node",
-                     12, node.size[1] - 28);
+        ctx.fillText("gaze viewer: no data yet — queue the node", 12, y);
         ctx.restore();
         return;
     }
