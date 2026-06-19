@@ -1,10 +1,22 @@
 onnx
 onnxruntime-gpu
 opencv-python
-mediapipe
+# mediapipe>=0.10.18 is REQUIRED: older mediapipe (<=0.10.x built against
+# protobuf 3) crashes on systems with protobuf>=5 with
+#   "'google._upb._message.FieldDescriptor' object has no attribute 'label'"
+# which kills FaceLandmarker + FaceMesh (the default blendshape gaze pipeline).
+# 0.10.18+ ships protobuf-5-compatible generated code. If you cannot upgrade
+# mediapipe, the alternative is to pin protobuf<=3.20.3 instead.
+mediapipe>=0.10.18
 ai-edge-litert
 
 # Optional — enable L2CS-Net gaze engine (gaze_engine = l2cs_gaze360 / l2cs_mpiigaze).
 # Install manually if you want CNN-based gaze (extreme-pose-robust, MIT licence):
 #   pip install git+https://github.com/edavalosanaya/L2CS-Net.git@main
 # Weights auto-download from HF tianfxc/l2cs into ComfyUI/models/gaze/.
+#
+# Optional — enable ETH-XGaze gaze engine (gaze_engine = ethxgaze, ~2.5° MAE):
+#   1. clone the repo so face_model.txt + model.py are available:
+#      git clone https://github.com/xucong-zhang/ETH-XGaze third_party/ETH-XGaze
+#   2. place checkpoint epoch_24_ckpt.pth.tar in ComfyUI/models/ethxgaze/
+# On any missing prerequisite the node silently falls back to the blendshape engine.
