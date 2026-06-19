@@ -7,9 +7,12 @@ trained on Gaze360 (extreme head poses, in-the-wild) and MPIIGaze
 (near-frontal portraits). Both variants are MIT-licensed, weight files
 hosted at HF ``tianfxc/l2cs``.
 
-This module is OPTIONAL — the L2CS python package is not a hard
-dependency of the node pack. When unavailable, the engine combo silently
-falls back to ``blendshape_head_corrected``.
+The L2CS-Net inference code ships directly in this repo
+(``nodes_extras/l2csnet``) — no ``pip install l2cs`` and no clone needed.
+The model runs on the face bounding box this pack already detects
+(MediaPipe), so the upstream RetinaFace detector is not required. If torch
+is somehow unavailable the engine combo falls back to
+``blendshape_head_corrected``.
 
 Public API
 ----------
@@ -21,11 +24,8 @@ Sign convention matches the rest of the pack:
 * ``yaw_rad`` > 0  -> subject looking to their *right*
 * ``pitch_rad`` > 0 -> looking *up*
 
-Install
--------
-    pip install git+https://github.com/edavalosanaya/L2CS-Net.git@main
-
-Weights auto-download from HF on first call to ``get_pipeline``.
+Weights auto-download from HF on first call to ``get_pipeline``; place
+``L2CSNet_gaze360.pkl`` manually at ``ComfyUI/models/gaze/`` if offline.
 """
 from __future__ import annotations
 
@@ -65,11 +65,38 @@ def _gaze_dir() -> str:
     return d
 
 
-def get_pipeline(variant: str = "gaze360"):
-    """Lazy-construct an ``l2cs.Pipeline`` and cache it.
+class _L2CSGaze:
+    """In-repo L2CS gaze predictor over a PRE-DETECTED face crop.
 
-    Downloads weights from HF on first use. Raises ``RuntimeError`` if
-    the ``l2cs`` package is not installed.
+    Drop-in replacement for ``l2cs.Pipeline`` minus the bundled RetinaFace:
+    this pack already supplies a face bbox (MediaPipe), so only the gaze
+    regressor + the exact upstream preprocess/decode are needed.
+    """
+
+    def __init__(self, model, device, num_bins: int):
+        import torch  # type: ignore
+        self.model = model
+        self.device = device
+        self.idx_tensor = torch.arange(
+            num_bins, dtype=torch.float32, device=device,
+        )
+
+    def predict_crop(self, face_rgb_u8: np.ndarray) -> Tuple[float, float]:
+        """``face_rgb_u8``: HxWx3 uint8 RGB crop -> ``(yaw_rad, pitch_rad)``."""
+        import torch  # type: ignore
+        from .nodes_extras.l2csnet import prep_input_numpy, decode_gaze
+        inp = prep_input_numpy(face_rgb_u8, self.device)
+        with torch.no_grad():
+            head_a, head_b = self.model(inp)   # (fc_yaw_gaze, fc_pitch_gaze)
+        yaw_rad, pitch_rad = decode_gaze(head_a, head_b, self.idx_tensor)
+        return float(yaw_rad[0]), float(pitch_rad[0])
+
+
+def get_pipeline(variant: str = "gaze360"):
+    """Lazy-construct the in-repo L2CS gaze predictor and cache it.
+
+    Downloads weights from HF on first use. Raises ``RuntimeError`` if torch /
+    the in-repo model cannot be imported.
     """
     if variant not in _WEIGHTS_HF:
         raise ValueError(f"Unknown L2CS variant {variant!r}; "
@@ -77,18 +104,17 @@ def get_pipeline(variant: str = "gaze360"):
     if variant in _PIPELINE_CACHE:
         return _PIPELINE_CACHE[variant]
 
+    import torch  # type: ignore
     try:
-        from l2cs import Pipeline  # type: ignore
+        from .nodes_extras.l2csnet import getArch, NUM_BINS  # type: ignore
     except Exception as exc:  # noqa: BLE001
         msg = (
-            "[gaze_l2cs] FAILED: l2cs python package not installed. Run:\n"
-            "  pip install git+https://github.com/edavalosanaya/L2CS-Net.git@main"
+            "[gaze_l2cs] FAILED to import the in-repo L2CS model "
+            f"(torch/torchvision missing?): {exc!r}"
         )
         print(msg, flush=True)
         logger.error(msg)
         raise RuntimeError(msg) from exc
-
-    import torch  # type: ignore
 
     repo, fname = _WEIGHTS_HF[variant]
     weight_path = os.path.join(_gaze_dir(), fname)
@@ -135,15 +161,26 @@ def get_pipeline(variant: str = "gaze360"):
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(
-        f"[gaze_l2cs] Initialising L2CS-Net pipeline "
+        f"[gaze_l2cs] Initialising in-repo L2CS-Net "
         f"(variant={variant}, device={device})",
         flush=True,
     )
     try:
-        pipeline = Pipeline(weights=weight_path, arch="ResNet50", device=device)
+        model = getArch("ResNet50", NUM_BINS)
+        state = torch.load(weight_path, map_location="cpu", weights_only=False)
+        # The released .pkl is a plain state_dict; tolerate a few wrappers.
+        if isinstance(state, torch.nn.Module):
+            state = state.state_dict()
+        elif isinstance(state, dict) and "model_state" in state:
+            state = state["model_state"]
+        elif isinstance(state, dict) and "state_dict" in state:
+            state = state["state_dict"]
+        model.load_state_dict(state, strict=True)
+        model.to(device).eval()
+        pipeline = _L2CSGaze(model, device, NUM_BINS)
     except Exception as exc:  # noqa: BLE001
         msg = (
-            f"[gaze_l2cs] PIPELINE INIT FAILED ({exc!r}); falling back to "
+            f"[gaze_l2cs] MODEL INIT FAILED ({exc!r}); falling back to "
             f"blendshape_head_corrected."
         )
         print(msg, flush=True)
@@ -158,93 +195,81 @@ def infer_frame(
     rgb_uint8: np.ndarray,
     face_bbox: Optional[Tuple[int, int, int, int]] = None,
 ) -> Optional[Tuple[float, float, float]]:
-    """Run L2CS on a single RGB frame and return ``(yaw, pitch, conf)``.
+    """Run in-repo L2CS on a single RGB frame -> ``(yaw, pitch, conf)``.
 
-    The L2CS-Net ``Pipeline.step(frame)`` API runs a RetinaFace detector
-    internally and then estimates gaze for each detected face. We
-    convert RGB->BGR (L2CS's internal detector expects OpenCV BGR), run
-    detection on the FULL frame (much more robust than feeding a tight
-    crop), and route to the primary face. If ``face_bbox`` is given,
-    pick the L2CS detection whose centre is closest to that bbox; else
-    pick the largest. Returns ``None`` if no face is detected.
+    Uses the face bounding box this pack already detected (MediaPipe): crop
+    it (with a small margin), resize to 224x224 and run the gaze regressor.
+    No RetinaFace, no full-frame detection. Returns ``None`` if there is no
+    usable face crop.
 
     Parameters
     ----------
     pipeline
-        From :func:`get_pipeline`.
+        From :func:`get_pipeline` (a :class:`_L2CSGaze`).
     rgb_uint8
         ``(H, W, 3)`` uint8 image in RGB order (ComfyUI convention).
     face_bbox
-        Optional ``(x1, y1, x2, y2)`` in ``rgb_uint8`` coords. If given,
-        used to route to the matching face when multiple are detected.
+        ``(x1, y1, x2, y2)`` in ``rgb_uint8`` pixel coords. Required.
 
     Returns
     -------
     ``(yaw_rad, pitch_rad, confidence)`` or ``None``.
+
+    Sign convention (unchanged, matches l2cs.utils.draw_gaze):
+        yaw  > 0 -> subject's RIGHT gaze;  pitch > 0 -> looking UP.
     """
-    if rgb_uint8 is None or rgb_uint8.size == 0:
+    if rgb_uint8 is None or getattr(rgb_uint8, "size", 0) == 0:
         return None
+    if rgb_uint8.ndim != 3 or rgb_uint8.shape[2] != 3:
+        return None
+    if face_bbox is None:
+        # This pack always supplies a bbox; without a detector we can't crop.
+        return None
+    H, W = rgb_uint8.shape[:2]
+    try:
+        x1, y1, x2, y2 = (float(v) for v in face_bbox[:4])
+    except Exception:  # noqa: BLE001
+        return None
+    bw, bh = x2 - x1, y2 - y1
+    if bw <= 1 or bh <= 1:
+        return None
+    # Small context margin around the face (gaze benefits from a little context).
+    mx, my = bw * 0.10, bh * 0.10
+    ix1 = max(0, int(round(x1 - mx)))
+    iy1 = max(0, int(round(y1 - my)))
+    ix2 = min(W, int(round(x2 + mx)))
+    iy2 = min(H, int(round(y2 + my)))
+    if ix2 - ix1 < 2 or iy2 - iy1 < 2:
+        return None
+    crop = rgb_uint8[iy1:iy2, ix1:ix2]
+    if crop.size == 0:
+        return None
+    # Resize to 224x224 (upstream Pipeline.step does the same; the transform
+    # then up-samples to 448 before normalising).
     try:
         import cv2  # type: ignore
-        bgr = cv2.cvtColor(rgb_uint8, cv2.COLOR_RGB2BGR)
+        crop224 = cv2.resize(crop, (224, 224), interpolation=cv2.INTER_AREA)
     except Exception:  # noqa: BLE001
-        bgr = rgb_uint8[..., ::-1].copy()
+        try:
+            from PIL import Image  # type: ignore
+            crop224 = np.asarray(
+                Image.fromarray(crop).resize((224, 224)), dtype=np.uint8,
+            )
+        except Exception:  # noqa: BLE001
+            return None
+    crop224 = np.ascontiguousarray(crop224.astype(np.uint8))
     try:
-        results = pipeline.step(bgr)
+        yaw_rad, pitch_rad = pipeline.predict_crop(crop224)
     except Exception as exc:  # noqa: BLE001
-        logger.debug("[gaze_l2cs] pipeline.step failed: %s", exc)
+        logger.debug("[gaze_l2cs] predict_crop failed: %s", exc)
         return None
-    if results is None:
-        return None
-    yaws = getattr(results, "yaw", None)
-    pitches = getattr(results, "pitch", None)
-    if yaws is None or pitches is None or len(yaws) == 0:
-        return None
-
-    # Route to primary face.
-    bboxes = getattr(results, "bboxes", None)
-    idx = 0
-    if bboxes is not None and len(bboxes) == len(yaws) and len(bboxes) > 1:
-        try:
-            if face_bbox is not None:
-                tx = 0.5 * (float(face_bbox[0]) + float(face_bbox[2]))
-                ty = 0.5 * (float(face_bbox[1]) + float(face_bbox[3]))
-                dists = []
-                for b in bboxes:
-                    bx = 0.5 * (float(b[0]) + float(b[2]))
-                    by = 0.5 * (float(b[1]) + float(b[3]))
-                    dists.append((bx - tx) ** 2 + (by - ty) ** 2)
-                idx = int(np.argmin(dists))
-            else:
-                areas = [max(0, (b[2] - b[0])) * max(0, (b[3] - b[1])) for b in bboxes]
-                idx = int(np.argmax(areas))
-        except Exception:  # noqa: BLE001
-            idx = 0
-
-    try:
-        yaw = float(yaws[idx])
-        pitch = float(pitches[idx])
-    except Exception:  # noqa: BLE001
-        return None
-
-    # L2CS-Net sign convention (verified against l2cs.utils.draw_gaze):
-    #   yaw  > 0 -> arrow drawn image-LEFT  (== subject's RIGHT gaze)
-    #   pitch> 0 -> arrow drawn image-UP    (== looking UP)
-    # which matches this package's convention exactly.
-    scores = getattr(results, "scores", None)
-    conf = 1.0
-    if scores is not None and len(scores) > idx:
-        try:
-            conf = float(scores[idx])
-        except Exception:  # noqa: BLE001
-            conf = 1.0
-    return yaw, pitch, conf
+    return float(yaw_rad), float(pitch_rad), 1.0
 
 
 def is_available() -> bool:
-    """Return True iff the ``l2cs`` python package can be imported."""
+    """True iff the in-repo L2CS model imports (needs torch + torchvision)."""
     try:
-        import l2cs  # type: ignore  # noqa: F401
+        from .nodes_extras.l2csnet import getArch  # type: ignore  # noqa: F401
         return True
     except Exception:  # noqa: BLE001
         return False
