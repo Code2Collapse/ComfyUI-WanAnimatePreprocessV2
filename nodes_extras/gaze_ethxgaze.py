@@ -158,15 +158,17 @@ def _list_ckpt_choices() -> list[str]:
 
 # ── face_model.txt — 68×3 generic 3D landmarks (mm) ──────────────────
 def _load_face_model_68() -> Optional[np.ndarray]:
-    fm = _third_party_root() / "face_model.txt"
-    if not fm.is_file():
-        return None
-    try:
-        arr = np.loadtxt(str(fm))
-        if arr.shape == (68, 3):
-            return arr.astype(np.float64)
-    except Exception as e:
-        log.warning("ethxgaze: failed to load face_model.txt: %s", e)
+    # In-repo copy first (ships with the pack), then a third_party clone (dev).
+    for fm in (Path(__file__).parent / "ethxgaze" / "face_model.txt",
+               _third_party_root() / "face_model.txt"):
+        if not fm.is_file():
+            continue
+        try:
+            arr = np.loadtxt(str(fm))
+            if arr.shape == (68, 3):
+                return arr.astype(np.float64)
+        except Exception as e:
+            log.warning("ethxgaze: failed to load face_model.txt: %s", e)
     return None
 
 
@@ -280,9 +282,13 @@ def _load_gaze_model(ckpt_path: Path, device: torch.device) -> "torch.nn.Module"
     key = f"{ckpt_path.resolve()}|{device}"
     if key in _MODEL_CACHE:
         return _MODEL_CACHE[key]
-    _ensure_eth_xgaze_on_path()
-    # Local import — only after sys.path is patched.
-    from model import gaze_network                                     # type: ignore
+    # Prefer the in-repo gaze_network (ships with the pack so it works on a
+    # fresh box with no clone); fall back to a third_party clone for dev.
+    try:
+        from .ethxgaze import gaze_network                             # type: ignore
+    except Exception:
+        _ensure_eth_xgaze_on_path()
+        from model import gaze_network                                 # type: ignore
     net = gaze_network()
     ckpt = torch.load(str(ckpt_path), map_location="cpu", weights_only=False)
     sd = ckpt.get("model_state", ckpt) if isinstance(ckpt, dict) else ckpt
