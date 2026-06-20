@@ -125,20 +125,13 @@ async function _tryLocalThreeStack() {
     if (!head || !head.ok) return null;
 
     const THREE = await import(/* @vite-ignore */ coreUrl);
+    // The local control files now import './three.module.js' (a resolvable
+    // relative specifier), so import them directly — no fetch/blob patch needed.
+    // This also fixes ComfyUI's own auto-load of these files, which previously
+    // errored with "Failed to resolve module specifier 'three'".
     const loadLocalCtrl = async (filename, exportName) => {
-        const url = here + filename;
-        const r = await fetch(url);
-        if (!r.ok) throw new Error(`HTTP ${r.status} for ${url}`);
-        const txt = await r.text();
-        const patched = txt.replace(/from\s*['"]three['"]/g, `from '${coreUrl}'`);
-        const blob = new Blob([patched], { type: "text/javascript" });
-        const blobUrl = URL.createObjectURL(blob);
-        try {
-            const mod = await import(/* @vite-ignore */ blobUrl);
-            return mod[exportName];
-        } finally {
-            setTimeout(() => URL.revokeObjectURL(blobUrl), 1000);
-        }
+        const mod = await import(/* @vite-ignore */ here + filename);
+        return mod[exportName];
     };
     const OrbitControls = await loadLocalCtrl("three_orbit.js", "OrbitControls");
     // TransformControls is optional — TransformControls vendoring is a nice-to-have,
