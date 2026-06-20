@@ -45,17 +45,17 @@ function clamp(v, lo, hi) { return v < lo ? lo : (v > hi ? hi : v); }
 
 function drawOverlay(ctx, node, meta) {
     if (!meta || !Array.isArray(meta.frames) || meta.frames.length === 0) {
-        // Place the placeholder text just below the last widget so it never
-        // overlaps widget content, and grow the node if there isn't room.
+        // Position the placeholder just below the last widget, but CLAMP it
+        // inside the node. CRITICAL: never mutate node.size here. This runs in
+        // onDrawForeground (every frame) — growing the node from inside draw
+        // caused an unbounded expand-on-draw loop (size grew -> setDirtyCanvas
+        // -> redraw -> grew again ...), pegging CPU and crashing ComfyUI.
         const widgets = node.widgets || [];
         const last_w = widgets.length ? widgets[widgets.length - 1] : null;
-        const y = (last_w && typeof last_w.last_y === "number")
+        const belowWidgets = (last_w && typeof last_w.last_y === "number")
             ? last_w.last_y + 20
             : node.size[1] - 28;
-        if (y > node.size[1] - 24) {
-            node.size[1] = y + 32;
-            node.setDirtyCanvas(true, false);
-        }
+        const y = Math.min(belowWidgets, node.size[1] - 8);
         ctx.save();
         ctx.font = "11px sans-serif";
         ctx.fillStyle = C.dim;
