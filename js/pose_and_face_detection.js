@@ -7,13 +7,6 @@ const ALWAYS = new Set([
     "use_iris_smoothing","use_mediapipe_face","crop_mode",
 ]);
 
-// Widgets that are ONLY relevant in jitterless crop_mode.
-const JITTERLESS_WIDGETS = new Set([
-    "frame0_cx","frame0_cy","frame0_size","keyframes_json",
-    "smoothing_method","crop_one_euro_min_cutoff","crop_one_euro_beta",
-    "crop_gaussian_window",
-]);
-
 function setHidden(w, hidden) {
     if (!w) return;
     if (hidden) {
@@ -42,10 +35,11 @@ function setHidden(w, hidden) {
             const cs = w.__mec_origComputeSize;
             if (cs === undefined) delete w.computeSize; else w.computeSize = cs;
             delete w.__mec_origComputeSize;
-        } else {
-            // never saved an original — drop any forced [0,-4] so default kicks in
-            delete w.computeSize;
         }
+        // No else: if no original was saved we never hid this widget, so its
+        // computeSize is already the legitimate one. Deleting it would destroy
+        // DOM-widget sizing (e.g. keyframes_json multiline, viewer_* widgets)
+        // on always-visible widgets. (Mirrors the `type` branch above.)
         w.hidden = false;
         const el = w.element;
         if (el) {

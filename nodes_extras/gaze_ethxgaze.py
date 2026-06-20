@@ -158,15 +158,25 @@ def _list_ckpt_choices() -> list[str]:
 
 # ── face_model.txt — 68×3 generic 3D landmarks (mm) ──────────────────
 def _load_face_model_68() -> Optional[np.ndarray]:
-    # In-repo copy first (ships with the pack), then a third_party clone (dev).
+    # The in-repo copy ships with the pack (nodes_extras/ethxgaze/face_model.txt);
+    # the third_party clone is only a dev fallback.
+    #
+    # IMPORTANT: ETH-XGaze's face_model.txt is the 50-point sparse 3D model
+    # (verified identical to upstream xucong-zhang/ETH-XGaze), NOT 68 points —
+    # we only ever index it up to 29 (see _FACE_MODEL_SUBSET_IDX). The old check
+    # required exactly (68, 3), so it REJECTED the real file and raised a bogus
+    # "third_party missing" error. Accept any (N, 3) with enough rows instead.
+    min_rows = max(_FACE_MODEL_SUBSET_IDX) + 1
     for fm in (Path(__file__).parent / "ethxgaze" / "face_model.txt",
                _third_party_root() / "face_model.txt"):
         if not fm.is_file():
             continue
         try:
             arr = np.loadtxt(str(fm))
-            if arr.shape == (68, 3):
+            if arr.ndim == 2 and arr.shape[1] == 3 and arr.shape[0] >= min_rows:
                 return arr.astype(np.float64)
+            log.warning("ethxgaze: face_model.txt has unexpected shape %s (need (>=%d, 3))",
+                        getattr(arr, "shape", None), min_rows)
         except Exception as e:
             log.warning("ethxgaze: failed to load face_model.txt: %s", e)
     return None
@@ -417,7 +427,9 @@ class WanGazeETHXGazeV2:
         face_model_68 = _load_face_model_68()
         if face_model_68 is None:
             raise FileNotFoundError(
-                "third_party/ETH-XGaze/face_model.txt is missing — clone the repo or copy the file."
+                "ETH-XGaze face_model.txt could not be loaded. It ships in-repo at "
+                "nodes_extras/ethxgaze/face_model.txt (50x3) — restore it from the "
+                "repo if it was deleted."
             )
         face_model_6 = face_model_68[_FACE_MODEL_SUBSET_IDX, :]
 
