@@ -263,9 +263,21 @@ class WanPoseDetectViTPoseV2:
         # 4) Bundle.
         pose_metas = load_pose_metas_from_kp2ds_seq(kp2ds_arr, width=W, height=H)
 
+        # Downstream draw/retarget consumers (DrawViTPoseV2) expect `pose_metas`
+        # to be AAPoseMeta objects — the same conversion PoseAndFaceDetectionV2
+        # applies. Without this, DrawViTPoseV2 receives raw dict metas it cannot
+        # draw and emits an all-black skeleton. Keep the raw dicts under
+        # `pose_metas_original` for keypoint access.
+        try:
+            from ..pose_utils.human_visualization import AAPoseMeta
+            aa_metas = [AAPoseMeta.from_humanapi_meta(m) for m in pose_metas]
+        except Exception as _aa_exc:  # noqa: BLE001
+            log.warning("AAPoseMeta conversion failed (%s); leaving raw metas.", _aa_exc)
+            aa_metas = pose_metas
+
         bundle = {
             "pose_metas_original": [deepcopy(m) for m in pose_metas],
-            "pose_metas":          pose_metas,
+            "pose_metas":          aa_metas,
             "iris_data":           [{} for _ in pose_metas],
             "width":               W,
             "height":              H,

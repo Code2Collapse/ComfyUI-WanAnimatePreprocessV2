@@ -179,6 +179,12 @@ def _remap_state_dict(state_dict: dict) -> dict:
             nk = nk[len("module."):]
         if nk.startswith("gaze_network.") and not nk.startswith("gaze_network.net."):
             nk = "gaze_network.net." + nk[len("gaze_network."):]
+        # The regression head is nn.Sequential -> keys are gaze_fc.0.weight/bias.
+        # Some community checkpoints store a PLAIN Linear (gaze_fc.weight/bias).
+        # Map those into the Sequential slot so the head actually loads instead
+        # of staying randomly initialised (the "gaze is garbage" bug).
+        if nk.startswith("gaze_fc.") and not nk[len("gaze_fc."):].split(".")[0].isdigit():
+            nk = "gaze_fc.0." + nk[len("gaze_fc."):]
         out[nk] = v
     return out
 
@@ -306,6 +312,18 @@ def get_model(checkpoint_path: Optional[str] = None):
 
     model = _build_gaze_network()
     missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    # HARD FAIL if the gaze regression head did not load — otherwise it stays
+    # randomly initialised and every gaze prediction is garbage while the
+    # pipeline still reports "success". Returning None makes the caller fall
+    # back to a working engine instead.
+    head_missing = [k for k in missing if k.startswith("gaze_fc.")]
+    if head_missing:
+        logger.error(
+            "[gaze_normalized_estimator] CRITICAL: gaze head not loaded (missing "
+            "%s) — checkpoint key layout doesn't match. Refusing random-weight "
+            "gaze; falling back to another engine.", head_missing,
+        )
+        return None
     if missing:
         # The bypassed imagenet fc may show up as missing if the
         # checkpoint omitted it -- benign.

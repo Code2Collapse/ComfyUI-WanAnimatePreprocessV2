@@ -55,6 +55,22 @@ except Exception as _e:                                                  # noqa:
     _ETHXGAZE_OK = False
 
 
+# NLF 3D-pose refinement (optional; needs torch — guarded so a failure never
+# breaks the rest of the pack).
+try:
+    from .pose3d_nlf import WanPose3DRefineNLFV2
+    _POSE3D_OK = True
+except Exception as _e:                                                  # noqa: BLE001
+    import logging as _logging
+    _logging.getLogger(__name__).info("WanPose3DRefineNLFV2 not registered: %s", _e)
+    WanPose3DRefineNLFV2 = None                                          # type: ignore
+    _POSE3D_OK = False
+
+# NOTE: the standalone WanPoseOverlayV2 node was removed — its full
+# body+face+hands+gaze verification overlay is now folded directly into
+# PoseAndFaceDetectionV2's built-in `debug_image` output (no second node to
+# wire). pose_overlay.py is kept as a drawing-helper module.
+
 EXTRA_NODE_CLASS_MAPPINGS = {
     "WanIrisControlNetV2":      WanIrisControlNetV2,
     "WanSHLightingTransferV2":  WanSHLightingTransferV2,
@@ -65,6 +81,8 @@ EXTRA_NODE_CLASS_MAPPINGS = {
 }
 if _ETHXGAZE_OK:
     EXTRA_NODE_CLASS_MAPPINGS["WanGazeETHXGazeV2"] = WanGazeETHXGazeV2
+if _POSE3D_OK:
+    EXTRA_NODE_CLASS_MAPPINGS["WanPose3DRefineNLFV2"] = WanPose3DRefineNLFV2
 
 EXTRA_NODE_DISPLAY_NAME_MAPPINGS = {
     "WanIrisControlNetV2":      "Wan Iris ControlNet Conditioning (V2)",
@@ -77,4 +95,8 @@ EXTRA_NODE_DISPLAY_NAME_MAPPINGS = {
 if _ETHXGAZE_OK:
     EXTRA_NODE_DISPLAY_NAME_MAPPINGS["WanGazeETHXGazeV2"] = (
         "Wan Gaze — ETH-XGaze Post-Processor (V2)"
+    )
+if _POSE3D_OK:
+    EXTRA_NODE_DISPLAY_NAME_MAPPINGS["WanPose3DRefineNLFV2"] = (
+        "Wan Pose 3D Refine — NLF (V2)"
     )

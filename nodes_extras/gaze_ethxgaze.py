@@ -226,8 +226,14 @@ def _normalize_face(img_bgr: np.ndarray,
                     face_model_6: np.ndarray,
                     landmarks_2d_6: np.ndarray,
                     rvec: np.ndarray, tvec: np.ndarray,
-                    cam: np.ndarray) -> Optional[np.ndarray]:
-    """Mirror of demo.normalizeData_face — returns 224x224 BGR crop."""
+                    cam: np.ndarray):
+    """Mirror of demo.normalizeData_face — returns (224x224 BGR crop, R).
+
+    ``R`` is the normalization rotation (camera→normalized). The predicted gaze
+    is in the normalized frame and MUST be rotated back by ``R.T`` to the camera
+    frame (denormalization); without it the gaze direction is wrong. Returns
+    ``(None, None)`` on failure.
+    """
     import cv2
     focal_norm     = 960
     distance_norm  = 600
@@ -242,7 +248,7 @@ def _normalize_face(img_bgr: np.ndarray,
                              axis=1).reshape((3, 1))
     distance = np.linalg.norm(face_center)
     if distance < 1e-6:
-        return None
+        return None, None
     z_scale = distance_norm / distance
     cam_norm = np.array([
         [focal_norm, 0,          roi_size[0] / 2],
@@ -258,19 +264,40 @@ def _normalize_face(img_bgr: np.ndarray,
     forward = (face_center / distance).reshape(3)
     down = np.cross(forward, hRx); n = np.linalg.norm(down)
     if n < 1e-6:
-        return None
+        return None, None
     down /= n
     right = np.cross(down, forward); n = np.linalg.norm(right)
     if n < 1e-6:
-        return None
+        return None, None
     right /= n
     R = np.c_[right, down, forward].T
     try:
         cam_inv = np.linalg.inv(cam)
     except np.linalg.LinAlgError:
-        return None
+        return None, None
     W = np.dot(np.dot(cam_norm, S), np.dot(R, cam_inv))
-    return cv2.warpPerspective(img_bgr, W, roi_size)
+    return cv2.warpPerspective(img_bgr, W, roi_size), R
+
+
+def _denormalize_pitchyaw(pitch_n: float, yaw_n: float, R: np.ndarray):
+    """Rotate a normalized-frame gaze (pitch,yaw) back to the camera frame.
+
+    Uses the ETH-XGaze convention. ``R`` is camera→normalized, so the inverse
+    rotation (normalized→camera) is ``R.T``.
+    """
+    import math
+    gx = -math.cos(pitch_n) * math.sin(yaw_n)
+    gy = -math.sin(pitch_n)
+    gz = -math.cos(pitch_n) * math.cos(yaw_n)
+    v = np.array([gx, gy, gz], dtype=np.float64)
+    v_cam = R.T @ v
+    nrm = float(np.linalg.norm(v_cam))
+    if nrm < 1e-8:
+        return pitch_n, yaw_n
+    v_cam /= nrm
+    pitch_c = math.asin(max(-1.0, min(1.0, -float(v_cam[1]))))
+    yaw_c = math.atan2(-float(v_cam[0]), -float(v_cam[2]))
+    return pitch_c, yaw_c
 
 
 # ImageNet stats (matches ETH-XGaze demo.py).
@@ -469,6 +496,7 @@ class WanGazeETHXGazeV2:
         # 1) Build all valid face crops + remember which frame each belongs to.
         crops:   list[np.ndarray] = []
         crop_fi: list[int]        = []
+        crop_R:  list             = []   # per-crop normalization rotation (for denorm)
         n_no_face = 0
         n_pnp_fail = 0
         n_warp_fail = 0
@@ -492,10 +520,10 @@ class WanGazeETHXGazeV2:
             if pose is None:
                 n_pnp_fail += 1; continue
             rvec, tvec = pose
-            crop = _normalize_face(img_bgr, face_model_6, lms6, rvec, tvec, cam)
+            crop, Rmat = _normalize_face(img_bgr, face_model_6, lms6, rvec, tvec, cam)
             if crop is None:
                 n_warp_fail += 1; continue
-            crops.append(crop); crop_fi.append(f_idx)
+            crops.append(crop); crop_fi.append(f_idx); crop_R.append(Rmat)
 
         # 2) Batched inference.
         n_pred = 0
@@ -509,6 +537,11 @@ class WanGazeETHXGazeV2:
             for k, (pitch_yaw) in enumerate(y):
                 pitch_rad = float(pitch_yaw[0])
                 yaw_rad   = float(pitch_yaw[1])
+                # Denormalize: the network predicts gaze in the head-normalized
+                # frame; rotate it back to the camera frame via the per-crop R.
+                Rmat = crop_R[i0 + k] if (i0 + k) < len(crop_R) else None
+                if Rmat is not None:
+                    pitch_rad, yaw_rad = _denormalize_pitchyaw(pitch_rad, yaw_rad, Rmat)
                 fi = crop_fi[i0 + k]
                 entry = new_iris[fi]
                 # Blend with existing gaze if the user wants partial replacement.

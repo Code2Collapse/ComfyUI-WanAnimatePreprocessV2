@@ -140,14 +140,37 @@ def get_pipeline(variant: str = "gaze360"):
                 repo_id=repo, filename=fname, local_dir=_gaze_dir(),
             )
         except Exception as exc:  # noqa: BLE001
-            msg = (
-                f"[gaze_l2cs] DOWNLOAD FAILED for {repo}/{fname}: {exc!r}. "
-                f"Check internet / HF_TOKEN / disk space. Falling back to "
-                f"blendshape_head_corrected engine."
-            )
-            print(msg, flush=True)
-            logger.error(msg)
-            raise RuntimeError(msg) from exc
+            # The mpiigaze weight file is frequently missing/404 on HF. Rather
+            # than collapsing all the way to the CPU blendshape engine, fall
+            # back to the gaze360 weights (same ResNet50 / NUM_BINS architecture)
+            # so the GPU L2CS engine still runs.
+            if variant != "gaze360":
+                logger.warning(
+                    "[gaze_l2cs] %s download failed (%s); falling back to gaze360 weights.",
+                    variant, exc,
+                )
+                print(f"[gaze_l2cs] {variant} weights unavailable; using gaze360 weights instead.",
+                      flush=True)
+                try:
+                    g_repo, g_fname = _WEIGHTS_HF["gaze360"]
+                    g_path = os.path.join(_gaze_dir(), g_fname)
+                    if not os.path.exists(g_path):
+                        g_path = hf_hub_download(repo_id=g_repo, filename=g_fname, local_dir=_gaze_dir())
+                    weight_path = g_path
+                except Exception as exc2:  # noqa: BLE001
+                    msg = (f"[gaze_l2cs] gaze360 fallback also failed ({exc2!r}); "
+                           f"dropping to blendshape engine.")
+                    print(msg, flush=True); logger.error(msg)
+                    raise RuntimeError(msg) from exc2
+            else:
+                msg = (
+                    f"[gaze_l2cs] DOWNLOAD FAILED for {repo}/{fname}: {exc!r}. "
+                    f"Check internet / HF_TOKEN / disk space. Falling back to "
+                    f"blendshape_head_corrected engine."
+                )
+                print(msg, flush=True)
+                logger.error(msg)
+                raise RuntimeError(msg) from exc
         try:
             size_mb = os.path.getsize(weight_path) / (1024 * 1024)
         except Exception:  # noqa: BLE001

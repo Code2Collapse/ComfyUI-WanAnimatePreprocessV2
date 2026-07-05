@@ -206,6 +206,31 @@ def mediapipe_to_dlib_68(mp_landmarks_xy):
     return mp_landmarks_xy[MP_TO_DLIB68].copy()
 
 
+# FaceMesh/FaceLandmarker need the face at a decent pixel size — the attention
+# (iris) submesh loses the eye region below roughly ~200px faces. On full/half-
+# body shots (the NORMAL Wan Animate input) the padded face crop is often only
+# 60–120px → "no face found" / garbage iris = the user's "eye detection not at
+# all working". Upscaling the CROP is free w.r.t. coordinate mapping because
+# MediaPipe returns NORMALISED [0,1] coords (scale-invariant) that we multiply
+# by the ORIGINAL crop_size_wh. Verified live: a 288px face crop failed raw,
+# detected perfectly at 3× with iris rings exactly on the irises.
+_MP_MIN_CROP_SIDE = 384
+
+
+def _upscale_face_crop_if_small(face_crop_rgb_uint8):
+    """Return the crop upscaled so its long side is >= _MP_MIN_CROP_SIDE."""
+    try:
+        h, w = face_crop_rgb_uint8.shape[:2]
+        side = max(h, w)
+        if side >= _MP_MIN_CROP_SIDE or side < 8:
+            return face_crop_rgb_uint8
+        s = _MP_MIN_CROP_SIDE / float(side)
+        return cv2.resize(face_crop_rgb_uint8, (max(8, int(round(w * s))), max(8, int(round(h * s)))),
+                          interpolation=cv2.INTER_CUBIC)
+    except Exception:
+        return face_crop_rgb_uint8
+
+
 def _run_mediapipe_on_face_crop(face_crop_rgb_uint8, crop_origin_xy, crop_size_wh,
                                   full_w, full_h):
     """Run MediaPipe FaceMesh on a single face crop.
@@ -229,7 +254,7 @@ def _run_mediapipe_on_face_crop(face_crop_rgb_uint8, crop_origin_xy, crop_size_w
         return None
 
     try:
-        results = fm.process(face_crop_rgb_uint8)
+        results = fm.process(_upscale_face_crop_if_small(face_crop_rgb_uint8))
     except Exception:
         return None
     if not results.multi_face_landmarks:
@@ -331,6 +356,21 @@ except Exception as _exc:  # noqa: BLE001
         _exc,
     )
 
+# W7-G1 gaze upgrade: geometric (measured-iris) eye-in-head engine.
+# MEASURES the iris position inside the eye aperture instead of estimating
+# gaze with a NN; composes with the same solvePnP head pose + Kalman as
+# blendshape_head_corrected. Pure math, no downloads.
+try:
+    from . import gaze_iris_geometric as _gaze_iris  # type: ignore
+    _GAZE_IRIS_IMPORTED = True
+except Exception as _exc:  # noqa: BLE001
+    _gaze_iris = None
+    _GAZE_IRIS_IMPORTED = False
+    logging.getLogger(__name__).info(
+        "gaze_iris_geometric module unavailable (%s); iris_geometric engine disabled.",
+        _exc,
+    )
+
 # Stage-2 gaze upgrade: L2CS-Net (MIT license, ~3.9 deg MPIIGaze MAE,
 # ~10.4 deg Gaze360 MAE — robust to extreme head poses). Optional; only
 # imported when the user explicitly selects an `l2cs_*` engine.
@@ -390,7 +430,9 @@ def _run_face_landmarker_on_face_crop(
         return None
     if face_crop_rgb_uint8 is None or face_crop_rgb_uint8.size == 0:
         return None
-    res = _gaze_bs.run_face_landmarker(face_crop_rgb_uint8)
+    # Same small-face upscale as the FaceMesh path — normalised coords make it
+    # transparent to the crop_size_wh mapping below.
+    res = _gaze_bs.run_face_landmarker(_upscale_face_crop_if_small(face_crop_rgb_uint8))
     if res is None:
         return None
 
@@ -1058,10 +1100,27 @@ class OnnxDetectionModelLoaderV2:
 
     @classmethod
     def INPUT_TYPES(s):
+        files = list_onnx_detection_models()
+        lf = lambda x: x.lower()
+        onnx = [f for f in files if lf(f).endswith(".onnx")]
+        # Smart defaults so the node works out-of-the-box instead of defaulting
+        # both slots to the alphabetically-first file (often an animal/apt36k
+        # pose model, which makes YOLO error and ViTPose produce empty skeletons).
+        vit_default = (next((f for f in onnx if "wholebody" in lf(f)), None)
+                       or next((f for f in onnx if "vitpose" in lf(f)
+                                and "apt" not in lf(f) and "animal" not in lf(f)), None)
+                       or next((f for f in onnx if "vitpose" in lf(f)), None)
+                       or (onnx[0] if onnx else (files[0] if files else "")))
+        yolo_default = (next((f for f in onnx if "yolov10" in lf(f)), None)
+                        or next((f for f in onnx if ("yolov8" in lf(f) or "yolox" in lf(f) or "yolo11" in lf(f))
+                                 and "face" not in lf(f) and "pose" not in lf(f)), None)
+                        or next((f for f in onnx if "yolo" in lf(f)
+                                 and "face" not in lf(f) and "pose" not in lf(f) and "vitpose" not in lf(f)), None)
+                        or (files[0] if files else ""))
         return {
             "required": {
-                "vitpose_model": (list_onnx_detection_models(), {"tooltip": "ViTPose ONNX file (e.g. vitpose-h.onnx). Place in ComfyUI/models/detection/. .onnx is always listed here even if ComfyUI hides it elsewhere."}),
-                "yolo_model":    (list_onnx_detection_models(), {"tooltip": "YOLO person-detector ONNX file. Place in ComfyUI/models/detection/. .onnx always listed."}),
+                "vitpose_model": (files, {"default": vit_default, "tooltip": "ViTPose ONNX file (human wholebody, e.g. vitpose_h_wholebody_model.onnx). Place in ComfyUI/models/detection/. .onnx is always listed here even if ComfyUI hides it elsewhere."}),
+                "yolo_model":    (files, {"default": yolo_default, "tooltip": "YOLO person-detector ONNX file (e.g. yolov10m.onnx — NOT a pose model). Place in ComfyUI/models/detection/. .onnx always listed."}),
                 "onnx_device":   (["CUDAExecutionProvider", "CPUExecutionProvider"], {"default": "CUDAExecutionProvider", "tooltip": "Execution provider for ONNX Runtime. CUDA is much faster; CPU is the safe fallback."}),
             },
         }
@@ -1386,10 +1445,11 @@ class PoseAndFaceDetectionV2:
                 "eye_y_fraction": ("FLOAT", {"default": 0.30, "min": 0.10, "max": 0.60, "step": 0.01, "tooltip": "Target eye row as a fraction of crop height (0.30 = upper third). Only used when eye_align_mode = 'eye_upper_third'."}),
                 "face_cfg_scale": ("FLOAT", {"default": 1.0, "min": 1.0, "max": 10.0, "step": 0.1, "tooltip": "Wan-Animate paper recommendation #3 (paper section 4.3): CFG on the face conditioning input gives finer control over expression / gaze when finer reenactment is desired. This widget is a passthrough -- wire the FLOAT output 'face_cfg_scale' into your Wan-Animate sampler's face CFG input. 1.0 = CFG disabled (default, fastest). 2.0-4.0 = stronger expression adherence. >5.0 may over-saturate."}),
                 # ---- Gaze engine selector + Kalman tuning (appended at end for back-compat with saved workflows) ----
-                "gaze_engine": (["blendshape_head_corrected", "blendshape_only", "l2cs_gaze360", "l2cs_mpiigaze", "pose_normalized_resnet50", "ethxgaze"], {"default": "blendshape_head_corrected", "tooltip": "Per-eye gaze yaw/pitch engine.\n\n* blendshape_head_corrected (DEFAULT, recommended): MediaPipe ARKit blend shapes + solvePnP head pose + Kalman temporal smoother. Eye-in-head rotation is composed with the head rotation so the rendered arrow tracks rotated heads. Pure numpy + cv2, no downloads.\n* blendshape_only: legacy May-2026 shipped behavior; eye-in-head only, no head composition.\n* l2cs_gaze360: L2CS-Net (MIT) ResNet50 trained on Gaze360. ~10.4\u00b0 MAE but robust to extreme poses (recommended for Wan-Animate character scenes). One-time ~100MB weight download to ComfyUI/models/gaze/.\n* l2cs_mpiigaze: L2CS-Net MPIIGaze variant. ~3.9\u00b0 MAE but calibrated only for near-portrait subjects.\n* pose_normalized_resnet50: Highest-accuracy path. Pipeline = solvePnP head pose -> analytical pose-normalized 224x224 face warp (head roll removed, camera distance fixed at 600 mm) -> ResNet50+Linear(2048,2) gaze regressor -> de-rotate output back to camera frame. Major accuracy gain on tilted / off-axis heads. The normalization warp is a clean-room implementation of the 2018 ETRA paper's published equations and ships with this pack (Apache-2.0). The ResNet50 checkpoint is NOT bundled \u2014 place a community-released gaze-trained ResNet50 weight file at <ComfyUI>/models/gaze/pose_normalized_resnet50.pth.tar to enable this engine. Note: those community checkpoints are typically released under CC BY-NC-SA 4.0 (non-commercial); you are responsible for confirming the licence of any weights you install matches your use case. If the file is missing the node automatically falls back to l2cs_gaze360.\n* ethxgaze: ETH-XGaze ResNet-50 (ECCV 2020, ~2.5\u00b0 in-the-wild MAE). Post-processes iris_data using pose-normalised 224x224 face crops + the official gaze_network. Requires (a) the third_party/ETH-XGaze/ repo cloned for face_model.txt + model.py and (b) checkpoint `epoch_24_ckpt.pth.tar` placed in `ComfyUI/models/ethxgaze/`. On any missing prerequisite the engine silently keeps the previous engine's output."}),
+                "gaze_engine": (["l2cs_gaze360", "l2cs_mpiigaze", "ethxgaze", "pose_normalized_resnet50", "iris_geometric", "blendshape_head_corrected", "blendshape_only"], {"default": "l2cs_gaze360", "tooltip": "Per-eye gaze yaw/pitch engine. DEFAULT is now l2cs_gaze360 (GPU/CUDA, auto-downloads ~100MB once) so gaze runs on the GPU; blendshape_* are the CPU-only fallbacks.\n\n* iris_geometric (NEW, deterministic): MEASURES the MediaPipe iris centre inside the eye aperture (corner-to-corner, lid-to-lid) instead of estimating gaze with a NN — no per-person appearance bias, per-eye output, blink-gated, composed with the solvePnP head pose + Kalman like blendshape_head_corrected. Best fidelity for animation retargeting (the character's eyeballs copy the performer's iris positions). Pure CPU math, no downloads.\n* blendshape_head_corrected (DEFAULT, recommended): MediaPipe ARKit blend shapes + solvePnP head pose + Kalman temporal smoother. Eye-in-head rotation is composed with the head rotation so the rendered arrow tracks rotated heads. Pure numpy + cv2, no downloads.\n* blendshape_only: legacy May-2026 shipped behavior; eye-in-head only, no head composition.\n* l2cs_gaze360: L2CS-Net (MIT) ResNet50 trained on Gaze360. ~10.4\u00b0 MAE but robust to extreme poses (recommended for Wan-Animate character scenes). One-time ~100MB weight download to ComfyUI/models/gaze/.\n* l2cs_mpiigaze: L2CS-Net MPIIGaze variant. ~3.9\u00b0 MAE but calibrated only for near-portrait subjects.\n* pose_normalized_resnet50: Highest-accuracy path. Pipeline = solvePnP head pose -> analytical pose-normalized 224x224 face warp (head roll removed, camera distance fixed at 600 mm) -> ResNet50+Linear(2048,2) gaze regressor -> de-rotate output back to camera frame. Major accuracy gain on tilted / off-axis heads. The normalization warp is a clean-room implementation of the 2018 ETRA paper's published equations and ships with this pack (Apache-2.0). The ResNet50 checkpoint is NOT bundled \u2014 place a community-released gaze-trained ResNet50 weight file at <ComfyUI>/models/gaze/pose_normalized_resnet50.pth.tar to enable this engine. Note: those community checkpoints are typically released under CC BY-NC-SA 4.0 (non-commercial); you are responsible for confirming the licence of any weights you install matches your use case. If the file is missing the node automatically falls back to l2cs_gaze360.\n* ethxgaze: ETH-XGaze ResNet-50 (ECCV 2020, ~2.5\u00b0 in-the-wild MAE). Post-processes iris_data using pose-normalised 224x224 face crops + the official gaze_network. Requires (a) the third_party/ETH-XGaze/ repo cloned for face_model.txt + model.py and (b) checkpoint `epoch_24_ckpt.pth.tar` placed in `ComfyUI/models/ethxgaze/`. On any missing prerequisite the engine silently keeps the previous engine's output."}),
                 "gaze_kalman_meas_std_deg": ("FLOAT", {"default": 3.0, "min": 0.1, "max": 20.0, "step": 0.1, "tooltip": "Kalman measurement noise (degrees). Higher = trust the model less and lean on the velocity model more — smoother. Used by blendshape_head_corrected and l2cs_* engines."}),
                 "gaze_kalman_process_std": ("FLOAT", {"default": 0.8, "min": 0.05, "max": 5.0, "step": 0.05, "tooltip": "Kalman process noise (rad/s). Roughly the expected saccade velocity scale. Higher = filter reacts faster to genuine motion but jitters more."}),
                 "gaze_fps": ("FLOAT", {"default": 30.0, "min": 1.0, "max": 240.0, "step": 1.0, "tooltip": "Video fps used by the Kalman dt. Set to match your source clip; affects velocity coupling, not absolute angles."}),
+                "gaze_calibration_frame": ("INT", {"default": -1, "min": -1, "max": 999999, "tooltip": "W7-G2 per-shot gaze calibration (iris_geometric engine only). Set this to a frame index where the subject looks STRAIGHT AT THE CAMERA; the measured eye-in-head angles on that frame become the zero reference for the whole shot, removing per-person eye-shape bias (the last few degrees of error no model can fix). -1 = off."}),
                 # C0.1 — per-frame iris repaint at gaze-corrected position.
                 "apply_gaze_to_face_image": (["off", "overlay", "replace"], {"default": "off", "tooltip": "C0.1: After gaze is computed, optionally stamp a synthetic iris disk into each 512x512 face crop at the gaze-corrected position so the face-encoder input visually matches the gaze the sampler will follow. 'off' = leave face_images untouched (default). 'overlay' = draw a dark iris disk at the new position WITHOUT erasing the original iris (cheap, useful when blending). 'replace' = paint over the original iris with eye-white first, then draw the new dark iris. Shift magnitude scales with the per-eye iris radius and the engine's magnitude_norm. Failures are non-fatal: a warning is logged and face_images is preserved."}),
             },
@@ -1447,10 +1507,11 @@ class PoseAndFaceDetectionV2:
         gaze_lock_strength=0.7,
         use_mediapipe_face=True,
         use_blendshape_gaze=True,
-        gaze_engine="blendshape_head_corrected",
+        gaze_engine="l2cs_gaze360",
         gaze_kalman_meas_std_deg=3.0,
         gaze_kalman_process_std=0.8,
         gaze_fps=30.0,
+        gaze_calibration_frame=-1,
         gaze_one_euro_min_cutoff=1.7,
         gaze_one_euro_beta=0.3,
         gaze_max_yaw_deg=30.0,
@@ -1503,6 +1564,7 @@ class PoseAndFaceDetectionV2:
                 gaze_kalman_meas_std_deg,
                 gaze_kalman_process_std,
                 gaze_fps,
+                gaze_calibration_frame,
                 gaze_one_euro_min_cutoff,
                 gaze_one_euro_beta,
                 gaze_max_yaw_deg,
@@ -1548,10 +1610,11 @@ class PoseAndFaceDetectionV2:
         gaze_lock_strength=0.7,
         use_mediapipe_face=True,
         use_blendshape_gaze=True,
-        gaze_engine="blendshape_head_corrected",
+        gaze_engine="l2cs_gaze360",
         gaze_kalman_meas_std_deg=3.0,
         gaze_kalman_process_std=0.8,
         gaze_fps=30.0,
+        gaze_calibration_frame=-1,
         gaze_one_euro_min_cutoff=1.7,
         gaze_one_euro_beta=0.3,
         gaze_max_yaw_deg=30.0,
@@ -2010,6 +2073,14 @@ class PoseAndFaceDetectionV2:
                 )
                 _pose_norm_resnet50_enabled = False
                 _engine = _fb_engine
+        if _engine == "iris_geometric" and not (
+            _GAZE_IRIS_IMPORTED and _gaze_iris is not None
+        ):
+            logging.getLogger(__name__).warning(
+                "gaze_engine=iris_geometric requested but gaze_iris_geometric "
+                "unavailable; falling back to blendshape_head_corrected.",
+            )
+            _engine = "blendshape_head_corrected"
         if _engine == "blendshape_head_corrected" and not (
             _GAZE_3D_IMPORTED and _gaze_3d is not None
         ):
@@ -2018,11 +2089,17 @@ class PoseAndFaceDetectionV2:
                 "gaze_3d unavailable; falling back to blendshape_only.",
             )
             _engine = "blendshape_only"
-        bs_enabled = (_engine in ("blendshape_head_corrected", "blendshape_only")
+        _iris_geo_enabled = (_engine == "iris_geometric")
+        # iris_geometric keeps the blendshape/FaceLandmarker pass enabled: it
+        # supplies R_head for the composition and a blendshape fallback for
+        # blink-gated frames. The measured-iris source simply outranks it.
+        bs_enabled = (_engine in ("blendshape_head_corrected", "blendshape_only",
+                                  "iris_geometric")
                       and _GAZE_BS_IMPORTED
                       and _gaze_bs is not None and _gaze_bs.is_available())
         l2cs_enabled = _engine.startswith("l2cs")
-        head_correct = (_engine == "blendshape_head_corrected")
+        head_correct = (_engine in ("blendshape_head_corrected", "iris_geometric")
+                        and _GAZE_3D_IMPORTED and _gaze_3d is not None)
         max_yaw_rad = math.radians(float(gaze_max_yaw_deg))
         max_pitch_rad = math.radians(float(gaze_max_pitch_deg))
         # Lazy-init L2CS pipeline and per-eye Kalman filters once per node call.
@@ -2053,6 +2130,48 @@ class PoseAndFaceDetectionV2:
                     dt=_kalman_dt, process_std=_kalman_proc, meas_std=_kalman_meas,
                 ),
             }
+        # ── W7-G2: per-shot gaze calibration pre-pass (iris_geometric only) ──
+        # Measure the eye-in-head angles on the user-designated "subject looks
+        # straight at the camera" frame and make them the zero reference for
+        # the whole shot. Runs BEFORE the main loop so every frame (including
+        # ones earlier than the calibration frame) gets the corrected origin.
+        if _iris_geo_enabled:
+            _gaze_iris.reset_calibration()   # never leak a previous run's offsets
+            _cal_idx = int(gaze_calibration_frame)
+            if 0 <= _cal_idx < B:
+                try:
+                    rx1, rx2, ry1, ry2 = raw_face_bboxes[_cal_idx]
+                    _side = max(rx2 - rx1, ry2 - ry1) * 1.4
+                    _ccx, _ccy = 0.5 * (rx1 + rx2), 0.5 * (ry1 + ry2)
+                    _h = 0.5 * _side
+                    _mx1 = int(max(0, round(_ccx - _h)))
+                    _my1 = int(max(0, round(_ccy - _h)))
+                    _mx2 = int(min(W, round(_ccx + _h)))
+                    _my2 = int(min(H, round(_ccy + _h)))
+                    _cal_res = None
+                    if _mx2 - _mx1 > 8 and _my2 - _my1 > 8:
+                        _cal_crop = (np.clip(images_np[_cal_idx][_my1:_my2, _mx1:_mx2], 0, 1) * 255).astype(np.uint8)
+                        if bs_enabled:
+                            _cal_res = _run_face_landmarker_on_face_crop(
+                                _cal_crop, (_mx1, _my1), (_mx2 - _mx1, _my2 - _my1), W, H)
+                        if _cal_res is None:
+                            _cal_res = _run_mediapipe_on_face_crop(
+                                _cal_crop, (_mx1, _my1), (_mx2 - _mx1, _my2 - _my1), W, H)
+                    if _cal_res is not None:
+                        _gaze_iris.calibrate_from_measurement(
+                            _gaze_iris.eye_in_head_from_iris(_cal_res, "right"),
+                            _gaze_iris.eye_in_head_from_iris(_cal_res, "left"),
+                        )
+                        logging.getLogger(__name__).info(
+                            "[iris_geometric] calibrated on frame %d: %s",
+                            _cal_idx, _gaze_iris.get_calibration())
+                    else:
+                        logging.getLogger(__name__).warning(
+                            "[iris_geometric] calibration frame %d: no face found; "
+                            "calibration skipped (gaze stays uncalibrated).", _cal_idx)
+                except Exception as exc:  # noqa: BLE001
+                    logging.getLogger(__name__).warning(
+                        "[iris_geometric] calibration pre-pass failed: %s", exc)
         mp_used_count = 0
         bs_used_count = 0
         l2cs_used_count = 0
@@ -2198,7 +2317,7 @@ class PoseAndFaceDetectionV2:
                         }
                         l2cs_used_count += 1
                 gaze_bs = mp_result.get('gaze_blendshape')
-                if gaze_bs is not None or _l2cs_per_eye is not None:
+                if gaze_bs is not None or _l2cs_per_eye is not None or _iris_geo_enabled:
                     # Blend-shape path: rescale yaw/pitch to user-tuned max
                     # angles (defaults already factor in MAX_GAZE_*_RAD,
                     # so divide by them and remultiply by the new max).
@@ -2253,6 +2372,30 @@ class PoseAndFaceDetectionV2:
                             e['source'] = 'l2cs_' + (
                                 "gaze360" if _engine == "l2cs_gaze360" else "mpiigaze"
                             )
+                        elif _iris_geo_enabled:
+                            # W7-G1: MEASURED iris-in-aperture eye-in-head gaze.
+                            # Outranks the blendshape estimate; blink-gated
+                            # frames fall back to blendshapes (if available)
+                            # so the Kalman stream never starves.
+                            _ge = None
+                            try:
+                                _ge = _gaze_iris.eye_in_head_from_iris(mp_result, eye_name)
+                            except Exception:  # noqa: BLE001
+                                _ge = None
+                            if _ge is not None:
+                                e = _ge
+                                e['source'] = 'iris_geometric'
+                            elif gaze_bs is not None:
+                                e = dict(gaze_bs[eye_name])
+                                e['yaw_rad'] = float(e['yaw_rad']) / max(base_yaw, 1e-6) * max_yaw_rad
+                                e['pitch_rad'] = float(e['pitch_rad']) / max(base_pitch, 1e-6) * max_pitch_rad
+                                e['source'] = 'blendshape_blink_fallback'
+                            else:
+                                # Blink/occlusion with no fallback: hold neutral;
+                                # the Kalman velocity model coasts through it.
+                                e = {'yaw_rad': 0.0, 'pitch_rad': 0.0,
+                                     'blink': 1.0, 'confidence': 0.0,
+                                     'source': 'iris_geometric_gated'}
                         else:
                             e = dict(gaze_bs[eye_name])
                             e['yaw_rad'] = float(e['yaw_rad']) / max(base_yaw, 1e-6) * max_yaw_rad
@@ -2288,7 +2431,10 @@ class PoseAndFaceDetectionV2:
                                 _dx, _dy = _dx2, _dy2
                             e['yaw_rad'] = float(_yaw_w)
                             e['pitch_rad'] = float(_pitch_w)
-                            e['source'] = 'blendshape_head_corrected'
+                            e['source'] = ('iris_geometric_head_corrected'
+                                           if _iris_geo_enabled and
+                                           str(e.get('source', '')).startswith('iris_geometric')
+                                           else 'blendshape_head_corrected')
                             _yaw = float(_yaw_w)
                             _pitch = float(_pitch_w)
                         else:
@@ -2722,6 +2868,17 @@ class PoseAndFaceDetectionV2:
                 frame_u8, pose_metas[idx]['keypoints_face'],
                 all_iris[idx], face_bboxes[idx], bboxes[idx], W, H,
             )
+            # Fold the full OP18 body skeleton + hands onto the same debug image
+            # (this is what the old standalone WanPoseOverlayV2 node did — now
+            # built in, so debug_image is a complete verification overlay:
+            # body + face + hands + iris + gaze, no second node to wire).
+            try:
+                from .nodes_extras.pose_overlay import draw_body_skeleton_rgb as _draw_body
+                _draw_body(cv2, vis, pose_metas[idx], W, H)
+            except Exception as _ov_exc:                                  # noqa: BLE001
+                logging.getLogger(__name__).debug(
+                    "body-skeleton overlay skipped on frame %d: %s", idx, _ov_exc,
+                )
             debug_frames.append(vis)
         debug_np = np.stack(debug_frames, 0).astype(np.float32) / 255.0
         debug_tensor = torch.from_numpy(debug_np)
