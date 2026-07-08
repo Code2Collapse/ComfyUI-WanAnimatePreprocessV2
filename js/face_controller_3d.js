@@ -1338,7 +1338,7 @@ function buildEditor(node) {
             info.textContent=`${g.yaw.toFixed(1)}\u00b0 / ${g.pitch.toFixed(1)}\u00b0`;
         }
         let dragging=false;
-        function m2g(e){const rect=gCvs.getBoundingClientRect(),mx=e.clientX-rect.left,my=e.clientY-rect.top;return{yaw:Math.max(-MAX_DEG,Math.min(MAX_DEG,((mx-SZ/2)/R)*MAX_DEG)),pitch:Math.max(-MAX_DEG,Math.min(MAX_DEG,((SZ/2-my)/R)*MAX_DEG))};}
+        function m2g(e){const rect=gCvs.getBoundingClientRect(),kx=(gCvs.offsetWidth||SZ)/(rect.width||SZ),ky=(gCvs.offsetHeight||SZ)/(rect.height||SZ),mx=(e.clientX-rect.left)*kx,my=(e.clientY-rect.top)*ky;return{yaw:Math.max(-MAX_DEG,Math.min(MAX_DEG,((mx-SZ/2)/R)*MAX_DEG)),pitch:Math.max(-MAX_DEG,Math.min(MAX_DEG,((SZ/2-my)/R)*MAX_DEG))};}
         gCvs.addEventListener("mousedown",e=>{e.preventDefault();dragging=true;const g=m2g(e);_setGazeForFrame(state.frame,eyeKey,g.yaw,g.pitch);if(gazeLinked)_setGazeForFrame(state.frame,eyeKey==="l"?"r":"l",g.yaw,g.pitch);_drawGimbals();render();});
         gCvs.addEventListener("mousemove",e=>{if(!dragging)return;const g=m2g(e);_setGazeForFrame(state.frame,eyeKey,g.yaw,g.pitch);if(gazeLinked)_setGazeForFrame(state.frame,eyeKey==="l"?"r":"l",g.yaw,g.pitch);_drawGimbals();render();});
         const up=()=>{dragging=false;};
