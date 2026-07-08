@@ -126,6 +126,18 @@ function makePanel(node) {
     );
     root.appendChild(header);
 
+    // Fallback banner — reveals when the requested accurate gaze engine
+    // silently degraded (e.g. ETH-XGaze checkpoint missing). Hidden otherwise.
+    const statusEl = document.createElement("div");
+    statusEl.style.cssText = `
+        display:none; flex:0 0 auto; font-size:10.5px; line-height:1.35;
+        padding:5px 8px; border-radius:6px;
+        background:${_fill(C.amber, "#fab387")}1e;
+        border:1px solid ${_fill(C.amber, "#fab387")}55;
+        color:${_fill(C.amber, "#fab387")};
+    `;
+    root.appendChild(statusEl);
+
     // Canvas stage.
     const stage = document.createElement("div");
     stage.style.cssText = `
@@ -269,7 +281,21 @@ function makePanel(node) {
         if (frameIdx > total - 1) frameIdx = 0;
         scrub.value = String(frameIdx);
         frameEl.textContent = total ? `frame ${frameIdx + 1}/${total}` : "frame —";
-        engineEl.textContent = m?.engine ? `engine: ${m.engine}` : "";
+        // Engine + accuracy readout, honest about what actually ran.
+        if (m?.engine) {
+            const acc = m.engine_accuracy ? ` · ${m.engine_accuracy}` : "";
+            engineEl.textContent = `gaze: ${m.engine}${acc}`;
+            engineEl.style.color = m.engine_status
+                ? _fill(C.amber, "#fab387") : _fill(C.overlay1, "#7f849c");
+        } else {
+            engineEl.textContent = "";
+        }
+        if (m?.engine_status) {
+            statusEl.style.display = "block";
+            statusEl.textContent = "⚠ " + m.engine_status;
+        } else {
+            statusEl.style.display = "none";
+        }
         // Preload the previews so the backdrop is ready.
         for (const p of (m?.previews || [])) loadImage(p.b64, render);
         render();

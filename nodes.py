@@ -2019,6 +2019,12 @@ class PoseAndFaceDetectionV2:
         # Resolve the gaze engine. `use_blendshape_gaze=False` forces the
         # legacy iris-offset path regardless of `gaze_engine`.
         _engine = str(gaze_engine or "blendshape_head_corrected").strip()
+        # Honest gaze-engine status: track what the user REQUESTED vs what
+        # actually ran, and why it fell back, so the viewer can tell the user
+        # (the accurate engines silently degraded before — the "gaze not
+        # accurate" complaint). _gaze_note is set at each fallback below.
+        _gaze_requested = _engine
+        _gaze_note = None
         if not bool(use_blendshape_gaze):
             _engine = "legacy_iris_offset"
         # C0.4: ethxgaze is a *post-process* over a base engine — the
@@ -2036,6 +2042,8 @@ class PoseAndFaceDetectionV2:
                 "falling back to blendshape_head_corrected.",
                 _engine,
             )
+            _gaze_note = (f"{_engine} unavailable (install l2cs-net / check weights) "
+                          "— using blendshape_head_corrected")
             _engine = "blendshape_head_corrected"
         # The pose_normalized_resnet50 engine requires the normalizer
         # module, the ResNet50 estimator module, AND a usable checkpoint
@@ -2071,6 +2079,9 @@ class PoseAndFaceDetectionV2:
                     "gaze_engine=pose_normalized_resnet50 disabled (%s); "
                     "falling back to %s.", _missing_reason, _fb_engine,
                 )
+                _gaze_note = (f"pose_normalized_resnet50 disabled ({_missing_reason}) "
+                              f"— using {_fb_engine}. Drop a ResNet50 gaze checkpoint at "
+                              "models/gaze/pose_normalized_resnet50.pth.tar to enable ~3-4°.")
                 _pose_norm_resnet50_enabled = False
                 _engine = _fb_engine
         if _engine == "iris_geometric" and not (
@@ -2738,6 +2749,7 @@ class PoseAndFaceDetectionV2:
         # from the ETH-XGaze ResNet-50 model. Requires the third_party
         # repo + checkpoint; on any failure we keep the original engine's
         # output and emit a warning.
+        _ethxgaze_ok = False
         if _ethxgaze_post:
             try:
                 from .nodes_extras.gaze_ethxgaze import WanGazeETHXGazeV2 as _ETHX
@@ -2748,8 +2760,14 @@ class PoseAndFaceDetectionV2:
                 )
                 pose_data["iris_data"] = _patched_bundle.get("iris_data", pose_data["iris_data"])
                 all_iris = pose_data["iris_data"]
+                _ethxgaze_ok = True
+                _engine = "ethxgaze"
                 logging.getLogger(__name__).info("ethxgaze post-process: %s", _info)
             except Exception as _exc:                                    # noqa: BLE001
+                _gaze_note = (
+                    "ETH-XGaze (~2.5°) checkpoint missing — using "
+                    f"{_engine}. Drop epoch_24_ckpt.pth.tar into models/ethxgaze/ "
+                    "to enable it. (" + str(_exc)[:80] + ")")
                 logging.getLogger(__name__).warning(
                     "gaze_engine=ethxgaze post-process failed (%s); "
                     "keeping previous engine output.", _exc,
@@ -2997,11 +3015,22 @@ class PoseAndFaceDetectionV2:
                     })
         except Exception:  # noqa: BLE001
             _viewer_previews = []
+        _GAZE_ACCURACY = {
+            "ethxgaze": "~2.5° MAE", "pose_normalized_resnet50": "~3-4° MAE",
+            "l2cs_mpiigaze": "~3.9° MAE", "l2cs_gaze360": "~10.4° MAE",
+            "iris_geometric": "iris-measured (deterministic)",
+            "blendshape_head_corrected": "blendshape + head (approx)",
+            "blendshape_only": "eye-in-head (approx)",
+            "legacy_iris_offset": "rough",
+        }
         _ui_payload = {
             "viewer_meta": [json.dumps({
                 "src_w": int(W), "src_h": int(H),
                 "n_frames": int(B),
                 "engine": str(_engine),
+                "engine_requested": str(_gaze_requested),
+                "engine_accuracy": _GAZE_ACCURACY.get(str(_engine), ""),
+                "engine_status": _gaze_note,   # non-null only when it fell back
                 "frames": _viewer_frames,
                 "previews": _viewer_previews,
             })],
