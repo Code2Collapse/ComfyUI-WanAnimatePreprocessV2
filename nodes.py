@@ -2969,12 +2969,41 @@ class PoseAndFaceDetectionV2:
                 })
         except Exception:  # noqa: BLE001
             _viewer_frames = []
+        # Clean downscaled frame previews so the viewer can REVEAL the
+        # skeleton/iris/gaze overlaid on the ACTUAL image (not a blank tile).
+        # Capped + downscaled to keep the websocket cheap; the frontend draws
+        # the nearest available preview as the backdrop for the current frame.
+        _viewer_previews = []
+        try:
+            import base64  # noqa: PLC0415
+            import cv2 as _cv2  # noqa: N813
+            _pv_max = min(60, int(B))
+            _pv_long = 320  # longest side px
+            _idxs = ([0] if _pv_max <= 1
+                     else [round(i * (B - 1) / (_pv_max - 1)) for i in range(_pv_max)])
+            for _pi in sorted(set(_idxs)):
+                _fr = images_np[_pi]  # H,W,C float 0..1
+                _hh, _ww = _fr.shape[:2]
+                _sc = _pv_long / float(max(_hh, _ww))
+                if _sc < 1.0:
+                    _fr = _cv2.resize(_fr, (max(1, int(_ww * _sc)), max(1, int(_hh * _sc))),
+                                      interpolation=_cv2.INTER_AREA)
+                _u8 = (np.clip(_fr, 0.0, 1.0) * 255.0).astype(np.uint8)[:, :, ::-1]  # RGB->BGR
+                _ok, _buf = _cv2.imencode(".jpg", _u8, [int(_cv2.IMWRITE_JPEG_QUALITY), 72])
+                if _ok:
+                    _viewer_previews.append({
+                        "frame": int(_pi),
+                        "b64": "data:image/jpeg;base64," + base64.b64encode(_buf.tobytes()).decode("ascii"),
+                    })
+        except Exception:  # noqa: BLE001
+            _viewer_previews = []
         _ui_payload = {
             "viewer_meta": [json.dumps({
                 "src_w": int(W), "src_h": int(H),
                 "n_frames": int(B),
                 "engine": str(_engine),
                 "frames": _viewer_frames,
+                "previews": _viewer_previews,
             })],
         }
 

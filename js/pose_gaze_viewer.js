@@ -1,25 +1,24 @@
-// pose_gaze_viewer.js — C.2 / C0.6
+// pose_gaze_viewer.js — always-on Pose · Face · Gaze viewer panel.
 //
-// In-canvas overlay for PoseAndFaceDetectionV2 showing skeleton + iris +
-// gaze-arrow per frame, driven by the `ui.viewer_meta` payload emitted
-// from PoseAndFaceDetectionV2.process().
+// REVEALS the detection: a real DOM panel that shows the source frame with
+// the pose skeleton, iris dots and gaze arrows drawn ON the image (not on a
+// blank tile, and not hidden until you queue). Before a run it shows the
+// connected input image with a "queue to detect" hint; after a run it
+// overlays the detected skeleton/iris/gaze from `viewer_meta` (which now
+// carries downscaled frame previews as the backdrop).
 //
-// Three toggle widgets are added to the node (UI-only — they do not
-// affect Python execution):
-//   viewer_show_skeleton  BOOLEAN  default true
-//   viewer_show_iris      BOOLEAN  default true
-//   viewer_show_gaze      BOOLEAN  default true
-//
-// A frame slider lets you scrub through up to 240 captured frames.
+// Toggle chips (skeleton / iris / gaze) + a frame scrubber. Read-only for
+// now — stage 2 grows this into an editable landmark editor.
 //
 // License: Apache-2.0
 
 import { app } from "../../scripts/app.js";
-import { C, T, reducedMotion } from "./_c2c_theme.js";
+import { C } from "./_c2c_theme.js";
 import { reportFailure } from "./_c2c_report.js";
 
 const NODE_CLASS = "PoseAndFaceDetectionV2";
 const UI_KEY     = "viewer_meta";
+const PANEL_H    = 340;
 
 // Compact OpenPose-18 skeleton edges (subset that's always meaningful).
 const SKELETON_EDGES = [
@@ -28,6 +27,19 @@ const SKELETON_EDGES = [
     [1, 11], [11, 12], [12, 13],
     [1, 0], [0, 14], [0, 15], [14, 16], [15, 17],
 ];
+
+// Decoded-image cache keyed by data-URL / src (avoid re-decoding each render).
+const IMG_CACHE = new Map();
+function loadImage(src, onReady) {
+    if (!src) return null;
+    const hit = IMG_CACHE.get(src);
+    if (hit) return hit.complete ? hit : null;
+    const img = new Image();
+    img.onload = () => { try { onReady?.(); } catch (_) {} };
+    img.src = src;
+    IMG_CACHE.set(src, img);
+    return null;
+}
 
 function parseMeta(message) {
     try {
@@ -41,127 +53,232 @@ function parseMeta(message) {
     }
 }
 
-function clamp(v, lo, hi) { return v < lo ? lo : (v > hi ? hi : v); }
-
-function drawOverlay(ctx, node, meta) {
-    if (!meta || !Array.isArray(meta.frames) || meta.frames.length === 0) {
-        // Position the placeholder just below the last widget, but CLAMP it
-        // inside the node. CRITICAL: never mutate node.size here. This runs in
-        // onDrawForeground (every frame) — growing the node from inside draw
-        // caused an unbounded expand-on-draw loop (size grew -> setDirtyCanvas
-        // -> redraw -> grew again ...), pegging CPU and crashing ComfyUI.
-        const widgets = node.widgets || [];
-        const last_w = widgets.length ? widgets[widgets.length - 1] : null;
-        const belowWidgets = (last_w && typeof last_w.last_y === "number")
-            ? last_w.last_y + 20
-            : node.size[1] - 28;
-        const y = Math.min(belowWidgets, node.size[1] - 8);
-        ctx.save();
-        ctx.font = "11px sans-serif";
-        ctx.fillStyle = C.dim;
-        ctx.fillText("gaze viewer: no data yet — queue the node", 12, y);
-        ctx.restore();
-        return;
-    }
-    const showSkel = node.__pgv_showSkel?.value !== false;
-    const showIris = node.__pgv_showIris?.value !== false;
-    const showGaze = node.__pgv_showGaze?.value !== false;
-    const frameIdx = clamp(node.__pgv_frame | 0, 0, meta.frames.length - 1);
-    const frame = meta.frames[frameIdx];
-    if (!frame) return;
-
-    // Reserve a square preview area below the regular widgets.
-    const pad = 8;
-    const w   = node.size[0] - 2 * pad;
-    const previewH = Math.min(220, Math.max(120, w * (meta.src_h / meta.src_w)));
-    const x0  = pad;
-    const y0  = node.size[1] - previewH - 24;
-
-    ctx.save();
-    // Background tile.
-    ctx.fillStyle = C.bg3 || C.bg;
-    ctx.fillRect(x0, y0, w, previewH);
-    ctx.strokeStyle = C.border;
-    ctx.lineWidth = 1;
-    ctx.strokeRect(x0 + 0.5, y0 + 0.5, w - 1, previewH - 1);
-
-    const sx = w / meta.src_w;
-    const sy = previewH / meta.src_h;
-    const px = (x) => x0 + x * sx;
-    const py = (y) => y0 + y * sy;
-
-    // Skeleton.
-    if (showSkel && Array.isArray(frame.skeleton)) {
-        ctx.strokeStyle = C.blue || "#89b4fa";
-        ctx.lineWidth = 2;
-        for (const [a, b] of SKELETON_EDGES) {
-            const pa = frame.skeleton[a];
-            const pb = frame.skeleton[b];
-            if (!pa || !pb) continue;
-            ctx.beginPath();
-            ctx.moveTo(px(pa[0]), py(pa[1]));
-            ctx.lineTo(px(pb[0]), py(pb[1]));
-            ctx.stroke();
+// Walk upstream from the node's image input to find a rendered preview so the
+// panel can show SOMETHING before the node is queued.
+function resolveUpstreamImageURL(node) {
+    try {
+        const graph = node.graph || app.graph;
+        const inp = (node.inputs || []).find(i => /^images?$/i.test(i.name) && i.link != null);
+        if (!inp) return null;
+        const seen = new Set();
+        let queue = [graph.links?.[inp.link]?.origin_id];
+        while (queue.length) {
+            const id = queue.shift();
+            if (id == null || seen.has(id)) continue;
+            seen.add(id);
+            const n = graph.getNodeById?.(id);
+            if (!n) continue;
+            if (n.imgs && n.imgs.length && n.imgs[0]?.src) return n.imgs[0].src;
+            for (const ni of (n.inputs || [])) {
+                if (ni.link != null) queue.push(graph.links?.[ni.link]?.origin_id);
+            }
         }
-        ctx.fillStyle = C.green || "#a6e3a1";
-        for (const p of frame.skeleton) {
-            if (!p) continue;
-            ctx.beginPath();
-            ctx.arc(px(p[0]), py(p[1]), 2.5, 0, Math.PI * 2);
-            ctx.fill();
-        }
-    }
+    } catch (_) { /* best-effort */ }
+    return null;
+}
 
-    // Iris dots + gaze arrows.
-    const eyes = [
-        { key: "right_iris", gkey: "right_gaze", color: C.red || "#f38ba8" },
-        { key: "left_iris",  gkey: "left_gaze",  color: C.teal || "#94e2d5" },
-    ];
-    for (const e of eyes) {
-        const ir = frame[e.key];
-        const gz = frame[e.gkey];
-        if (!ir || ir.length < 2) continue;
-        const ix = px(ir[0]);
-        const iy = py(ir[1]);
-        if (showIris) {
-            ctx.fillStyle = e.color;
-            ctx.beginPath();
-            ctx.arc(ix, iy, 3, 0, Math.PI * 2);
-            ctx.fill();
-        }
-        if (showGaze && gz && gz.length >= 3 && gz[2] > 0.01) {
-            const len = 28 * gz[2];
-            const ex = ix + gz[0] * len;
-            const ey = iy + gz[1] * len;
-            ctx.strokeStyle = e.color;
-            ctx.lineWidth = 2;
-            ctx.beginPath();
-            ctx.moveTo(ix, iy);
-            ctx.lineTo(ex, ey);
-            ctx.stroke();
-            // arrow head
-            const ang = Math.atan2(ey - iy, ex - ix);
-            const ah = 5;
-            ctx.beginPath();
-            ctx.moveTo(ex, ey);
-            ctx.lineTo(ex - ah * Math.cos(ang - 0.5),
-                       ey - ah * Math.sin(ang - 0.5));
-            ctx.lineTo(ex - ah * Math.cos(ang + 0.5),
-                       ey - ah * Math.sin(ang + 0.5));
-            ctx.closePath();
-            ctx.fillStyle = e.color;
-            ctx.fill();
-        }
-    }
+const _fill = (v, def) => (v || def);
 
-    // Status pill.
-    ctx.font = "10px sans-serif";
-    ctx.fillStyle = C.dim || "#888";
-    ctx.fillText(
-        `frame ${frameIdx + 1}/${meta.frames.length}  engine=${meta.engine || "?"}`,
-        x0 + 4, y0 + previewH + 12,
+function makePanel(node) {
+    const root = document.createElement("div");
+    root.className = "pgv-root";
+    root.style.cssText = `
+        display:flex; flex-direction:column; gap:6px; width:100%; height:100%;
+        box-sizing:border-box; font-family:ui-sans-serif,system-ui,sans-serif;
+        color:${_fill(C.gray150, "#cdd6f4")};
+        background:${_fill(C.scrimDark7, "#181825")}; border-radius:8px; padding:8px;
+        overflow:hidden; min-height:0;
+    `;
+
+    // Header: title + engine readout + toggle chips.
+    const header = document.createElement("div");
+    header.style.cssText = "display:flex; align-items:center; gap:6px; flex:0 0 auto; flex-wrap:wrap;";
+    const title = document.createElement("span");
+    title.textContent = "Pose · Face · Gaze";
+    title.style.cssText = "font-weight:600; font-size:12px;";
+    const engineEl = document.createElement("span");
+    engineEl.style.cssText = `font-size:10.5px; color:${_fill(C.overlay1, "#7f849c")}; margin-left:2px;`;
+    const spacer = document.createElement("span");
+    spacer.style.cssText = "flex:1 1 auto;";
+    header.append(title, engineEl, spacer);
+
+    const state = { skel: true, iris: true, gaze: true };
+    const mkChip = (label, key, color) => {
+        const b = document.createElement("button");
+        b.type = "button";
+        b.textContent = label;
+        const paint = () => {
+            b.style.cssText = `
+                font-size:10.5px; padding:3px 8px; border-radius:999px; cursor:pointer;
+                border:1px solid ${state[key] ? color : _fill(C.surface1, "#45475a")};
+                background:${state[key] ? color + "22" : "transparent"};
+                color:${state[key] ? color : _fill(C.overlay1, "#7f849c")};
+            `;
+        };
+        paint();
+        b.onclick = () => { state[key] = !state[key]; paint(); render(); };
+        return b;
+    };
+    header.append(
+        mkChip("🦴 skeleton", "skel", _fill(C.blue, "#89b4fa")),
+        mkChip("👁 iris", "iris", _fill(C.red, "#f38ba8")),
+        mkChip("↗ gaze", "gaze", _fill(C.teal, "#94e2d5")),
     );
-    ctx.restore();
+    root.appendChild(header);
+
+    // Canvas stage.
+    const stage = document.createElement("div");
+    stage.style.cssText = `
+        position:relative; flex:1 1 auto; min-height:0; border-radius:6px;
+        background:${_fill(C.black, "#0b0b12")}; border:1px solid ${_fill(C.surface1, "#45475a")};
+        overflow:hidden;
+    `;
+    const cvs = document.createElement("canvas");
+    cvs.style.cssText = "width:100%; height:100%; display:block;";
+    stage.appendChild(cvs);
+    root.appendChild(stage);
+
+    // Scrubber row.
+    const scrubRow = document.createElement("div");
+    scrubRow.style.cssText = "display:flex; align-items:center; gap:8px; flex:0 0 auto;";
+    const scrub = document.createElement("input");
+    scrub.type = "range"; scrub.min = "0"; scrub.max = "0"; scrub.value = "0"; scrub.step = "1";
+    scrub.style.cssText = "flex:1 1 auto; accent-color:" + _fill(C.blue, "#89b4fa") + ";";
+    const frameEl = document.createElement("span");
+    frameEl.style.cssText = `font:11px ui-monospace,monospace; color:${_fill(C.overlay1, "#a6adc8")}; white-space:nowrap;`;
+    frameEl.textContent = "frame —";
+    scrubRow.append(scrub, frameEl);
+    root.appendChild(scrubRow);
+
+    const ctx = cvs.getContext("2d");
+    let meta = null;
+    let frameIdx = 0;
+
+    function _nearestPreview(idx) {
+        const pv = meta?.previews;
+        if (!pv || !pv.length) return null;
+        let best = pv[0], bd = Infinity;
+        for (const p of pv) { const d = Math.abs(p.frame - idx); if (d < bd) { bd = d; best = p; } }
+        return best;
+    }
+
+    function render() {
+        const dpr = window.devicePixelRatio || 1;
+        const r = cvs.getBoundingClientRect();
+        const W = Math.max(1, Math.round(r.width)), H = Math.max(1, Math.round(r.height));
+        if (cvs.width !== W * dpr || cvs.height !== H * dpr) { cvs.width = W * dpr; cvs.height = H * dpr; }
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        ctx.clearRect(0, 0, W, H);
+
+        // Backdrop: preview for the current frame (after run), else upstream image.
+        let bdImg = null, srcW = meta?.src_w || 0, srcH = meta?.src_h || 0;
+        const pv = _nearestPreview(frameIdx);
+        if (pv) bdImg = loadImage(pv.b64, render);
+        if (!bdImg) {
+            const up = resolveUpstreamImageURL(node);
+            if (up) { bdImg = loadImage(up, render); if (bdImg && !srcW) { srcW = bdImg.naturalWidth; srcH = bdImg.naturalHeight; } }
+        }
+
+        // Fit the image (letterbox) → drawn rect (ix,iy,iw,ih).
+        let ix = 0, iy = 0, iw = W, ih = H;
+        if (bdImg) {
+            const iar = bdImg.naturalWidth / bdImg.naturalHeight, sar = W / H;
+            if (iar > sar) { iw = W; ih = W / iar; } else { ih = H; iw = H * iar; }
+            ix = (W - iw) / 2; iy = (H - ih) / 2;
+            ctx.imageSmoothingEnabled = true; ctx.imageSmoothingQuality = "high";
+            ctx.drawImage(bdImg, ix, iy, iw, ih);
+            if (!srcW) { srcW = bdImg.naturalWidth; srcH = bdImg.naturalHeight; }
+        } else {
+            // Empty state — clear invitation, never a blank void.
+            ctx.fillStyle = "rgba(148,158,190,0.5)";
+            ctx.textAlign = "center"; ctx.textBaseline = "middle";
+            ctx.font = "26px system-ui,sans-serif";
+            ctx.fillText("👁", W / 2, H / 2 - 22);
+            ctx.fillStyle = "rgba(168,178,208,0.7)";
+            ctx.font = "600 12px system-ui,sans-serif";
+            ctx.fillText("Connect an image, then Queue", W / 2, H / 2 + 2);
+            ctx.fillStyle = "rgba(128,138,166,0.55)";
+            ctx.font = "11px system-ui,sans-serif";
+            ctx.fillText("the skeleton, iris and gaze appear here on the frame", W / 2, H / 2 + 20);
+            ctx.textAlign = "left"; ctx.textBaseline = "alphabetic";
+        }
+
+        // Overlay (only with detection data). src coords → drawn rect.
+        const frame = meta?.frames?.[frameIdx];
+        if (frame && srcW && srcH) {
+            const sx = iw / srcW, sy = ih / srcH;
+            const px = (x) => ix + x * sx, py = (y) => iy + y * sy;
+
+            if (state.skel && Array.isArray(frame.skeleton)) {
+                ctx.strokeStyle = _fill(C.blue, "#89b4fa"); ctx.lineWidth = 2;
+                for (const [a, b] of SKELETON_EDGES) {
+                    const pa = frame.skeleton[a], pb = frame.skeleton[b];
+                    if (!pa || !pb) continue;
+                    ctx.beginPath(); ctx.moveTo(px(pa[0]), py(pa[1])); ctx.lineTo(px(pb[0]), py(pb[1])); ctx.stroke();
+                }
+                ctx.fillStyle = _fill(C.green, "#a6e3a1");
+                for (const p of frame.skeleton) {
+                    if (!p) continue;
+                    ctx.beginPath(); ctx.arc(px(p[0]), py(p[1]), 2.5, 0, Math.PI * 2); ctx.fill();
+                }
+            }
+            const eyes = [
+                { key: "right_iris", gkey: "right_gaze", color: _fill(C.red, "#f38ba8") },
+                { key: "left_iris",  gkey: "left_gaze",  color: _fill(C.teal, "#94e2d5") },
+            ];
+            for (const e of eyes) {
+                const ir = frame[e.key], gz = frame[e.gkey];
+                if (!ir || ir.length < 2) continue;
+                const iX = px(ir[0]), iY = py(ir[1]);
+                if (state.iris) {
+                    ctx.fillStyle = e.color;
+                    ctx.beginPath(); ctx.arc(iX, iY, 3.5, 0, Math.PI * 2); ctx.fill();
+                }
+                if (state.gaze && gz && gz.length >= 3 && gz[2] > 0.01) {
+                    const len = 34 * gz[2], ex = iX + gz[0] * len, ey = iY + gz[1] * len;
+                    ctx.strokeStyle = e.color; ctx.lineWidth = 2;
+                    ctx.beginPath(); ctx.moveTo(iX, iY); ctx.lineTo(ex, ey); ctx.stroke();
+                    const ang = Math.atan2(ey - iY, ex - iX), ah = 6;
+                    ctx.beginPath(); ctx.moveTo(ex, ey);
+                    ctx.lineTo(ex - ah * Math.cos(ang - 0.5), ey - ah * Math.sin(ang - 0.5));
+                    ctx.lineTo(ex - ah * Math.cos(ang + 0.5), ey - ah * Math.sin(ang + 0.5));
+                    ctx.closePath(); ctx.fillStyle = e.color; ctx.fill();
+                }
+            }
+        } else if (bdImg) {
+            // Image present but no detection yet — prompt to queue.
+            ctx.fillStyle = "rgba(0,0,0,0.45)"; ctx.fillRect(ix, iy + ih - 22, iw, 22);
+            ctx.fillStyle = "rgba(230,235,245,0.9)"; ctx.font = "11px system-ui,sans-serif";
+            ctx.textAlign = "center";
+            ctx.fillText("Queue to detect skeleton · iris · gaze", ix + iw / 2, iy + ih - 8);
+            ctx.textAlign = "left";
+        }
+    }
+
+    scrub.oninput = () => {
+        frameIdx = parseInt(scrub.value, 10) || 0;
+        const total = meta?.frames?.length || 0;
+        frameEl.textContent = total ? `frame ${frameIdx + 1}/${total}` : "frame —";
+        render();
+    };
+
+    function setMeta(m) {
+        meta = m;
+        const total = m?.frames?.length || 0;
+        scrub.max = String(Math.max(0, total - 1));
+        if (frameIdx > total - 1) frameIdx = 0;
+        scrub.value = String(frameIdx);
+        frameEl.textContent = total ? `frame ${frameIdx + 1}/${total}` : "frame —";
+        engineEl.textContent = m?.engine ? `engine: ${m.engine}` : "";
+        // Preload the previews so the backdrop is ready.
+        for (const p of (m?.previews || [])) loadImage(p.b64, render);
+        render();
+    }
+
+    const _ro = new ResizeObserver(() => render());
+    _ro.observe(stage);
+
+    return { root, setMeta, render, dispose: () => { try { _ro.disconnect(); } catch (_) {} } };
 }
 
 app.registerExtension({
@@ -173,27 +290,21 @@ app.registerExtension({
         nodeType.prototype.onNodeCreated = function () {
             const r = onNodeCreated?.apply(this, arguments);
             try {
-                this.__pgv_meta  = null;
-                this.__pgv_frame = 0;
-                this.__pgv_showSkel = this.addWidget("toggle",
-                    "viewer_show_skeleton", true, () => { this.setDirtyCanvas(true, false); });
-                this.__pgv_showIris = this.addWidget("toggle",
-                    "viewer_show_iris", true, () => { this.setDirtyCanvas(true, false); });
-                this.__pgv_showGaze = this.addWidget("toggle",
-                    "viewer_show_gaze", true, () => { this.setDirtyCanvas(true, false); });
-                this.__pgv_slider = this.addWidget("slider",
-                    "viewer_frame", 0,
-                    (v) => { this.__pgv_frame = v | 0; this.setDirtyCanvas(true, false); },
-                    { min: 0, max: 0, step: 1, precision: 0 });
-                // Mark these widgets as UI-only (Comfy will skip them on
-                // serialize/queue because they have no INPUT counterpart).
-                for (const w of [this.__pgv_showSkel, this.__pgv_showIris,
-                                 this.__pgv_showGaze, this.__pgv_slider]) {
-                    if (w) w.serialize = false;
-                }
-                // Reserve extra height for the preview.
-                if (this.size && this.size[1] < 360) this.size[1] = 360;
-                _pgvInstances.add(this);
+                const panel = makePanel(this);
+                this.__pgv = panel;
+                const host = document.createElement("div");
+                host.style.cssText = "width:100%;height:100%;";
+                host.appendChild(panel.root);
+                const w = this.addDOMWidget("pose_gaze_view", "PGV", host, {
+                    serialize: false,
+                    getMinHeight: () => PANEL_H,
+                    getHeight: () => PANEL_H,
+                });
+                w.computeSize = () => [this.size?.[0] || 320, PANEL_H];
+                if (this.size && this.size[1] < 560) this.setSize([Math.max(this.size[0], 360), Math.max(this.size[1], 560)]);
+                // Redraw once the graph settles / an image gets connected.
+                setTimeout(() => panel.render(), 60);
+                setTimeout(() => panel.render(), 400);
             } catch (e) {
                 reportFailure("pose_gaze_viewer.onNodeCreated", e);
             }
@@ -205,125 +316,25 @@ app.registerExtension({
             const r = onExecuted?.apply(this, arguments);
             try {
                 const meta = parseMeta(message);
-                if (meta) {
-                    this.__pgv_meta = meta;
-                    if (this.__pgv_slider) {
-                        this.__pgv_slider.options.max =
-                            Math.max(0, (meta.frames?.length || 1) - 1);
-                    }
-                    this.setDirtyCanvas(true, false);
-                }
+                if (meta && this.__pgv) this.__pgv.setMeta(meta);
             } catch (e) {
                 reportFailure("pose_gaze_viewer.onExecuted", e);
             }
             return r;
         };
 
-        const onDrawForeground = nodeType.prototype.onDrawForeground;
-        nodeType.prototype.onDrawForeground = function (ctx) {
-            onDrawForeground?.apply(this, arguments);
-            if (this.flags?.collapsed) return;
-            try {
-                drawOverlay(ctx, this, this.__pgv_meta);
-            } catch (e) {
-                reportFailure("pose_gaze_viewer.onDrawForeground", e);
-            }
-        };
-
-        // Keyboard navigation when the node is the selected node in the
-        // LiteGraph canvas. LiteGraph dispatches keydown to the selected
-        // node via `onKeyDown(e)`. We step the viewer_frame slider.
-        const onKeyDown = nodeType.prototype.onKeyDown;
-        nodeType.prototype.onKeyDown = function (ev) {
-            // Pass through to any prior handler first.
-            const r = onKeyDown?.apply(this, arguments);
-            if (r === true) return r;
-            try {
-                const slider = this.__pgv_slider;
-                if (!slider) return r;
-                const max = slider.options?.max ?? 0;
-                const big = ev.shiftKey ? 10 : 1;
-                let next = this.__pgv_frame | 0;
-                let handled = false;
-                switch (ev.key) {
-                    case "ArrowLeft":
-                    case "ArrowDown":
-                        next = Math.max(0, next - big); handled = true; break;
-                    case "ArrowRight":
-                    case "ArrowUp":
-                        next = Math.min(max, next + big); handled = true; break;
-                    case "Home":
-                        next = 0; handled = true; break;
-                    case "End":
-                        next = max; handled = true; break;
-                }
-                if (handled && next !== this.__pgv_frame) {
-                    this.__pgv_frame = next;
-                    slider.value = next;
-                    if (slider.callback) try { slider.callback(next); } catch (_) {}
-                    this.setDirtyCanvas(true, false);
-                }
-                if (handled && ev.preventDefault) ev.preventDefault();
-                return handled || r;
-            } catch (e) {
-                reportFailure("pose_gaze_viewer.onKeyDown", e);
-            }
+        // Re-render when a connection changes (image just got wired in).
+        const onConnectionsChange = nodeType.prototype.onConnectionsChange;
+        nodeType.prototype.onConnectionsChange = function (...a) {
+            const r = onConnectionsChange?.apply(this, arguments);
+            try { setTimeout(() => this.__pgv?.render(), 50); } catch (_) {}
             return r;
         };
 
         const onRemoved = nodeType.prototype.onRemoved;
         nodeType.prototype.onRemoved = function () {
-            _pgvInstances.delete(this);
+            try { this.__pgv?.dispose(); } catch (_) {}
             return onRemoved?.apply(this, arguments);
         };
     },
 });
-
-// ── Ctrl+K command-palette integration ──────────────────────────────
-const _pgvInstances = new Set();
-function _pgvActive() {
-    let last = null;
-    for (const n of _pgvInstances) last = n;
-    return last || null;
-}
-function _pgvSetFrame(node, idx) {
-    if (!node) return;
-    const s = node.__pgv_slider;
-    if (!s) return;
-    const max = s.options?.max ?? 0;
-    const next = Math.max(0, Math.min(max, idx | 0));
-    node.__pgv_frame = next;
-    s.value = next;
-    if (s.callback) try { s.callback(next); } catch (_) {}
-    node.setDirtyCanvas(true, false);
-}
-function _pgvStep(node, delta) {
-    if (!node) return;
-    _pgvSetFrame(node, (node.__pgv_frame | 0) + delta);
-}
-function _pgvToggle(node, key) {
-    if (!node) return;
-    const w = node[key];
-    if (!w) return;
-    w.value = !w.value;
-    if (w.callback) try { w.callback(w.value); } catch (_) {}
-}
-function _pgvRegisterActions() {
-    const reg = window.__C2C_ACTIONS__?.register;
-    if (typeof reg !== "function") return;
-    const enabled = () => _pgvInstances.size > 0;
-    const actions = [
-        { id: "wanv2.pgv.nextFrame",  title: "Pose+Face Viewer: Next frame",     icon: "→", keywords: ["pose","face","viewer","next","frame"], run: () => _pgvStep(_pgvActive(), +1) },
-        { id: "wanv2.pgv.prevFrame",  title: "Pose+Face Viewer: Previous frame", icon: "←", keywords: ["pose","face","viewer","prev","frame"], run: () => _pgvStep(_pgvActive(), -1) },
-        { id: "wanv2.pgv.gotoFirst",  title: "Pose+Face Viewer: Go to first frame", icon: "⏮", keywords: ["pose","first","home"], run: () => _pgvSetFrame(_pgvActive(), 0) },
-        { id: "wanv2.pgv.gotoLast",   title: "Pose+Face Viewer: Go to last frame",  icon: "⏭", keywords: ["pose","last","end"],   run: () => { const n = _pgvActive(); _pgvSetFrame(n, n?.__pgv_slider?.options?.max ?? 0); } },
-        { id: "wanv2.pgv.toggleSkel", title: "Pose+Face Viewer: Toggle skeleton overlay", icon: "🦴", keywords: ["pose","skeleton","toggle"], run: () => _pgvToggle(_pgvActive(), "__pgv_showSkel") },
-        { id: "wanv2.pgv.toggleIris", title: "Pose+Face Viewer: Toggle iris overlay",     icon: "👁", keywords: ["face","iris","toggle"],     run: () => _pgvToggle(_pgvActive(), "__pgv_showIris") },
-        { id: "wanv2.pgv.toggleGaze", title: "Pose+Face Viewer: Toggle gaze arrows",      icon: "↗", keywords: ["face","gaze","toggle"],     run: () => _pgvToggle(_pgvActive(), "__pgv_showGaze") },
-    ];
-    for (const a of actions) {
-        try { reg({ ...a, kind: "command", scope: "graph", enabled }); } catch (_) {}
-    }
-}
-setTimeout(_pgvRegisterActions, 0);
-setTimeout(_pgvRegisterActions, 1000);
