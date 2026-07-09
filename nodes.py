@@ -1455,6 +1455,7 @@ class PoseAndFaceDetectionV2:
             },
             "optional": {
                 "bbox_override": ("BBOX", {"tooltip": "Optional external BBOX for the frame-0 anchor. Highest priority; overrides frame0_cx/cy/size widgets."}),
+                "landmark_overrides_json": ("STRING", {"default": "{}", "multiline": True, "tooltip": "Manual body-keypoint corrections from the Pose editor. Shape: {\"<frame>\": {\"<jointIdx>\": [x_px, y_px], ...}, ...} in SOURCE pixels. Written by the viewer's Edit mode — drag a joint to fix a mis-detection and the correction flows through retargeting into pose_data AND the rendered pose images (not just the preview). Leave as {} for pure detection."}),
             },
         }
 
@@ -1530,6 +1531,7 @@ class PoseAndFaceDetectionV2:
         face_cfg_scale=1.0,
         apply_gaze_to_face_image="off",
         bbox_override=None,
+        landmark_overrides_json="{}",
     ):
         if not isinstance(images, torch.Tensor) or images.ndim != 4 or images.shape[-1] != 3:
             raise ValueError(
@@ -1583,6 +1585,7 @@ class PoseAndFaceDetectionV2:
                 face_cfg_scale,
                 apply_gaze_to_face_image,
                 bbox_override,
+                landmark_overrides_json,
             )
 
     def _process_impl(
@@ -1633,6 +1636,7 @@ class PoseAndFaceDetectionV2:
         face_cfg_scale=1.0,
         apply_gaze_to_face_image="off",
         bbox_override=None,
+        landmark_overrides_json="{}",
     ):
         detector = model["yolo"]
         pose_model = model["vitpose"]
@@ -1992,6 +1996,74 @@ class PoseAndFaceDetectionV2:
 
         face_images_np = np.stack(face_images, 0)
         face_images_tensor = torch.from_numpy(face_images_np)
+
+        # ---- Manual landmark corrections (Pose editor, stage 2) ----
+        # The pose_gaze_viewer's Edit mode writes per-frame, per-joint body
+        # keypoint corrections here so a MIS-DETECTED skeleton can be fixed by
+        # hand and the fix flows through retargeting into pose_data + the
+        # rendered pose images — not just the on-node preview. Coords arrive as
+        # SOURCE pixels; keypoints_body is normalised 0..1, so we divide by W/H.
+        # Row length is preserved so the downstream np.array(keypoints_body)
+        # stays rectangular. Best-effort: a bad blob never breaks the node.
+        try:
+            _ov = json.loads(landmark_overrides_json) if landmark_overrides_json else None
+            if isinstance(_ov, dict) and _ov:
+                _n_applied = 0
+                for _fk, _joints in _ov.items():
+                    try:
+                        _fi = int(_fk)
+                    except (TypeError, ValueError):
+                        continue
+                    if not (0 <= _fi < len(pose_metas)) or not isinstance(_joints, dict):
+                        continue
+                    _kpb = pose_metas[_fi].get('keypoints_body')
+                    if _kpb is None:
+                        continue
+                    # length template from a detected sibling → uniform rows
+                    _tmpl_len = 3
+                    for _s in _kpb:
+                        if _s is not None and hasattr(_s, '__len__') and len(_s) >= 2:
+                            _tmpl_len = len(_s)
+                            break
+                    for _jk, _xy in _joints.items():
+                        try:
+                            _j = int(_jk)
+                        except (TypeError, ValueError):
+                            continue
+                        if not (0 <= _j < len(_kpb)):
+                            continue
+                        if not (isinstance(_xy, (list, tuple)) and len(_xy) >= 2):
+                            continue
+                        _xn = min(1.0, max(0.0, float(_xy[0]) / float(W))) if W else 0.0
+                        _yn = min(1.0, max(0.0, float(_xy[1]) / float(H))) if H else 0.0
+                        _old = _kpb[_j]
+                        if _old is not None and hasattr(_old, '__len__') and len(_old) >= 2:
+                            try:                       # numpy row / list → mutate in place
+                                _old[0] = _xn
+                                _old[1] = _yn
+                            except (TypeError, IndexError):   # immutable (tuple) → rebuild same length
+                                _new = list(_old)
+                                _new[0] = _xn
+                                _new[1] = _yn
+                                _kpb[_j] = _new
+                        else:                          # was undetected → add a visible keypoint
+                            _row = [0.0] * _tmpl_len
+                            if _tmpl_len >= 3:
+                                _row[2] = 1.0
+                            _row[0] = _xn
+                            _row[1] = _yn
+                            _kpb[_j] = _row
+                        _n_applied += 1
+                    pose_metas[_fi]['keypoints_body'] = _kpb
+                if _n_applied:
+                    logging.getLogger(__name__).info(
+                        "PoseAndFaceDetectionV2: applied %d manual landmark correction(s).",
+                        _n_applied,
+                    )
+        except Exception as _ov_exc:  # noqa: BLE001 — never break the node on a bad blob
+            logging.getLogger(__name__).warning(
+                "PoseAndFaceDetectionV2: landmark_overrides_json ignored (%s).", _ov_exc,
+            )
 
         retarget_pose_metas = [AAPoseMeta.from_humanapi_meta(meta) for meta in pose_metas]
 

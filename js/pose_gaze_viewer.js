@@ -102,8 +102,8 @@ function makePanel(node) {
     spacer.style.cssText = "flex:1 1 auto;";
     header.append(title, engineEl, spacer);
 
-    const state = { skel: true, iris: true, gaze: true };
-    const mkChip = (label, key, color) => {
+    const state = { skel: true, iris: true, gaze: true, edit: false };
+    const mkChip = (label, key, color, onToggle) => {
         const b = document.createElement("button");
         b.type = "button";
         b.textContent = label;
@@ -116,7 +116,8 @@ function makePanel(node) {
             `;
         };
         paint();
-        b.onclick = () => { state[key] = !state[key]; paint(); render(); };
+        b.onclick = () => { state[key] = !state[key]; paint(); onToggle?.(); render(); };
+        b._paint = paint;
         return b;
     };
     header.append(
@@ -124,6 +125,24 @@ function makePanel(node) {
         mkChip("👁 iris", "iris", _fill(C.red, "#f38ba8")),
         mkChip("↗ gaze", "gaze", _fill(C.teal, "#94e2d5")),
     );
+    // Edit mode — turns the skeleton into draggable handles that CORRECT the
+    // detection. When on, the skeleton chip is forced visible so joints show.
+    const editChip = mkChip("✏ edit joints", "edit", _fill(C.mauve, "#cba6f7"), () => {
+        if (state.edit && !state.skel) { state.skel = true; skelChip._paint(); }
+        resetBtn.style.display = state.edit ? "inline-block" : "none";
+        cvs.style.cursor = state.edit ? "crosshair" : "default";
+    });
+    const resetBtn = document.createElement("button");
+    resetBtn.type = "button";
+    resetBtn.textContent = "↺ reset frame";
+    resetBtn.style.cssText = `
+        display:none; font-size:10.5px; padding:3px 8px; border-radius:999px; cursor:pointer;
+        border:1px solid ${_fill(C.surface1, "#45475a")}; background:transparent;
+        color:${_fill(C.overlay1, "#7f849c")};
+    `;
+    resetBtn.onclick = () => resetFrame();
+    const skelChip = header.children[3];   // the "skeleton" chip added above
+    header.append(editChip, resetBtn);
     root.appendChild(header);
 
     // Fallback banner — reveals when the requested accurate gaze engine
@@ -165,6 +184,52 @@ function makePanel(node) {
     const ctx = cvs.getContext("2d");
     let meta = null;
     let frameIdx = 0;
+    let lastMap = null;           // {ix,iy,sx,sy,srcW,srcH} from last render
+    let dragJoint = -1;           // joint index being dragged (-1 = none)
+    let hoverJoint = -1;          // joint index under the cursor
+    let overrides = {};           // {"<frame>": {"<joint>": [x_px, y_px]}}
+
+    const HIT_R = 11;             // grab radius (screen px)
+
+    // --- Manual-correction persistence (writes the node's hidden widget) ---
+    function _ovWidget() {
+        try { return (node.widgets || []).find(w => w.name === "landmark_overrides_json"); }
+        catch (_) { return null; }
+    }
+    function loadOverrides() {
+        try {
+            const w = _ovWidget();
+            const v = w && w.value;
+            overrides = (v && typeof v === "string") ? (JSON.parse(v) || {}) : (v || {});
+            if (typeof overrides !== "object" || Array.isArray(overrides)) overrides = {};
+        } catch (_) { overrides = {}; }
+    }
+    function saveOverrides() {
+        try {
+            const w = _ovWidget();
+            if (w) {
+                w.value = JSON.stringify(overrides);
+                if (typeof w.callback === "function") w.callback(w.value);
+            }
+            node.setDirtyCanvas?.(true, true);
+        } catch (_) { /* best-effort */ }
+    }
+    function _hasOverride(f, j) {
+        const fk = String(f), jk = String(j);
+        return !!(overrides[fk] && overrides[fk][jk]);
+    }
+    function setOverride(f, j, xSrc, ySrc) {
+        const fk = String(f), jk = String(j);
+        if (!overrides[fk]) overrides[fk] = {};
+        overrides[fk][jk] = [Math.round(xSrc), Math.round(ySrc)];
+    }
+    function resetFrame() {
+        const fk = String(frameIdx);
+        if (overrides[fk]) { delete overrides[fk]; saveOverrides(); }
+        // Note: the displayed skeleton keeps the edited positions until the
+        // next Queue re-detects; make that explicit in the hint.
+        render();
+    }
 
     function _nearestPreview(idx) {
         const pv = meta?.previews;
@@ -213,6 +278,14 @@ function makePanel(node) {
             ctx.font = "11px system-ui,sans-serif";
             ctx.fillText("the skeleton, iris and gaze appear here on the frame", W / 2, H / 2 + 20);
             ctx.textAlign = "left"; ctx.textBaseline = "alphabetic";
+            // Even without a backdrop, letterbox the overlay to the SOURCE
+            // aspect ratio so the skeleton isn't stretched (and drag hit-tests
+            // stay square). Otherwise it fills the canvas non-uniformly.
+            if (srcW && srcH) {
+                const iar = srcW / srcH, sar = W / H;
+                if (iar > sar) { iw = W; ih = W / iar; } else { ih = H; iw = H * iar; }
+                ix = (W - iw) / 2; iy = (H - ih) / 2;
+            }
         }
 
         // Overlay (only with detection data). src coords → drawn rect.
@@ -220,6 +293,7 @@ function makePanel(node) {
         if (frame && srcW && srcH) {
             const sx = iw / srcW, sy = ih / srcH;
             const px = (x) => ix + x * sx, py = (y) => iy + y * sy;
+            lastMap = { ix, iy, sx, sy, srcW, srcH };   // for edit hit-testing
 
             if (state.skel && Array.isArray(frame.skeleton)) {
                 ctx.strokeStyle = _fill(C.blue, "#89b4fa"); ctx.lineWidth = 2;
@@ -228,10 +302,28 @@ function makePanel(node) {
                     if (!pa || !pb) continue;
                     ctx.beginPath(); ctx.moveTo(px(pa[0]), py(pa[1])); ctx.lineTo(px(pb[0]), py(pb[1])); ctx.stroke();
                 }
-                ctx.fillStyle = _fill(C.green, "#a6e3a1");
-                for (const p of frame.skeleton) {
-                    if (!p) continue;
-                    ctx.beginPath(); ctx.arc(px(p[0]), py(p[1]), 2.5, 0, Math.PI * 2); ctx.fill();
+                if (state.edit) {
+                    // Grabbable handles: ring + fill, larger; hovered/dragged
+                    // joint highlighted; corrected joints tinted mauve.
+                    for (let j = 0; j < frame.skeleton.length; j++) {
+                        const p = frame.skeleton[j];
+                        if (!p) continue;
+                        const active = (j === dragJoint || j === hoverJoint);
+                        const edited = _hasOverride(frameIdx, j);
+                        const cx = px(p[0]), cy = py(p[1]);
+                        ctx.beginPath(); ctx.arc(cx, cy, active ? 7 : 5, 0, Math.PI * 2);
+                        ctx.fillStyle = edited ? _fill(C.mauve, "#cba6f7") : _fill(C.green, "#a6e3a1");
+                        ctx.globalAlpha = active ? 1 : 0.9; ctx.fill(); ctx.globalAlpha = 1;
+                        ctx.lineWidth = active ? 2.5 : 1.5;
+                        ctx.strokeStyle = active ? _fill(C.text, "#e6e9f0") : "rgba(0,0,0,0.55)";
+                        ctx.stroke();
+                    }
+                } else {
+                    ctx.fillStyle = _fill(C.green, "#a6e3a1");
+                    for (const p of frame.skeleton) {
+                        if (!p) continue;
+                        ctx.beginPath(); ctx.arc(px(p[0]), py(p[1]), 2.5, 0, Math.PI * 2); ctx.fill();
+                    }
                 }
             }
             const eyes = [
@@ -257,25 +349,108 @@ function makePanel(node) {
                     ctx.closePath(); ctx.fillStyle = e.color; ctx.fill();
                 }
             }
+            if (state.edit) {
+                // Editing hint bar.
+                const nEdits = Object.keys(overrides[String(frameIdx)] || {}).length;
+                const msg = dragJoint >= 0
+                    ? "Release to set · re-Queue bakes it into pose_data"
+                    : (nEdits ? `${nEdits} joint${nEdits > 1 ? "s" : ""} corrected — re-Queue to bake`
+                              : "Drag a joint to correct it");
+                ctx.fillStyle = "rgba(0,0,0,0.5)"; ctx.fillRect(ix, iy + ih - 22, iw, 22);
+                ctx.fillStyle = _fill(C.mauve, "#cba6f7"); ctx.font = "11px system-ui,sans-serif";
+                ctx.textAlign = "center";
+                ctx.fillText(msg, ix + iw / 2, iy + ih - 8);
+                ctx.textAlign = "left";
+            }
         } else if (bdImg) {
             // Image present but no detection yet — prompt to queue.
             ctx.fillStyle = "rgba(0,0,0,0.45)"; ctx.fillRect(ix, iy + ih - 22, iw, 22);
             ctx.fillStyle = "rgba(230,235,245,0.9)"; ctx.font = "11px system-ui,sans-serif";
             ctx.textAlign = "center";
-            ctx.fillText("Queue to detect skeleton · iris · gaze", ix + iw / 2, iy + ih - 8);
+            ctx.fillText(state.edit
+                ? "Queue once to detect, then drag joints to correct"
+                : "Queue to detect skeleton · iris · gaze", ix + iw / 2, iy + ih - 8);
             ctx.textAlign = "left";
         }
     }
+
+    // --- Edit-mode pointer handling (drag skeleton joints to correct) ---
+    function _evtSrc(e) {
+        if (!lastMap || !lastMap.sx || !lastMap.sy) return null;
+        const r = cvs.getBoundingClientRect();
+        const mx = e.clientX - r.left, my = e.clientY - r.top;
+        return { sxp: (mx - lastMap.ix) / lastMap.sx, syp: (my - lastMap.iy) / lastMap.sy, mx, my };
+    }
+    function _pickJoint(mx, my) {
+        const frame = meta?.frames?.[frameIdx];
+        if (!frame || !Array.isArray(frame.skeleton) || !lastMap) return -1;
+        const { ix, iy, sx, sy } = lastMap;
+        let best = -1, bd = HIT_R * HIT_R;
+        for (let j = 0; j < frame.skeleton.length; j++) {
+            const p = frame.skeleton[j];
+            if (!p) continue;
+            const dx = (ix + p[0] * sx) - mx, dy = (iy + p[1] * sy) - my;
+            const d = dx * dx + dy * dy;
+            if (d < bd) { bd = d; best = j; }
+        }
+        return best;
+    }
+    cvs.addEventListener("pointermove", (e) => {
+        if (!state.edit) return;
+        const s = _evtSrc(e); if (!s) return;
+        if (dragJoint >= 0) {
+            const frame = meta.frames[frameIdx];
+            const sxp = Math.min(lastMap.srcW, Math.max(0, s.sxp));
+            const syp = Math.min(lastMap.srcH, Math.max(0, s.syp));
+            frame.skeleton[dragJoint] = [sxp, syp];
+            setOverride(frameIdx, dragJoint, sxp, syp);
+            e.stopPropagation();
+            render();
+        } else {
+            const h = _pickJoint(s.mx, s.my);
+            if (h !== hoverJoint) {
+                hoverJoint = h;
+                cvs.style.cursor = h >= 0 ? "grab" : "crosshair";
+                render();
+            }
+        }
+    });
+    cvs.addEventListener("pointerdown", (e) => {
+        if (!state.edit) return;
+        const s = _evtSrc(e); if (!s) return;
+        const j = _pickJoint(s.mx, s.my);
+        if (j >= 0) {
+            dragJoint = j;
+            cvs.style.cursor = "grabbing";
+            try { cvs.setPointerCapture(e.pointerId); } catch (_) {}
+            e.preventDefault(); e.stopPropagation();
+            render();
+        }
+    });
+    function _endDrag(e) {
+        if (dragJoint >= 0) {
+            dragJoint = -1;
+            saveOverrides();
+            cvs.style.cursor = state.edit ? "crosshair" : "default";
+            try { cvs.releasePointerCapture(e.pointerId); } catch (_) {}
+            render();
+        }
+    }
+    cvs.addEventListener("pointerup", _endDrag);
+    cvs.addEventListener("pointercancel", _endDrag);
 
     scrub.oninput = () => {
         frameIdx = parseInt(scrub.value, 10) || 0;
         const total = meta?.frames?.length || 0;
         frameEl.textContent = total ? `frame ${frameIdx + 1}/${total}` : "frame —";
+        hoverJoint = -1;
         render();
     };
 
     function setMeta(m) {
         meta = m;
+        loadOverrides();     // resync with the (possibly workflow-loaded) widget
+        hoverJoint = -1; dragJoint = -1;
         const total = m?.frames?.length || 0;
         scrub.max = String(Math.max(0, total - 1));
         if (frameIdx > total - 1) frameIdx = 0;
@@ -304,7 +479,7 @@ function makePanel(node) {
     const _ro = new ResizeObserver(() => render());
     _ro.observe(stage);
 
-    return { root, setMeta, render, dispose: () => { try { _ro.disconnect(); } catch (_) {} } };
+    return { root, setMeta, render, loadOverrides, getMap: () => lastMap, dispose: () => { try { _ro.disconnect(); } catch (_) {} } };
 }
 
 app.registerExtension({
@@ -328,8 +503,16 @@ app.registerExtension({
                 });
                 w.computeSize = () => [this.size?.[0] || 320, PANEL_H];
                 if (this.size && this.size[1] < 560) this.setSize([Math.max(this.size[0], 360), Math.max(this.size[1], 560)]);
+                // Hide the raw landmark-overrides widget — it's driven by the
+                // editor, not typed by hand (keep its value serialised).
+                const ow = (this.widgets || []).find(wd => wd.name === "landmark_overrides_json");
+                if (ow) {
+                    ow.hidden = true;
+                    ow.computeSize = () => [0, -4];
+                    ow.type = "hidden";
+                }
                 // Redraw once the graph settles / an image gets connected.
-                setTimeout(() => panel.render(), 60);
+                setTimeout(() => { panel.loadOverrides?.(); panel.render(); }, 60);
                 setTimeout(() => panel.render(), 400);
             } catch (e) {
                 reportFailure("pose_gaze_viewer.onNodeCreated", e);
