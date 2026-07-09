@@ -639,6 +639,7 @@ from .utils import (
     compute_eye_region_brightness,
 )
 from .pose_utils.human_visualization import AAPoseMeta, draw_aapose_by_meta_new
+from .retarget_pose import get_retarget_pose
 
 
 # ---------------------------------------------------
@@ -1456,6 +1457,7 @@ class PoseAndFaceDetectionV2:
             "optional": {
                 "bbox_override": ("BBOX", {"tooltip": "Optional external BBOX for the frame-0 anchor. Highest priority; overrides frame0_cx/cy/size widgets."}),
                 "landmark_overrides_json": ("STRING", {"default": "{}", "multiline": True, "tooltip": "Manual body-keypoint corrections from the Pose editor. Shape: {\"<frame>\": {\"<jointIdx>\": [x_px, y_px], ...}, ...} in SOURCE pixels. Written by the viewer's Edit mode — drag a joint to fix a mis-detection and the correction flows through retargeting into pose_data AND the rendered pose images (not just the preview). Leave as {} for pure detection."}),
+                "retarget_image": ("IMAGE", {"tooltip": "Optional reference image of the TARGET character. When connected, the detected driver pose is RETARGETED onto this reference's body proportions and position (the same retarget V1 had): the reference's pose is detected, then get_retarget_pose maps the driver's motion onto it. Leave unconnected for straight detection (no retarget)."}),
             },
         }
 
@@ -1532,6 +1534,7 @@ class PoseAndFaceDetectionV2:
         apply_gaze_to_face_image="off",
         bbox_override=None,
         landmark_overrides_json="{}",
+        retarget_image=None,
     ):
         if not isinstance(images, torch.Tensor) or images.ndim != 4 or images.shape[-1] != 3:
             raise ValueError(
@@ -1586,6 +1589,7 @@ class PoseAndFaceDetectionV2:
                 apply_gaze_to_face_image,
                 bbox_override,
                 landmark_overrides_json,
+                retarget_image,
             )
 
     def _process_impl(
@@ -1637,6 +1641,7 @@ class PoseAndFaceDetectionV2:
         apply_gaze_to_face_image="off",
         bbox_override=None,
         landmark_overrides_json="{}",
+        retarget_image=None,
     ):
         detector = model["yolo"]
         pose_model = model["vitpose"]
@@ -1665,6 +1670,49 @@ class PoseAndFaceDetectionV2:
 
         detector.reinit()
         pose_model.reinit()
+
+        # --- Optional retarget reference (V1 parity) ---
+        # When a retarget_image is connected, detect ITS pose so the driver's
+        # motion can be mapped onto the target character's proportions/position
+        # (get_retarget_pose below). Runs here while both detector + pose_model
+        # are alive; best-effort — a failed reference just disables retarget.
+        refer_pose_meta = None
+        refer_img_proc = None
+        if retarget_image is not None:
+            try:
+                _rt = retarget_image[0]
+                _rt_np = _rt.detach().cpu().numpy() if hasattr(_rt, "detach") else np.asarray(_rt)
+                _rt_np = np.ascontiguousarray(_rt_np[..., :3]).astype(np.float32)
+                _ref_shape = np.array([_rt_np.shape[0], _rt_np.shape[1]])[None]
+                _ref_dets = detector(
+                    cv2.resize(_rt_np, (640, 640)).transpose(2, 0, 1)[None], _ref_shape
+                )[0]
+                if isinstance(_ref_dets, list) and len(_ref_dets) > 0 and isinstance(_ref_dets[0], dict):
+                    _ref_bbox = _ref_dets[0]["bbox"]
+                else:
+                    _ref_bbox = None
+                if (_ref_bbox is None or len(_ref_bbox) < 5 or _ref_bbox[4] <= 0
+                        or (_ref_bbox[2] - _ref_bbox[0]) < 10 or (_ref_bbox[3] - _ref_bbox[1]) < 10):
+                    _ref_bbox = np.array([0, 0, _rt_np.shape[1], _rt_np.shape[0], 1.0], dtype=np.float32)
+                _rc, _rs = bbox_from_detector(_ref_bbox, input_resolution, rescale=rescale)
+                _ref_crop = crop(_rt_np, _rc, _rs, (input_resolution[0], input_resolution[1]))[0]
+                _ref_crop = preprocess_for_pose(_ref_crop, use_clahe)
+                _ref_norm = ((_ref_crop - IMG_NORM_MEAN) / IMG_NORM_STD).transpose(2, 0, 1).astype(np.float32)
+                _ref_kp = pose_model(_ref_norm[None], np.array(_rc)[None], np.array(_rs)[None])
+                refer_pose_meta = load_pose_metas_from_kp2ds_seq(
+                    _ref_kp, width=_rt_np.shape[1], height=_rt_np.shape[0]
+                )[0]
+                refer_img_proc = _rt_np
+                logging.getLogger(__name__).info(
+                    "PoseAndFaceDetectionV2: retarget reference detected (%dx%d).",
+                    _rt_np.shape[1], _rt_np.shape[0],
+                )
+            except Exception as _rt_exc:  # noqa: BLE001 — a bad reference just disables retarget
+                logging.getLogger(__name__).warning(
+                    "PoseAndFaceDetectionV2: retarget_image detection failed (%s); ignoring.", _rt_exc,
+                )
+                refer_pose_meta = None
+                refer_img_proc = None
 
         comfy_pbar = ProgressBar(B * 2)
         progress = 0
@@ -2065,7 +2113,28 @@ class PoseAndFaceDetectionV2:
                 "PoseAndFaceDetectionV2: landmark_overrides_json ignored (%s).", _ov_exc,
             )
 
-        retarget_pose_metas = [AAPoseMeta.from_humanapi_meta(meta) for meta in pose_metas]
+        # Retarget onto the reference character when one was provided, else the
+        # straight per-frame conversion. get_retarget_pose returns AAPoseMeta
+        # objects just like from_humanapi_meta, so the draw path is unchanged.
+        if refer_pose_meta is not None:
+            try:
+                # get_retarget_pose mutates its input metas in place (ndarray→
+                # list, hands scaled to pixels). Pass a deep copy so the shared
+                # pose_metas stays ndarray-typed for the iris / viewer / points
+                # passes that run after this.
+                import copy as _copy  # noqa: PLC0415
+                _pm_for_rt = _copy.deepcopy(pose_metas)
+                retarget_pose_metas = get_retarget_pose(
+                    _pm_for_rt[0], refer_pose_meta, _pm_for_rt, None, None
+                )
+            except Exception as _rt_exc:  # noqa: BLE001 — fall back to non-retargeted
+                logging.getLogger(__name__).warning(
+                    "PoseAndFaceDetectionV2: get_retarget_pose failed (%s); using non-retargeted pose.",
+                    _rt_exc,
+                )
+                retarget_pose_metas = [AAPoseMeta.from_humanapi_meta(meta) for meta in pose_metas]
+        else:
+            retarget_pose_metas = [AAPoseMeta.from_humanapi_meta(meta) for meta in pose_metas]
 
         # use first bbox for return (legacy)
         bbox0 = bboxes[0]
@@ -2805,6 +2874,10 @@ class PoseAndFaceDetectionV2:
         pose_data = {
             "pose_metas": retarget_pose_metas,
             "pose_metas_original": pose_metas,
+            # V1-parity retarget payload — present only when retarget_image was
+            # connected; lets the draw node pad/resize onto the reference.
+            "refer_pose_meta": refer_pose_meta if retarget_image is not None else None,
+            "retarget_image": refer_img_proc if retarget_image is not None else None,
             "iris_data": all_iris,
             "lip_openness_ratios": all_lip_ratios,
             # MANUAL bug-fix (Apr 2026): expose source frame dims + target
