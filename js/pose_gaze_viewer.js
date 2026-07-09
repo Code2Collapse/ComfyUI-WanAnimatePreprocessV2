@@ -15,6 +15,7 @@
 import { app } from "../../scripts/app.js";
 import { C } from "./_c2c_theme.js";
 import { reportFailure } from "./_c2c_report.js";
+import { ensureC2CKit } from "./_c2c_ui_kit.js";
 
 const NODE_CLASS = "PoseAndFaceDetectionV2";
 const UI_KEY     = "viewer_meta";
@@ -80,24 +81,25 @@ function resolveUpstreamImageURL(node) {
 const _fill = (v, def) => (v || def);
 
 function makePanel(node) {
+    ensureC2CKit();
     const root = document.createElement("div");
-    root.className = "pgv-root";
+    root.className = "pgv-root c2ck";
     root.style.cssText = `
         display:flex; flex-direction:column; gap:6px; width:100%; height:100%;
         box-sizing:border-box; font-family:ui-sans-serif,system-ui,sans-serif;
-        color:${_fill(C.gray150, "#cdd6f4")};
-        background:${_fill(C.scrimDark7, "#181825")}; border-radius:8px; padding:8px;
+        color:#e6e6e6; background:#161616; border-radius:8px; padding:8px;
         overflow:hidden; min-height:0;
     `;
 
-    // Header: title + engine readout + toggle chips.
+    // Header: title + engine readout pill + toggle chips.
     const header = document.createElement("div");
     header.style.cssText = "display:flex; align-items:center; gap:6px; flex:0 0 auto; flex-wrap:wrap;";
     const title = document.createElement("span");
     title.textContent = "Pose · Face · Gaze";
     title.style.cssText = "font-weight:600; font-size:12px;";
     const engineEl = document.createElement("span");
-    engineEl.style.cssText = `font-size:10.5px; color:${_fill(C.overlay1, "#7f849c")}; margin-left:2px;`;
+    engineEl.className = "c2ck-pill";
+    engineEl.style.display = "none";
     const spacer = document.createElement("span");
     spacer.style.cssText = "flex:1 1 auto;";
     header.append(title, engineEl, spacer);
@@ -456,14 +458,14 @@ function makePanel(node) {
         if (frameIdx > total - 1) frameIdx = 0;
         scrub.value = String(frameIdx);
         frameEl.textContent = total ? `frame ${frameIdx + 1}/${total}` : "frame —";
-        // Engine + accuracy readout, honest about what actually ran.
+        // Engine + accuracy readout as a sub-status pill, honest about what ran.
         if (m?.engine) {
             const acc = m.engine_accuracy ? ` · ${m.engine_accuracy}` : "";
             engineEl.textContent = `gaze: ${m.engine}${acc}`;
-            engineEl.style.color = m.engine_status
-                ? _fill(C.amber, "#fab387") : _fill(C.overlay1, "#7f849c");
+            engineEl.style.display = "inline-flex";
+            engineEl.className = "c2ck-pill " + (m.engine_status ? "off" : "on");
         } else {
-            engineEl.textContent = "";
+            engineEl.style.display = "none";
         }
         if (m?.engine_status) {
             statusEl.style.display = "block";
