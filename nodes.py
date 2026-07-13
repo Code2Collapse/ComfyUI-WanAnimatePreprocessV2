@@ -46,6 +46,7 @@ import math
 from typing import Any, Dict, List, Optional, Tuple
 
 from . import _interrupt_check as _IC
+from ._is_changed_util import hash_args_and_kwargs
 script_directory = os.path.dirname(os.path.abspath(__file__))
 
 # ---------------------------------------------------
@@ -205,6 +206,31 @@ def mediapipe_to_dlib_68(mp_landmarks_xy):
     return mp_landmarks_xy[MP_TO_DLIB68].copy()
 
 
+# FaceMesh/FaceLandmarker need the face at a decent pixel size — the attention
+# (iris) submesh loses the eye region below roughly ~200px faces. On full/half-
+# body shots (the NORMAL Wan Animate input) the padded face crop is often only
+# 60–120px → "no face found" / garbage iris = the user's "eye detection not at
+# all working". Upscaling the CROP is free w.r.t. coordinate mapping because
+# MediaPipe returns NORMALISED [0,1] coords (scale-invariant) that we multiply
+# by the ORIGINAL crop_size_wh. Verified live: a 288px face crop failed raw,
+# detected perfectly at 3× with iris rings exactly on the irises.
+_MP_MIN_CROP_SIDE = 384
+
+
+def _upscale_face_crop_if_small(face_crop_rgb_uint8):
+    """Return the crop upscaled so its long side is >= _MP_MIN_CROP_SIDE."""
+    try:
+        h, w = face_crop_rgb_uint8.shape[:2]
+        side = max(h, w)
+        if side >= _MP_MIN_CROP_SIDE or side < 8:
+            return face_crop_rgb_uint8
+        s = _MP_MIN_CROP_SIDE / float(side)
+        return cv2.resize(face_crop_rgb_uint8, (max(8, int(round(w * s))), max(8, int(round(h * s)))),
+                          interpolation=cv2.INTER_CUBIC)
+    except Exception:
+        return face_crop_rgb_uint8
+
+
 def _run_mediapipe_on_face_crop(face_crop_rgb_uint8, crop_origin_xy, crop_size_wh,
                                   full_w, full_h):
     """Run MediaPipe FaceMesh on a single face crop.
@@ -228,7 +254,7 @@ def _run_mediapipe_on_face_crop(face_crop_rgb_uint8, crop_origin_xy, crop_size_w
         return None
 
     try:
-        results = fm.process(face_crop_rgb_uint8)
+        results = fm.process(_upscale_face_crop_if_small(face_crop_rgb_uint8))
     except Exception:
         return None
     if not results.multi_face_landmarks:
@@ -330,6 +356,21 @@ except Exception as _exc:  # noqa: BLE001
         _exc,
     )
 
+# W7-G1 gaze upgrade: geometric (measured-iris) eye-in-head engine.
+# MEASURES the iris position inside the eye aperture instead of estimating
+# gaze with a NN; composes with the same solvePnP head pose + Kalman as
+# blendshape_head_corrected. Pure math, no downloads.
+try:
+    from . import gaze_iris_geometric as _gaze_iris  # type: ignore
+    _GAZE_IRIS_IMPORTED = True
+except Exception as _exc:  # noqa: BLE001
+    _gaze_iris = None
+    _GAZE_IRIS_IMPORTED = False
+    logging.getLogger(__name__).info(
+        "gaze_iris_geometric module unavailable (%s); iris_geometric engine disabled.",
+        _exc,
+    )
+
 # Stage-2 gaze upgrade: L2CS-Net (MIT license, ~3.9 deg MPIIGaze MAE,
 # ~10.4 deg Gaze360 MAE — robust to extreme head poses). Optional; only
 # imported when the user explicitly selects an `l2cs_*` engine.
@@ -389,7 +430,9 @@ def _run_face_landmarker_on_face_crop(
         return None
     if face_crop_rgb_uint8 is None or face_crop_rgb_uint8.size == 0:
         return None
-    res = _gaze_bs.run_face_landmarker(face_crop_rgb_uint8)
+    # Same small-face upscale as the FaceMesh path — normalised coords make it
+    # transparent to the crop_size_wh mapping below.
+    res = _gaze_bs.run_face_landmarker(_upscale_face_crop_if_small(face_crop_rgb_uint8))
     if res is None:
         return None
 
@@ -596,6 +639,7 @@ from .utils import (
     compute_eye_region_brightness,
 )
 from .pose_utils.human_visualization import AAPoseMeta, draw_aapose_by_meta_new
+from .retarget_pose import get_retarget_pose
 
 
 # ---------------------------------------------------
@@ -1057,10 +1101,27 @@ class OnnxDetectionModelLoaderV2:
 
     @classmethod
     def INPUT_TYPES(s):
+        files = list_onnx_detection_models()
+        lf = lambda x: x.lower()
+        onnx = [f for f in files if lf(f).endswith(".onnx")]
+        # Smart defaults so the node works out-of-the-box instead of defaulting
+        # both slots to the alphabetically-first file (often an animal/apt36k
+        # pose model, which makes YOLO error and ViTPose produce empty skeletons).
+        vit_default = (next((f for f in onnx if "wholebody" in lf(f)), None)
+                       or next((f for f in onnx if "vitpose" in lf(f)
+                                and "apt" not in lf(f) and "animal" not in lf(f)), None)
+                       or next((f for f in onnx if "vitpose" in lf(f)), None)
+                       or (onnx[0] if onnx else (files[0] if files else "")))
+        yolo_default = (next((f for f in onnx if "yolov10" in lf(f)), None)
+                        or next((f for f in onnx if ("yolov8" in lf(f) or "yolox" in lf(f) or "yolo11" in lf(f))
+                                 and "face" not in lf(f) and "pose" not in lf(f)), None)
+                        or next((f for f in onnx if "yolo" in lf(f)
+                                 and "face" not in lf(f) and "pose" not in lf(f) and "vitpose" not in lf(f)), None)
+                        or (files[0] if files else ""))
         return {
             "required": {
-                "vitpose_model": (list_onnx_detection_models(), {"tooltip": "ViTPose ONNX file (e.g. vitpose-h.onnx). Place in ComfyUI/models/detection/. .onnx is always listed here even if ComfyUI hides it elsewhere."}),
-                "yolo_model":    (list_onnx_detection_models(), {"tooltip": "YOLO person-detector ONNX file. Place in ComfyUI/models/detection/. .onnx always listed."}),
+                "vitpose_model": (files, {"default": vit_default, "tooltip": "ViTPose ONNX file (human wholebody, e.g. vitpose_h_wholebody_model.onnx). Place in ComfyUI/models/detection/. .onnx is always listed here even if ComfyUI hides it elsewhere."}),
+                "yolo_model":    (files, {"default": yolo_default, "tooltip": "YOLO person-detector ONNX file (e.g. yolov10m.onnx — NOT a pose model). Place in ComfyUI/models/detection/. .onnx always listed."}),
                 "onnx_device":   (["CUDAExecutionProvider", "CPUExecutionProvider"], {"default": "CUDAExecutionProvider", "tooltip": "Execution provider for ONNX Runtime. CUDA is much faster; CPU is the safe fallback."}),
             },
         }
@@ -1070,6 +1131,10 @@ class OnnxDetectionModelLoaderV2:
     OUTPUT_TOOLTIPS = ("ViTPose+YOLO model bundle. Connect to `model` on Pose and Face Detection (V2).",)
     FUNCTION = "loadmodel"
     CATEGORY = "WanAnimatePreprocess_V2"
+
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        return hash_args_and_kwargs(**kwargs)
 
     def loadmodel(self, vitpose_model, yolo_model, onnx_device):
         vitpose_model_path = _resolve_detection_path(vitpose_model)
@@ -1381,15 +1446,18 @@ class PoseAndFaceDetectionV2:
                 "eye_y_fraction": ("FLOAT", {"default": 0.30, "min": 0.10, "max": 0.60, "step": 0.01, "tooltip": "Target eye row as a fraction of crop height (0.30 = upper third). Only used when eye_align_mode = 'eye_upper_third'."}),
                 "face_cfg_scale": ("FLOAT", {"default": 1.0, "min": 1.0, "max": 10.0, "step": 0.1, "tooltip": "Wan-Animate paper recommendation #3 (paper section 4.3): CFG on the face conditioning input gives finer control over expression / gaze when finer reenactment is desired. This widget is a passthrough -- wire the FLOAT output 'face_cfg_scale' into your Wan-Animate sampler's face CFG input. 1.0 = CFG disabled (default, fastest). 2.0-4.0 = stronger expression adherence. >5.0 may over-saturate."}),
                 # ---- Gaze engine selector + Kalman tuning (appended at end for back-compat with saved workflows) ----
-                "gaze_engine": (["blendshape_head_corrected", "blendshape_only", "l2cs_gaze360", "l2cs_mpiigaze", "pose_normalized_resnet50", "ethxgaze"], {"default": "blendshape_head_corrected", "tooltip": "Per-eye gaze yaw/pitch engine.\n\n* blendshape_head_corrected (DEFAULT, recommended): MediaPipe ARKit blend shapes + solvePnP head pose + Kalman temporal smoother. Eye-in-head rotation is composed with the head rotation so the rendered arrow tracks rotated heads. Pure numpy + cv2, no downloads.\n* blendshape_only: legacy May-2026 shipped behavior; eye-in-head only, no head composition.\n* l2cs_gaze360: L2CS-Net (MIT) ResNet50 trained on Gaze360. ~10.4\u00b0 MAE but robust to extreme poses (recommended for Wan-Animate character scenes). One-time ~100MB weight download to ComfyUI/models/gaze/.\n* l2cs_mpiigaze: L2CS-Net MPIIGaze variant. ~3.9\u00b0 MAE but calibrated only for near-portrait subjects.\n* pose_normalized_resnet50: Highest-accuracy path. Pipeline = solvePnP head pose -> analytical pose-normalized 224x224 face warp (head roll removed, camera distance fixed at 600 mm) -> ResNet50+Linear(2048,2) gaze regressor -> de-rotate output back to camera frame. Major accuracy gain on tilted / off-axis heads. The normalization warp is a clean-room implementation of the 2018 ETRA paper's published equations and ships with this pack (Apache-2.0). The ResNet50 checkpoint is NOT bundled \u2014 place a community-released gaze-trained ResNet50 weight file at <ComfyUI>/models/gaze/pose_normalized_resnet50.pth.tar to enable this engine. Note: those community checkpoints are typically released under CC BY-NC-SA 4.0 (non-commercial); you are responsible for confirming the licence of any weights you install matches your use case. If the file is missing the node automatically falls back to l2cs_gaze360.\n* ethxgaze: ETH-XGaze ResNet-50 (ECCV 2020, ~2.5\u00b0 in-the-wild MAE). Post-processes iris_data using pose-normalised 224x224 face crops + the official gaze_network. Requires (a) the third_party/ETH-XGaze/ repo cloned for face_model.txt + model.py and (b) checkpoint `epoch_24_ckpt.pth.tar` placed in `ComfyUI/models/ethxgaze/`. On any missing prerequisite the engine silently keeps the previous engine's output."}),
+                "gaze_engine": (["l2cs_gaze360", "l2cs_mpiigaze", "ethxgaze", "pose_normalized_resnet50", "iris_geometric", "blendshape_head_corrected", "blendshape_only"], {"default": "l2cs_gaze360", "tooltip": "Per-eye gaze yaw/pitch engine. DEFAULT is now l2cs_gaze360 (GPU/CUDA, auto-downloads ~100MB once) so gaze runs on the GPU; blendshape_* are the CPU-only fallbacks.\n\n* iris_geometric (NEW, deterministic): MEASURES the MediaPipe iris centre inside the eye aperture (corner-to-corner, lid-to-lid) instead of estimating gaze with a NN — no per-person appearance bias, per-eye output, blink-gated, composed with the solvePnP head pose + Kalman like blendshape_head_corrected. Best fidelity for animation retargeting (the character's eyeballs copy the performer's iris positions). Pure CPU math, no downloads.\n* blendshape_head_corrected (DEFAULT, recommended): MediaPipe ARKit blend shapes + solvePnP head pose + Kalman temporal smoother. Eye-in-head rotation is composed with the head rotation so the rendered arrow tracks rotated heads. Pure numpy + cv2, no downloads.\n* blendshape_only: legacy May-2026 shipped behavior; eye-in-head only, no head composition.\n* l2cs_gaze360: L2CS-Net (MIT) ResNet50 trained on Gaze360. ~10.4\u00b0 MAE but robust to extreme poses (recommended for Wan-Animate character scenes). One-time ~100MB weight download to ComfyUI/models/gaze/.\n* l2cs_mpiigaze: L2CS-Net MPIIGaze variant. ~3.9\u00b0 MAE but calibrated only for near-portrait subjects.\n* pose_normalized_resnet50: Highest-accuracy path. Pipeline = solvePnP head pose -> analytical pose-normalized 224x224 face warp (head roll removed, camera distance fixed at 600 mm) -> ResNet50+Linear(2048,2) gaze regressor -> de-rotate output back to camera frame. Major accuracy gain on tilted / off-axis heads. The normalization warp is a clean-room implementation of the 2018 ETRA paper's published equations and ships with this pack (Apache-2.0). The ResNet50 checkpoint is NOT bundled \u2014 place a community-released gaze-trained ResNet50 weight file at <ComfyUI>/models/gaze/pose_normalized_resnet50.pth.tar to enable this engine. Note: those community checkpoints are typically released under CC BY-NC-SA 4.0 (non-commercial); you are responsible for confirming the licence of any weights you install matches your use case. If the file is missing the node automatically falls back to l2cs_gaze360.\n* ethxgaze: ETH-XGaze ResNet-50 (ECCV 2020, ~2.5\u00b0 in-the-wild MAE). Post-processes iris_data using pose-normalised 224x224 face crops + the official gaze_network. Requires (a) the third_party/ETH-XGaze/ repo cloned for face_model.txt + model.py and (b) checkpoint `epoch_24_ckpt.pth.tar` placed in `ComfyUI/models/ethxgaze/`. On any missing prerequisite the engine silently keeps the previous engine's output."}),
                 "gaze_kalman_meas_std_deg": ("FLOAT", {"default": 3.0, "min": 0.1, "max": 20.0, "step": 0.1, "tooltip": "Kalman measurement noise (degrees). Higher = trust the model less and lean on the velocity model more — smoother. Used by blendshape_head_corrected and l2cs_* engines."}),
                 "gaze_kalman_process_std": ("FLOAT", {"default": 0.8, "min": 0.05, "max": 5.0, "step": 0.05, "tooltip": "Kalman process noise (rad/s). Roughly the expected saccade velocity scale. Higher = filter reacts faster to genuine motion but jitters more."}),
                 "gaze_fps": ("FLOAT", {"default": 30.0, "min": 1.0, "max": 240.0, "step": 1.0, "tooltip": "Video fps used by the Kalman dt. Set to match your source clip; affects velocity coupling, not absolute angles."}),
+                "gaze_calibration_frame": ("INT", {"default": -1, "min": -1, "max": 999999, "tooltip": "W7-G2 per-shot gaze calibration (iris_geometric engine only). Set this to a frame index where the subject looks STRAIGHT AT THE CAMERA; the measured eye-in-head angles on that frame become the zero reference for the whole shot, removing per-person eye-shape bias (the last few degrees of error no model can fix). -1 = off."}),
                 # C0.1 — per-frame iris repaint at gaze-corrected position.
                 "apply_gaze_to_face_image": (["off", "overlay", "replace"], {"default": "off", "tooltip": "C0.1: After gaze is computed, optionally stamp a synthetic iris disk into each 512x512 face crop at the gaze-corrected position so the face-encoder input visually matches the gaze the sampler will follow. 'off' = leave face_images untouched (default). 'overlay' = draw a dark iris disk at the new position WITHOUT erasing the original iris (cheap, useful when blending). 'replace' = paint over the original iris with eye-white first, then draw the new dark iris. Shift magnitude scales with the per-eye iris radius and the engine's magnitude_norm. Failures are non-fatal: a warning is logged and face_images is preserved."}),
             },
             "optional": {
                 "bbox_override": ("BBOX", {"tooltip": "Optional external BBOX for the frame-0 anchor. Highest priority; overrides frame0_cx/cy/size widgets."}),
+                "landmark_overrides_json": ("STRING", {"default": "{}", "multiline": True, "tooltip": "Manual body-keypoint corrections from the Pose editor. Shape: {\"<frame>\": {\"<jointIdx>\": [x_px, y_px], ...}, ...} in SOURCE pixels. Written by the viewer's Edit mode — drag a joint to fix a mis-detection and the correction flows through retargeting into pose_data AND the rendered pose images (not just the preview). Leave as {} for pure detection."}),
+                "retarget_image": ("IMAGE", {"tooltip": "Optional reference image of the TARGET character. When connected, the detected driver pose is RETARGETED onto this reference's body proportions and position (the same retarget V1 had): the reference's pose is detected, then get_retarget_pose maps the driver's motion onto it. Leave unconnected for straight detection (no retarget)."}),
             },
         }
 
@@ -1412,6 +1480,10 @@ class PoseAndFaceDetectionV2:
     )
     FUNCTION = "process"
     CATEGORY = "WanAnimatePreprocess_V2"
+
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        return hash_args_and_kwargs(**kwargs)
 
     def process(
         self,
@@ -1438,10 +1510,11 @@ class PoseAndFaceDetectionV2:
         gaze_lock_strength=0.7,
         use_mediapipe_face=True,
         use_blendshape_gaze=True,
-        gaze_engine="blendshape_head_corrected",
+        gaze_engine="l2cs_gaze360",
         gaze_kalman_meas_std_deg=3.0,
         gaze_kalman_process_std=0.8,
         gaze_fps=30.0,
+        gaze_calibration_frame=-1,
         gaze_one_euro_min_cutoff=1.7,
         gaze_one_euro_beta=0.3,
         gaze_max_yaw_deg=30.0,
@@ -1460,6 +1533,115 @@ class PoseAndFaceDetectionV2:
         face_cfg_scale=1.0,
         apply_gaze_to_face_image="off",
         bbox_override=None,
+        landmark_overrides_json="{}",
+        retarget_image=None,
+    ):
+        if not isinstance(images, torch.Tensor) or images.ndim != 4 or images.shape[-1] != 3:
+            raise ValueError(
+                f"PoseAndFaceDetectionV2: expected IMAGE (B,H,W,3); got {tuple(getattr(images, 'shape', ()))}"
+            )
+        with torch.inference_mode():
+            return self._process_impl(
+                model,
+                images,
+                width,
+                height,
+                detection_threshold,
+                pose_threshold,
+                use_clahe,
+                use_blur_for_pose,
+                blur_radius,
+                blur_sigma,
+                use_face_smoothing,
+                face_smoothing_strength,
+                use_constant_face_box,
+                face_box_size_px,
+                use_iris_smoothing,
+                iris_smoothing_strength,
+                iris_smoothing_method,
+                iris_one_euro_min_cutoff,
+                iris_one_euro_beta,
+                gaze_lock_eyes,
+                gaze_lock_strength,
+                use_mediapipe_face,
+                use_blendshape_gaze,
+                gaze_engine,
+                gaze_kalman_meas_std_deg,
+                gaze_kalman_process_std,
+                gaze_fps,
+                gaze_calibration_frame,
+                gaze_one_euro_min_cutoff,
+                gaze_one_euro_beta,
+                gaze_max_yaw_deg,
+                gaze_max_pitch_deg,
+                crop_mode,
+                frame0_cx,
+                frame0_cy,
+                frame0_size,
+                keyframes_json,
+                smoothing_method,
+                crop_one_euro_min_cutoff,
+                crop_one_euro_beta,
+                crop_gaussian_window,
+                eye_align_mode,
+                eye_y_fraction,
+                face_cfg_scale,
+                apply_gaze_to_face_image,
+                bbox_override,
+                landmark_overrides_json,
+                retarget_image,
+            )
+
+    def _process_impl(
+        self,
+        model,
+        images,
+        width,
+        height,
+        detection_threshold,
+        pose_threshold,
+        use_clahe,
+        use_blur_for_pose,
+        blur_radius,
+        blur_sigma,
+        use_face_smoothing,
+        face_smoothing_strength,
+        use_constant_face_box,
+        face_box_size_px,
+        use_iris_smoothing,
+        iris_smoothing_strength,
+        iris_smoothing_method="one_euro",
+        iris_one_euro_min_cutoff=1.0,
+        iris_one_euro_beta=0.05,
+        gaze_lock_eyes=True,
+        gaze_lock_strength=0.7,
+        use_mediapipe_face=True,
+        use_blendshape_gaze=True,
+        gaze_engine="l2cs_gaze360",
+        gaze_kalman_meas_std_deg=3.0,
+        gaze_kalman_process_std=0.8,
+        gaze_fps=30.0,
+        gaze_calibration_frame=-1,
+        gaze_one_euro_min_cutoff=1.7,
+        gaze_one_euro_beta=0.3,
+        gaze_max_yaw_deg=30.0,
+        gaze_max_pitch_deg=25.0,
+        crop_mode="default",
+        frame0_cx=-1,
+        frame0_cy=-1,
+        frame0_size=0,
+        keyframes_json="[]",
+        smoothing_method="one_euro",
+        crop_one_euro_min_cutoff=1.0,
+        crop_one_euro_beta=0.05,
+        crop_gaussian_window=7,
+        eye_align_mode="default",
+        eye_y_fraction=0.30,
+        face_cfg_scale=1.0,
+        apply_gaze_to_face_image="off",
+        bbox_override=None,
+        landmark_overrides_json="{}",
+        retarget_image=None,
     ):
         detector = model["yolo"]
         pose_model = model["vitpose"]
@@ -1488,6 +1670,49 @@ class PoseAndFaceDetectionV2:
 
         detector.reinit()
         pose_model.reinit()
+
+        # --- Optional retarget reference (V1 parity) ---
+        # When a retarget_image is connected, detect ITS pose so the driver's
+        # motion can be mapped onto the target character's proportions/position
+        # (get_retarget_pose below). Runs here while both detector + pose_model
+        # are alive; best-effort — a failed reference just disables retarget.
+        refer_pose_meta = None
+        refer_img_proc = None
+        if retarget_image is not None:
+            try:
+                _rt = retarget_image[0]
+                _rt_np = _rt.detach().cpu().numpy() if hasattr(_rt, "detach") else np.asarray(_rt)
+                _rt_np = np.ascontiguousarray(_rt_np[..., :3]).astype(np.float32)
+                _ref_shape = np.array([_rt_np.shape[0], _rt_np.shape[1]])[None]
+                _ref_dets = detector(
+                    cv2.resize(_rt_np, (640, 640)).transpose(2, 0, 1)[None], _ref_shape
+                )[0]
+                if isinstance(_ref_dets, list) and len(_ref_dets) > 0 and isinstance(_ref_dets[0], dict):
+                    _ref_bbox = _ref_dets[0]["bbox"]
+                else:
+                    _ref_bbox = None
+                if (_ref_bbox is None or len(_ref_bbox) < 5 or _ref_bbox[4] <= 0
+                        or (_ref_bbox[2] - _ref_bbox[0]) < 10 or (_ref_bbox[3] - _ref_bbox[1]) < 10):
+                    _ref_bbox = np.array([0, 0, _rt_np.shape[1], _rt_np.shape[0], 1.0], dtype=np.float32)
+                _rc, _rs = bbox_from_detector(_ref_bbox, input_resolution, rescale=rescale)
+                _ref_crop = crop(_rt_np, _rc, _rs, (input_resolution[0], input_resolution[1]))[0]
+                _ref_crop = preprocess_for_pose(_ref_crop, use_clahe)
+                _ref_norm = ((_ref_crop - IMG_NORM_MEAN) / IMG_NORM_STD).transpose(2, 0, 1).astype(np.float32)
+                _ref_kp = pose_model(_ref_norm[None], np.array(_rc)[None], np.array(_rs)[None])
+                refer_pose_meta = load_pose_metas_from_kp2ds_seq(
+                    _ref_kp, width=_rt_np.shape[1], height=_rt_np.shape[0]
+                )[0]
+                refer_img_proc = _rt_np
+                logging.getLogger(__name__).info(
+                    "PoseAndFaceDetectionV2: retarget reference detected (%dx%d).",
+                    _rt_np.shape[1], _rt_np.shape[0],
+                )
+            except Exception as _rt_exc:  # noqa: BLE001 — a bad reference just disables retarget
+                logging.getLogger(__name__).warning(
+                    "PoseAndFaceDetectionV2: retarget_image detection failed (%s); ignoring.", _rt_exc,
+                )
+                refer_pose_meta = None
+                refer_img_proc = None
 
         comfy_pbar = ProgressBar(B * 2)
         progress = 0
@@ -1820,7 +2045,96 @@ class PoseAndFaceDetectionV2:
         face_images_np = np.stack(face_images, 0)
         face_images_tensor = torch.from_numpy(face_images_np)
 
-        retarget_pose_metas = [AAPoseMeta.from_humanapi_meta(meta) for meta in pose_metas]
+        # ---- Manual landmark corrections (Pose editor, stage 2) ----
+        # The pose_gaze_viewer's Edit mode writes per-frame, per-joint body
+        # keypoint corrections here so a MIS-DETECTED skeleton can be fixed by
+        # hand and the fix flows through retargeting into pose_data + the
+        # rendered pose images — not just the on-node preview. Coords arrive as
+        # SOURCE pixels; keypoints_body is normalised 0..1, so we divide by W/H.
+        # Row length is preserved so the downstream np.array(keypoints_body)
+        # stays rectangular. Best-effort: a bad blob never breaks the node.
+        try:
+            _ov = json.loads(landmark_overrides_json) if landmark_overrides_json else None
+            if isinstance(_ov, dict) and _ov:
+                _n_applied = 0
+                for _fk, _joints in _ov.items():
+                    try:
+                        _fi = int(_fk)
+                    except (TypeError, ValueError):
+                        continue
+                    if not (0 <= _fi < len(pose_metas)) or not isinstance(_joints, dict):
+                        continue
+                    _kpb = pose_metas[_fi].get('keypoints_body')
+                    if _kpb is None:
+                        continue
+                    # length template from a detected sibling → uniform rows
+                    _tmpl_len = 3
+                    for _s in _kpb:
+                        if _s is not None and hasattr(_s, '__len__') and len(_s) >= 2:
+                            _tmpl_len = len(_s)
+                            break
+                    for _jk, _xy in _joints.items():
+                        try:
+                            _j = int(_jk)
+                        except (TypeError, ValueError):
+                            continue
+                        if not (0 <= _j < len(_kpb)):
+                            continue
+                        if not (isinstance(_xy, (list, tuple)) and len(_xy) >= 2):
+                            continue
+                        _xn = min(1.0, max(0.0, float(_xy[0]) / float(W))) if W else 0.0
+                        _yn = min(1.0, max(0.0, float(_xy[1]) / float(H))) if H else 0.0
+                        _old = _kpb[_j]
+                        if _old is not None and hasattr(_old, '__len__') and len(_old) >= 2:
+                            try:                       # numpy row / list → mutate in place
+                                _old[0] = _xn
+                                _old[1] = _yn
+                            except (TypeError, IndexError):   # immutable (tuple) → rebuild same length
+                                _new = list(_old)
+                                _new[0] = _xn
+                                _new[1] = _yn
+                                _kpb[_j] = _new
+                        else:                          # was undetected → add a visible keypoint
+                            _row = [0.0] * _tmpl_len
+                            if _tmpl_len >= 3:
+                                _row[2] = 1.0
+                            _row[0] = _xn
+                            _row[1] = _yn
+                            _kpb[_j] = _row
+                        _n_applied += 1
+                    pose_metas[_fi]['keypoints_body'] = _kpb
+                if _n_applied:
+                    logging.getLogger(__name__).info(
+                        "PoseAndFaceDetectionV2: applied %d manual landmark correction(s).",
+                        _n_applied,
+                    )
+        except Exception as _ov_exc:  # noqa: BLE001 — never break the node on a bad blob
+            logging.getLogger(__name__).warning(
+                "PoseAndFaceDetectionV2: landmark_overrides_json ignored (%s).", _ov_exc,
+            )
+
+        # Retarget onto the reference character when one was provided, else the
+        # straight per-frame conversion. get_retarget_pose returns AAPoseMeta
+        # objects just like from_humanapi_meta, so the draw path is unchanged.
+        if refer_pose_meta is not None:
+            try:
+                # get_retarget_pose mutates its input metas in place (ndarray→
+                # list, hands scaled to pixels). Pass a deep copy so the shared
+                # pose_metas stays ndarray-typed for the iris / viewer / points
+                # passes that run after this.
+                import copy as _copy  # noqa: PLC0415
+                _pm_for_rt = _copy.deepcopy(pose_metas)
+                retarget_pose_metas = get_retarget_pose(
+                    _pm_for_rt[0], refer_pose_meta, _pm_for_rt, None, None
+                )
+            except Exception as _rt_exc:  # noqa: BLE001 — fall back to non-retargeted
+                logging.getLogger(__name__).warning(
+                    "PoseAndFaceDetectionV2: get_retarget_pose failed (%s); using non-retargeted pose.",
+                    _rt_exc,
+                )
+                retarget_pose_metas = [AAPoseMeta.from_humanapi_meta(meta) for meta in pose_metas]
+        else:
+            retarget_pose_metas = [AAPoseMeta.from_humanapi_meta(meta) for meta in pose_metas]
 
         # use first bbox for return (legacy)
         bbox0 = bboxes[0]
@@ -1846,6 +2160,12 @@ class PoseAndFaceDetectionV2:
         # Resolve the gaze engine. `use_blendshape_gaze=False` forces the
         # legacy iris-offset path regardless of `gaze_engine`.
         _engine = str(gaze_engine or "blendshape_head_corrected").strip()
+        # Honest gaze-engine status: track what the user REQUESTED vs what
+        # actually ran, and why it fell back, so the viewer can tell the user
+        # (the accurate engines silently degraded before — the "gaze not
+        # accurate" complaint). _gaze_note is set at each fallback below.
+        _gaze_requested = _engine
+        _gaze_note = None
         if not bool(use_blendshape_gaze):
             _engine = "legacy_iris_offset"
         # C0.4: ethxgaze is a *post-process* over a base engine — the
@@ -1863,6 +2183,8 @@ class PoseAndFaceDetectionV2:
                 "falling back to blendshape_head_corrected.",
                 _engine,
             )
+            _gaze_note = (f"{_engine} unavailable (install l2cs-net / check weights) "
+                          "— using blendshape_head_corrected")
             _engine = "blendshape_head_corrected"
         # The pose_normalized_resnet50 engine requires the normalizer
         # module, the ResNet50 estimator module, AND a usable checkpoint
@@ -1898,8 +2220,19 @@ class PoseAndFaceDetectionV2:
                     "gaze_engine=pose_normalized_resnet50 disabled (%s); "
                     "falling back to %s.", _missing_reason, _fb_engine,
                 )
+                _gaze_note = (f"pose_normalized_resnet50 disabled ({_missing_reason}) "
+                              f"— using {_fb_engine}. Drop a ResNet50 gaze checkpoint at "
+                              "models/gaze/pose_normalized_resnet50.pth.tar to enable ~3-4°.")
                 _pose_norm_resnet50_enabled = False
                 _engine = _fb_engine
+        if _engine == "iris_geometric" and not (
+            _GAZE_IRIS_IMPORTED and _gaze_iris is not None
+        ):
+            logging.getLogger(__name__).warning(
+                "gaze_engine=iris_geometric requested but gaze_iris_geometric "
+                "unavailable; falling back to blendshape_head_corrected.",
+            )
+            _engine = "blendshape_head_corrected"
         if _engine == "blendshape_head_corrected" and not (
             _GAZE_3D_IMPORTED and _gaze_3d is not None
         ):
@@ -1908,11 +2241,17 @@ class PoseAndFaceDetectionV2:
                 "gaze_3d unavailable; falling back to blendshape_only.",
             )
             _engine = "blendshape_only"
-        bs_enabled = (_engine in ("blendshape_head_corrected", "blendshape_only")
+        _iris_geo_enabled = (_engine == "iris_geometric")
+        # iris_geometric keeps the blendshape/FaceLandmarker pass enabled: it
+        # supplies R_head for the composition and a blendshape fallback for
+        # blink-gated frames. The measured-iris source simply outranks it.
+        bs_enabled = (_engine in ("blendshape_head_corrected", "blendshape_only",
+                                  "iris_geometric")
                       and _GAZE_BS_IMPORTED
                       and _gaze_bs is not None and _gaze_bs.is_available())
         l2cs_enabled = _engine.startswith("l2cs")
-        head_correct = (_engine == "blendshape_head_corrected")
+        head_correct = (_engine in ("blendshape_head_corrected", "iris_geometric")
+                        and _GAZE_3D_IMPORTED and _gaze_3d is not None)
         max_yaw_rad = math.radians(float(gaze_max_yaw_deg))
         max_pitch_rad = math.radians(float(gaze_max_pitch_deg))
         # Lazy-init L2CS pipeline and per-eye Kalman filters once per node call.
@@ -1943,6 +2282,48 @@ class PoseAndFaceDetectionV2:
                     dt=_kalman_dt, process_std=_kalman_proc, meas_std=_kalman_meas,
                 ),
             }
+        # ── W7-G2: per-shot gaze calibration pre-pass (iris_geometric only) ──
+        # Measure the eye-in-head angles on the user-designated "subject looks
+        # straight at the camera" frame and make them the zero reference for
+        # the whole shot. Runs BEFORE the main loop so every frame (including
+        # ones earlier than the calibration frame) gets the corrected origin.
+        if _iris_geo_enabled:
+            _gaze_iris.reset_calibration()   # never leak a previous run's offsets
+            _cal_idx = int(gaze_calibration_frame)
+            if 0 <= _cal_idx < B:
+                try:
+                    rx1, rx2, ry1, ry2 = raw_face_bboxes[_cal_idx]
+                    _side = max(rx2 - rx1, ry2 - ry1) * 1.4
+                    _ccx, _ccy = 0.5 * (rx1 + rx2), 0.5 * (ry1 + ry2)
+                    _h = 0.5 * _side
+                    _mx1 = int(max(0, round(_ccx - _h)))
+                    _my1 = int(max(0, round(_ccy - _h)))
+                    _mx2 = int(min(W, round(_ccx + _h)))
+                    _my2 = int(min(H, round(_ccy + _h)))
+                    _cal_res = None
+                    if _mx2 - _mx1 > 8 and _my2 - _my1 > 8:
+                        _cal_crop = (np.clip(images_np[_cal_idx][_my1:_my2, _mx1:_mx2], 0, 1) * 255).astype(np.uint8)
+                        if bs_enabled:
+                            _cal_res = _run_face_landmarker_on_face_crop(
+                                _cal_crop, (_mx1, _my1), (_mx2 - _mx1, _my2 - _my1), W, H)
+                        if _cal_res is None:
+                            _cal_res = _run_mediapipe_on_face_crop(
+                                _cal_crop, (_mx1, _my1), (_mx2 - _mx1, _my2 - _my1), W, H)
+                    if _cal_res is not None:
+                        _gaze_iris.calibrate_from_measurement(
+                            _gaze_iris.eye_in_head_from_iris(_cal_res, "right"),
+                            _gaze_iris.eye_in_head_from_iris(_cal_res, "left"),
+                        )
+                        logging.getLogger(__name__).info(
+                            "[iris_geometric] calibrated on frame %d: %s",
+                            _cal_idx, _gaze_iris.get_calibration())
+                    else:
+                        logging.getLogger(__name__).warning(
+                            "[iris_geometric] calibration frame %d: no face found; "
+                            "calibration skipped (gaze stays uncalibrated).", _cal_idx)
+                except Exception as exc:  # noqa: BLE001
+                    logging.getLogger(__name__).warning(
+                        "[iris_geometric] calibration pre-pass failed: %s", exc)
         mp_used_count = 0
         bs_used_count = 0
         l2cs_used_count = 0
@@ -2088,7 +2469,7 @@ class PoseAndFaceDetectionV2:
                         }
                         l2cs_used_count += 1
                 gaze_bs = mp_result.get('gaze_blendshape')
-                if gaze_bs is not None or _l2cs_per_eye is not None:
+                if gaze_bs is not None or _l2cs_per_eye is not None or _iris_geo_enabled:
                     # Blend-shape path: rescale yaw/pitch to user-tuned max
                     # angles (defaults already factor in MAX_GAZE_*_RAD,
                     # so divide by them and remultiply by the new max).
@@ -2143,6 +2524,30 @@ class PoseAndFaceDetectionV2:
                             e['source'] = 'l2cs_' + (
                                 "gaze360" if _engine == "l2cs_gaze360" else "mpiigaze"
                             )
+                        elif _iris_geo_enabled:
+                            # W7-G1: MEASURED iris-in-aperture eye-in-head gaze.
+                            # Outranks the blendshape estimate; blink-gated
+                            # frames fall back to blendshapes (if available)
+                            # so the Kalman stream never starves.
+                            _ge = None
+                            try:
+                                _ge = _gaze_iris.eye_in_head_from_iris(mp_result, eye_name)
+                            except Exception:  # noqa: BLE001
+                                _ge = None
+                            if _ge is not None:
+                                e = _ge
+                                e['source'] = 'iris_geometric'
+                            elif gaze_bs is not None:
+                                e = dict(gaze_bs[eye_name])
+                                e['yaw_rad'] = float(e['yaw_rad']) / max(base_yaw, 1e-6) * max_yaw_rad
+                                e['pitch_rad'] = float(e['pitch_rad']) / max(base_pitch, 1e-6) * max_pitch_rad
+                                e['source'] = 'blendshape_blink_fallback'
+                            else:
+                                # Blink/occlusion with no fallback: hold neutral;
+                                # the Kalman velocity model coasts through it.
+                                e = {'yaw_rad': 0.0, 'pitch_rad': 0.0,
+                                     'blink': 1.0, 'confidence': 0.0,
+                                     'source': 'iris_geometric_gated'}
                         else:
                             e = dict(gaze_bs[eye_name])
                             e['yaw_rad'] = float(e['yaw_rad']) / max(base_yaw, 1e-6) * max_yaw_rad
@@ -2178,7 +2583,10 @@ class PoseAndFaceDetectionV2:
                                 _dx, _dy = _dx2, _dy2
                             e['yaw_rad'] = float(_yaw_w)
                             e['pitch_rad'] = float(_pitch_w)
-                            e['source'] = 'blendshape_head_corrected'
+                            e['source'] = ('iris_geometric_head_corrected'
+                                           if _iris_geo_enabled and
+                                           str(e.get('source', '')).startswith('iris_geometric')
+                                           else 'blendshape_head_corrected')
                             _yaw = float(_yaw_w)
                             _pitch = float(_pitch_w)
                         else:
@@ -2466,6 +2874,10 @@ class PoseAndFaceDetectionV2:
         pose_data = {
             "pose_metas": retarget_pose_metas,
             "pose_metas_original": pose_metas,
+            # V1-parity retarget payload — present only when retarget_image was
+            # connected; lets the draw node pad/resize onto the reference.
+            "refer_pose_meta": refer_pose_meta if retarget_image is not None else None,
+            "retarget_image": refer_img_proc if retarget_image is not None else None,
             "iris_data": all_iris,
             "lip_openness_ratios": all_lip_ratios,
             # MANUAL bug-fix (Apr 2026): expose source frame dims + target
@@ -2482,6 +2894,7 @@ class PoseAndFaceDetectionV2:
         # from the ETH-XGaze ResNet-50 model. Requires the third_party
         # repo + checkpoint; on any failure we keep the original engine's
         # output and emit a warning.
+        _ethxgaze_ok = False
         if _ethxgaze_post:
             try:
                 from .nodes_extras.gaze_ethxgaze import WanGazeETHXGazeV2 as _ETHX
@@ -2492,8 +2905,14 @@ class PoseAndFaceDetectionV2:
                 )
                 pose_data["iris_data"] = _patched_bundle.get("iris_data", pose_data["iris_data"])
                 all_iris = pose_data["iris_data"]
+                _ethxgaze_ok = True
+                _engine = "ethxgaze"
                 logging.getLogger(__name__).info("ethxgaze post-process: %s", _info)
             except Exception as _exc:                                    # noqa: BLE001
+                _gaze_note = (
+                    "ETH-XGaze (~2.5°) checkpoint missing — using "
+                    f"{_engine}. Drop epoch_24_ckpt.pth.tar into models/ethxgaze/ "
+                    "to enable it. (" + str(_exc)[:80] + ")")
                 logging.getLogger(__name__).warning(
                     "gaze_engine=ethxgaze post-process failed (%s); "
                     "keeping previous engine output.", _exc,
@@ -2612,6 +3031,17 @@ class PoseAndFaceDetectionV2:
                 frame_u8, pose_metas[idx]['keypoints_face'],
                 all_iris[idx], face_bboxes[idx], bboxes[idx], W, H,
             )
+            # Fold the full OP18 body skeleton + hands onto the same debug image
+            # (this is what the old standalone WanPoseOverlayV2 node did — now
+            # built in, so debug_image is a complete verification overlay:
+            # body + face + hands + iris + gaze, no second node to wire).
+            try:
+                from .nodes_extras.pose_overlay import draw_body_skeleton_rgb as _draw_body
+                _draw_body(cv2, vis, pose_metas[idx], W, H)
+            except Exception as _ov_exc:                                  # noqa: BLE001
+                logging.getLogger(__name__).debug(
+                    "body-skeleton overlay skipped on frame %d: %s", idx, _ov_exc,
+                )
             debug_frames.append(vis)
         debug_np = np.stack(debug_frames, 0).astype(np.float32) / 255.0
         debug_tensor = torch.from_numpy(debug_np)
@@ -2702,12 +3132,52 @@ class PoseAndFaceDetectionV2:
                 })
         except Exception:  # noqa: BLE001
             _viewer_frames = []
+        # Clean downscaled frame previews so the viewer can REVEAL the
+        # skeleton/iris/gaze overlaid on the ACTUAL image (not a blank tile).
+        # Capped + downscaled to keep the websocket cheap; the frontend draws
+        # the nearest available preview as the backdrop for the current frame.
+        _viewer_previews = []
+        try:
+            import base64  # noqa: PLC0415
+            import cv2 as _cv2  # noqa: N813
+            _pv_max = min(60, int(B))
+            _pv_long = 320  # longest side px
+            _idxs = ([0] if _pv_max <= 1
+                     else [round(i * (B - 1) / (_pv_max - 1)) for i in range(_pv_max)])
+            for _pi in sorted(set(_idxs)):
+                _fr = images_np[_pi]  # H,W,C float 0..1
+                _hh, _ww = _fr.shape[:2]
+                _sc = _pv_long / float(max(_hh, _ww))
+                if _sc < 1.0:
+                    _fr = _cv2.resize(_fr, (max(1, int(_ww * _sc)), max(1, int(_hh * _sc))),
+                                      interpolation=_cv2.INTER_AREA)
+                _u8 = (np.clip(_fr, 0.0, 1.0) * 255.0).astype(np.uint8)[:, :, ::-1]  # RGB->BGR
+                _ok, _buf = _cv2.imencode(".jpg", _u8, [int(_cv2.IMWRITE_JPEG_QUALITY), 72])
+                if _ok:
+                    _viewer_previews.append({
+                        "frame": int(_pi),
+                        "b64": "data:image/jpeg;base64," + base64.b64encode(_buf.tobytes()).decode("ascii"),
+                    })
+        except Exception:  # noqa: BLE001
+            _viewer_previews = []
+        _GAZE_ACCURACY = {
+            "ethxgaze": "~2.5° MAE", "pose_normalized_resnet50": "~3-4° MAE",
+            "l2cs_mpiigaze": "~3.9° MAE", "l2cs_gaze360": "~10.4° MAE",
+            "iris_geometric": "iris-measured (deterministic)",
+            "blendshape_head_corrected": "blendshape + head (approx)",
+            "blendshape_only": "eye-in-head (approx)",
+            "legacy_iris_offset": "rough",
+        }
         _ui_payload = {
             "viewer_meta": [json.dumps({
                 "src_w": int(W), "src_h": int(H),
                 "n_frames": int(B),
                 "engine": str(_engine),
+                "engine_requested": str(_gaze_requested),
+                "engine_accuracy": _GAZE_ACCURACY.get(str(_engine), ""),
+                "engine_status": _gaze_note,   # non-null only when it fell back
                 "frames": _viewer_frames,
+                "previews": _viewer_previews,
             })],
         }
 
@@ -2791,6 +3261,10 @@ class DrawViTPoseV2:
     FUNCTION = "process"
     CATEGORY = "WanAnimatePreprocess_V2"
 
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        return hash_args_and_kwargs(**kwargs)
+
     @staticmethod
     def _padding_resize_transform(src_h, src_w, out_h, out_w):
         """Replicate utils.padding_resize math as a (scale, ox, oy) transform.
@@ -2863,6 +3337,22 @@ class DrawViTPoseV2:
                                         color_bgr, 2, cv2.LINE_AA, tipLength=0.3)
 
     def process(self, pose_data, width, height, body_stick_width, hand_stick_width,
+                draw_head, pose_draw_threshold, retarget_padding=64,
+                draw_iris=True, draw_gaze=True,
+                iris_radius=4, gaze_arrow_len=30,
+                iris_min_confidence=0.05, iris_color="white",
+                face_images=None, face_cfg_scale=1.0, enforce_512_face=True):
+        with torch.inference_mode():
+            return self._process_impl(
+                pose_data, width, height, body_stick_width, hand_stick_width,
+                draw_head, pose_draw_threshold, retarget_padding,
+                draw_iris, draw_gaze,
+                iris_radius, gaze_arrow_len,
+                iris_min_confidence, iris_color,
+                face_images, face_cfg_scale, enforce_512_face,
+            )
+
+    def _process_impl(self, pose_data, width, height, body_stick_width, hand_stick_width,
                 draw_head, pose_draw_threshold, retarget_padding=64,
                 draw_iris=True, draw_gaze=True,
                 iris_radius=4, gaze_arrow_len=30,
@@ -2942,27 +3432,24 @@ class DrawViTPoseV2:
                     _fi = face_images
                 else:
                     _fi = torch.from_numpy(np.asarray(face_images))
-                if _fi.ndim != 4 or _fi.shape[-1] != 3:
-                    logging.getLogger(__name__).warning(
-                        "DrawViTPoseV2: face_images has unexpected shape %s; passing through unmodified.",
-                        tuple(_fi.shape),
+                if not isinstance(_fi, torch.Tensor) or _fi.ndim != 4 or _fi.shape[-1] != 3:
+                    raise ValueError(
+                        f"DrawViTPoseV2: face_images expected (B,H,W,3); got {tuple(_fi.shape)}"
                     )
-                    face_video_out = _fi
+                if _fi.shape[0] != pose_images_tensor.shape[0]:
+                    logging.getLogger(__name__).warning(
+                        "DrawViTPoseV2: face_images frame count (%d) != pose frame count (%d); forwarding face_images as-is.",
+                        int(_fi.shape[0]), int(pose_images_tensor.shape[0]),
+                    )
+                if bool(enforce_512_face) and (int(_fi.shape[1]) != 512 or int(_fi.shape[2]) != 512):
+                    # (B,H,W,3) -> (B,3,H,W) -> resize -> (B,H,W,3)
+                    _t = _fi.permute(0, 3, 1, 2).float()
+                    _t = torch.nn.functional.interpolate(
+                        _t, size=(512, 512), mode="bilinear", align_corners=False,
+                    )
+                    face_video_out = _t.permute(0, 2, 3, 1).contiguous().clamp(0.0, 1.0)
                 else:
-                    if _fi.shape[0] != pose_images_tensor.shape[0]:
-                        logging.getLogger(__name__).warning(
-                            "DrawViTPoseV2: face_images frame count (%d) != pose frame count (%d); forwarding face_images as-is.",
-                            int(_fi.shape[0]), int(pose_images_tensor.shape[0]),
-                        )
-                    if bool(enforce_512_face) and (int(_fi.shape[1]) != 512 or int(_fi.shape[2]) != 512):
-                        # (B,H,W,3) -> (B,3,H,W) -> resize -> (B,H,W,3)
-                        _t = _fi.permute(0, 3, 1, 2).float()
-                        _t = torch.nn.functional.interpolate(
-                            _t, size=(512, 512), mode="bilinear", align_corners=False,
-                        )
-                        face_video_out = _t.permute(0, 2, 3, 1).contiguous().clamp(0.0, 1.0)
-                    else:
-                        face_video_out = _fi
+                    face_video_out = _fi
             except Exception as e:
                 logging.getLogger(__name__).warning(
                     "DrawViTPoseV2: face passthrough failed (%s); forwarding original face_images.", e,
@@ -3010,6 +3497,10 @@ class WanAnimateFaceQualityCheckV2:
     FUNCTION = "process"
     CATEGORY = "WanAnimatePreprocess_V2"
 
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        return hash_args_and_kwargs(**kwargs)
+
     def _unsharp(self, frame_np):
         # Frame is float32 [0,1].
         u8 = (np.clip(frame_np, 0.0, 1.0) * 255.0).astype(np.uint8)
@@ -3018,6 +3509,18 @@ class WanAnimateFaceQualityCheckV2:
         return np.clip(sharp.astype(np.float32) / 255.0, 0.0, 1.0)
 
     def process(self, face_images, blur_threshold, min_eye_brightness,
+                auto_repair_bad_frames, repair_strategy):
+        if not isinstance(face_images, torch.Tensor) or face_images.ndim != 4 or face_images.shape[-1] != 3:
+            raise ValueError(
+                f"WanAnimateFaceQualityCheckV2: expected (B,H,W,3); got {tuple(getattr(face_images, 'shape', ()))}"
+            )
+        with torch.inference_mode():
+            return self._process_impl(
+                face_images, blur_threshold, min_eye_brightness,
+                auto_repair_bad_frames, repair_strategy,
+            )
+
+    def _process_impl(self, face_images, blur_threshold, min_eye_brightness,
                 auto_repair_bad_frames, repair_strategy):
         if hasattr(face_images, "detach"):
             arr = face_images.detach().cpu().numpy()
@@ -3157,6 +3660,10 @@ class DepthPoseCannyCombinedV2:
     )
     FUNCTION = "process"
     CATEGORY = "WanAnimatePreprocess_V2"
+
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        return hash_args_and_kwargs(**kwargs)
 
     # ---------- helpers ----------
     @staticmethod
@@ -3721,6 +4228,47 @@ class DepthPoseCannyCombinedV2:
         depthcrafter_steps=5, depthcrafter_guidance=1.0,
         depthcrafter_window=110, depthcrafter_overlap=25,
     ):
+        if isinstance(images, torch.Tensor):
+            if images.ndim != 4 or images.shape[-1] != 3:
+                raise ValueError(
+                    f"DepthPoseCannyCombinedV2: expected (B,H,W,3); got {tuple(images.shape)}"
+                )
+        with torch.inference_mode():
+            return self._process_impl(
+                images, width, height,
+                enable_depth, enable_pose, enable_canny,
+                canny_threshold1, canny_threshold2, canny_aperture,
+                depth_colorize, depth_invert,
+                pose_detection_threshold, pose_draw_threshold,
+                combined_layout,
+                depth_backend, enable_normal, normal_strength,
+                blend_mode,
+                depth_weight, pose_weight, canny_weight, normal_weight,
+                external_depth_map,
+                damodel_v2, da3_model,
+                depthcrafter_model, depth_pro_model,
+                posemodel, external_pose_map,
+                depthcrafter_steps, depthcrafter_guidance,
+                depthcrafter_window, depthcrafter_overlap,
+            )
+
+    def _process_impl(
+        self, images, width, height,
+        enable_depth, enable_pose, enable_canny,
+        canny_threshold1, canny_threshold2, canny_aperture,
+        depth_colorize, depth_invert,
+        pose_detection_threshold, pose_draw_threshold,
+        combined_layout,
+        depth_backend="auto", enable_normal=True, normal_strength=1.0,
+        blend_mode="weighted_avg",
+        depth_weight=1.0, pose_weight=1.0, canny_weight=1.0, normal_weight=0.5,
+        external_depth_map=None,
+        damodel_v2=None, da3_model=None,
+        depthcrafter_model=None, depth_pro_model=None,
+        posemodel=None, external_pose_map=None,
+        depthcrafter_steps=5, depthcrafter_guidance=1.0,
+        depthcrafter_window=110, depthcrafter_overlap=25,
+    ):
         images_np = self._to_np(images)
         if images_np.ndim != 4 or images_np.shape[-1] != 3:
             raise ValueError(
@@ -3918,7 +4466,18 @@ class EARBlinkDetectorC2C:
     FUNCTION = "detect"
     CATEGORY = "WanAnimatePreprocess_V2/KANIBUS"
 
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        return hash_args_and_kwargs(**kwargs)
+
     def detect(self, pose_data, threshold, min_consecutive_frames, fps,
+               smooth_window):
+        with torch.inference_mode():
+            return self._detect_impl(
+                pose_data, threshold, min_consecutive_frames, fps, smooth_window,
+            )
+
+    def _detect_impl(self, pose_data, threshold, min_consecutive_frames, fps,
                smooth_window):
         metas, _iris, (H, W) = _coerce_pose_data(pose_data)
         ear_r: List[float] = []
@@ -4030,7 +4589,19 @@ class SaccadeClassifierC2C:
     FUNCTION = "classify"
     CATEGORY = "WanAnimatePreprocess_V2/KANIBUS"
 
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        return hash_args_and_kwargs(**kwargs)
+
     def classify(self, pose_data, fps, velocity_threshold_deg_s,
+                 min_consecutive_frames, one_euro_min_cutoff, one_euro_beta):
+        with torch.inference_mode():
+            return self._classify_impl(
+                pose_data, fps, velocity_threshold_deg_s,
+                min_consecutive_frames, one_euro_min_cutoff, one_euro_beta,
+            )
+
+    def _classify_impl(self, pose_data, fps, velocity_threshold_deg_s,
                  min_consecutive_frames, one_euro_min_cutoff, one_euro_beta):
         _metas, iris_seq, _ = _coerce_pose_data(pose_data)
         if not iris_seq:
@@ -4161,6 +4732,10 @@ class PupilDilationTrackerC2C:
     FUNCTION = "track"
     CATEGORY = "WanAnimatePreprocess_V2/KANIBUS"
 
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        return hash_args_and_kwargs(**kwargs)
+
     def _scale_eye_width(self, face_kps, W, H) -> float:
         if face_kps is None or face_kps.ndim < 2:
             return float('nan')
@@ -4181,6 +4756,15 @@ class PupilDilationTrackerC2C:
         return float(np.mean(widths))
 
     def track(self, pose_data, normaliser, event_threshold,
+              min_consecutive_frames, smooth_window, fps,
+              face_bboxes=None):
+        with torch.inference_mode():
+            return self._track_impl(
+                pose_data, normaliser, event_threshold,
+                min_consecutive_frames, smooth_window, fps, face_bboxes,
+            )
+
+    def _track_impl(self, pose_data, normaliser, event_threshold,
               min_consecutive_frames, smooth_window, fps,
               face_bboxes=None):
         metas, iris_seq, (H, W) = _coerce_pose_data(pose_data)
