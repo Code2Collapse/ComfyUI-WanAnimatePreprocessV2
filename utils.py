@@ -5,6 +5,24 @@ import math
 import random
 import numpy as np
 
+
+def resize_face_crop(face_image, size=512):
+    """Direction-aware resize for the face-encoder crop (fixes a real bug).
+
+    Every call site previously did a bare ``cv2.resize(face_image, (512, 512))``
+    with no interpolation flag, which defaults to INTER_LINEAR for BOTH
+    directions. For any shot where the face occupies less than 512px in-frame
+    (the common half-/full-body case), that is an UPSCALE using the softest
+    available filter, actively blurring the fine detail (wrinkles, eye
+    creases) that carries a microexpression before it ever reaches the face
+    encoder. Use INTER_AREA for genuine downscales (correct anti-aliasing) and
+    INTER_LANCZOS4 for upscales (sharpest upsample cv2 offers).
+    """
+    h, w = face_image.shape[:2]
+    interp = cv2.INTER_AREA if (h > size or w > size) else cv2.INTER_LANCZOS4
+    return cv2.resize(face_image, (size, size), interpolation=interp)
+
+
 def get_mask_boxes(mask):
     y_coords, x_coords = np.nonzero(mask)
     x_min = x_coords.min()
@@ -41,6 +59,11 @@ def get_mask_body_img(img_copy, hand_mask, k=7, iterations=1):
     return mask_hand_img, dilation
 
 
+# NOTE: this 4-arg get_face_bboxes is DEAD CODE — a second def of the same
+# name at line ~310 (3-arg, no ratio_aug) shadows it at module scope, and the
+# one live call site (nodes.py) uses the 3-arg form. Nothing can reach this
+# version under this name. Left in place (not deleted) since removing it is
+# out of scope here; do not "fix" its bugs expecting it to run anywhere.
 def get_face_bboxes(kp2ds, scale, image_shape, ratio_aug):
     h, w = image_shape
     kp2ds_face = kp2ds.copy()[23:91, :2]
@@ -307,12 +330,20 @@ def get_face_bboxes(kp2ds, scale, image_shape):
     new_height = np.sqrt(expanded_area * (initial_height / initial_width))
 
     delta_width = (new_width - initial_width) / 2
-    delta_height = (new_height - initial_height) / 4
+    # Bug-fix (Wan-Animate spec 1.2): was `/ 4` here with the vertical room
+    # split 3:1 upward:downward below (3x toward the forehead/hair, 1x toward
+    # the chin). Mouth-corner pull, jaw tension, and chin dimpling are core
+    # microexpression carriers and were getting clipped tighter than the
+    # upper face. `/ 2` (matching delta_width) + applying it EVENLY above
+    # and below (both `1.4 *`, verified by unit test to land at an exact 1:1
+    # up:down ratio) gives the chin/jaw as much room as the forehead, instead
+    # of the old 3:1 forehead bias.
+    delta_height = (new_height - initial_height) / 2
 
     expanded_min_x = max(min_x - delta_width, 0)
     expanded_max_x = min(max_x + delta_width, w)
-    expanded_min_y = max(min_y - 3 * delta_height, 0)
-    expanded_max_y = min(max_y + delta_height, h)
+    expanded_min_y = max(min_y - 1.4 * delta_height, 0)
+    expanded_max_y = min(max_y + 1.4 * delta_height, h)
 
     return [int(expanded_min_x), int(expanded_max_x), int(expanded_min_y), int(expanded_max_y)]
 
@@ -355,6 +386,39 @@ def adjust_bbox_eye_upper_third(face_bbox, eye_xy_pixel, frame_w, frame_h,
     new_y1 = int(np.clip(desired_y1, 0, max(0, frame_h - crop_h)))
     new_y2 = new_y1 + crop_h
     return (int(x1), int(x2), int(new_y1), int(new_y2))
+
+
+def apply_eye_offset_to_center(center_xy, eye_xy_pixel, crop_size, frame_h,
+                                eye_y_fraction=0.30):
+    """Like ``adjust_bbox_eye_upper_third`` but operates on a crop CENTER
+    point instead of a finalised (x1,x2,y1,y2) bbox, so the eye-offset can be
+    folded into the target-center TRAJECTORY before temporal smoothing runs
+    (Wan-Animate spec 1.3), instead of shifting an already-smoothed bbox
+    afterward with a fresh, unsmoothed per-frame eye-landmark read.
+
+    Mathematically equivalent to applying ``adjust_bbox_eye_upper_third`` to
+    the eventual (x1,x2,y1,y2) bbox at this crop_size: a bbox's y-center is
+    ``y1 + crop_size/2``, so shifting the center the same way the bbox's y1
+    would have shifted lands the eyes at the same ``eye_y_fraction`` row.
+
+    Args:
+        center_xy:      (cx, cy) crop center in full-frame pixel space.
+        eye_xy_pixel:   (eye_cx, eye_cy) midpoint of both eye centres in
+                        full-frame pixel space, or None.
+        crop_size:      the (square) crop's pixel height at this frame.
+        frame_h:        full frame height.
+        eye_y_fraction: target normalised eye row inside the crop.
+
+    Returns:
+        (cx, new_cy) — x is never touched, only the vertical position.
+    """
+    cx, cy = center_xy
+    if crop_size is None or crop_size <= 0 or eye_xy_pixel is None:
+        return (float(cx), float(cy))
+    _eye_cx, eye_cy = eye_xy_pixel
+    desired_y1 = float(eye_cy) - float(eye_y_fraction) * float(crop_size)
+    new_y1 = float(np.clip(desired_y1, 0.0, max(0.0, float(frame_h) - float(crop_size))))
+    return (float(cx), new_y1 + float(crop_size) / 2.0)
 
 
 def compute_eye_midpoint_from_face_kps(face_kps_norm, frame_w, frame_h):
