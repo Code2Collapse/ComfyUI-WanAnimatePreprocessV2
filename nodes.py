@@ -639,6 +639,7 @@ from .utils import (
     compute_frame_blur_score,
     compute_eye_region_brightness,
     resize_face_crop,
+    amplify_landmarks_from_neutral,
 )
 from .pose_utils.human_visualization import AAPoseMeta, draw_aapose_by_meta_new
 from .retarget_pose import get_retarget_pose
@@ -1392,7 +1393,27 @@ class PoseAndFaceDetectionV2:
     DESCRIPTION = (
         "Run YOLO person detection + ViTPose 2D keypoints + (optional) MediaPipe "
         "FaceMesh on a video tensor. Produces the full pose/face/iris bundle "
-        "required by Wan 2.2 Animate Character Replacement workflows."
+        "required by Wan 2.2 Animate Character Replacement workflows.\n\n"
+        "Wan-Animate fidelity notes (spec 2.5-2.7, workflow-level — not "
+        "something this node can enforce for you):\n"
+        "2.5 Wan-Animate splices long generations in ~78-frame segments with "
+        "1-5 frame temporal handoffs (WanVideoAnimateEmbeds.frame_window_size, "
+        "default 77); a brief microexpression (often only 2-4 frames) landing "
+        "exactly on a segment boundary risks being smoothed by the "
+        "discard/resume splice. If a specific expression must survive, check "
+        "where it falls relative to your frame_window_size and shift the cut "
+        "(or duration) if needed.\n"
+        "2.6 Feed this node NATIVE framerate footage. Don't downsample fps "
+        "upstream (e.g. a LoadVideo 'force_rate' below the source fps) — the "
+        "face branch's causal 1D-conv temporal downsampling further "
+        "compresses an already-fps-reduced brief expression, and a 2-4 frame "
+        "microexpression can be lost entirely before it ever reaches this node.\n"
+        "2.7 If your workflow globally autocasts to fp8/fp16, the face "
+        "encoder's small-magnitude motion-basis deltas are more vulnerable to "
+        "quantization noise than the body/pose branch. As of this writing "
+        "Kijai's ComfyUI-WanVideoWrapper has no per-module precision override "
+        "for the Wan-Animate face branch specifically — if you need this, "
+        "load the full checkpoint in fp16/fp32 rather than an fp8 quant."
     )
 
     @classmethod
@@ -1446,7 +1467,7 @@ class PoseAndFaceDetectionV2:
                 # ---- Wan-Animate paper-driven gaze fixes (arXiv:2509.14055) ----
                 "eye_align_mode": (["default", "eye_upper_third"], {"default": "default", "tooltip": "Wan-Animate paper recommendation #1: 'eye_upper_third' vertically shifts the face crop so eyes land at the upper third of the 512x512 face encoder input. The encoder reads holistic face appearance, so consistent eye placement directly improves gaze fidelity. 'default' keeps legacy bbox center."}),
                 "eye_y_fraction": ("FLOAT", {"default": 0.30, "min": 0.10, "max": 0.60, "step": 0.01, "tooltip": "Target eye row as a fraction of crop height (0.30 = upper third). Only used when eye_align_mode = 'eye_upper_third'."}),
-                "face_cfg_scale": ("FLOAT", {"default": 1.0, "min": 1.0, "max": 10.0, "step": 0.1, "tooltip": "Wan-Animate paper recommendation #3 (paper section 4.3): CFG on the face conditioning input gives finer control over expression / gaze when finer reenactment is desired. This widget is a passthrough -- wire the FLOAT output 'face_cfg_scale' into your Wan-Animate sampler's face CFG input. 1.0 = CFG disabled (default, fastest). 2.0-4.0 = stronger expression adherence. >5.0 may over-saturate."}),
+                "face_cfg_scale": ("FLOAT", {"default": 1.0, "min": 1.0, "max": 10.0, "step": 0.1, "tooltip": "Wan-Animate paper Sec. 4.3 names CFG on the face-conditioning branch as one lever for finer expression control, BUT Kijai's ComfyUI-WanVideoWrapper has no separate face-CFG input to wire this into — wiring it nowhere is a dead passthrough. The wrapper instead exposes a STRONGER, more direct lever for exactly this purpose (spec 2.2: 'a raw face-adapter block-scale... changes contribution before guidance math rather than after'): WanVideoAnimateEmbeds.face_strength (default 1.0, try 1.5-2.5 for stronger expression adherence). Use that widget on your WanVideoAnimateEmbeds node instead. This FLOAT output is kept for any sampler that DOES expose a genuine face-CFG input and for forward-compat; 1.0 = no-op."}),
                 # ---- Gaze engine selector + Kalman tuning (appended at end for back-compat with saved workflows) ----
                 "gaze_engine": (["l2cs_gaze360", "l2cs_mpiigaze", "ethxgaze", "pose_normalized_resnet50", "iris_geometric", "blendshape_head_corrected", "blendshape_only"], {"default": "l2cs_gaze360", "tooltip": "Per-eye gaze yaw/pitch engine. DEFAULT is now l2cs_gaze360 (GPU/CUDA, auto-downloads ~100MB once) so gaze runs on the GPU; blendshape_* are the CPU-only fallbacks.\n\n* iris_geometric (NEW, deterministic): MEASURES the MediaPipe iris centre inside the eye aperture (corner-to-corner, lid-to-lid) instead of estimating gaze with a NN — no per-person appearance bias, per-eye output, blink-gated, composed with the solvePnP head pose + Kalman like blendshape_head_corrected. Best fidelity for animation retargeting (the character's eyeballs copy the performer's iris positions). Pure CPU math, no downloads.\n* blendshape_head_corrected (DEFAULT, recommended): MediaPipe ARKit blend shapes + solvePnP head pose + Kalman temporal smoother. Eye-in-head rotation is composed with the head rotation so the rendered arrow tracks rotated heads. Pure numpy + cv2, no downloads.\n* blendshape_only: legacy May-2026 shipped behavior; eye-in-head only, no head composition.\n* l2cs_gaze360: L2CS-Net (MIT) ResNet50 trained on Gaze360. ~10.4\u00b0 MAE but robust to extreme poses (recommended for Wan-Animate character scenes). One-time ~100MB weight download to ComfyUI/models/gaze/.\n* l2cs_mpiigaze: L2CS-Net MPIIGaze variant. ~3.9\u00b0 MAE but calibrated only for near-portrait subjects.\n* pose_normalized_resnet50: Highest-accuracy path. Pipeline = solvePnP head pose -> analytical pose-normalized 224x224 face warp (head roll removed, camera distance fixed at 600 mm) -> ResNet50+Linear(2048,2) gaze regressor -> de-rotate output back to camera frame. Major accuracy gain on tilted / off-axis heads. The normalization warp is a clean-room implementation of the 2018 ETRA paper's published equations and ships with this pack (Apache-2.0). The ResNet50 checkpoint is NOT bundled \u2014 place a community-released gaze-trained ResNet50 weight file at <ComfyUI>/models/gaze/pose_normalized_resnet50.pth.tar to enable this engine. Note: those community checkpoints are typically released under CC BY-NC-SA 4.0 (non-commercial); you are responsible for confirming the licence of any weights you install matches your use case. If the file is missing the node automatically falls back to l2cs_gaze360.\n* ethxgaze: ETH-XGaze ResNet-50 (ECCV 2020, ~2.5\u00b0 in-the-wild MAE). Post-processes iris_data using pose-normalised 224x224 face crops + the official gaze_network. Requires (a) the third_party/ETH-XGaze/ repo cloned for face_model.txt + model.py and (b) checkpoint `epoch_24_ckpt.pth.tar` placed in `ComfyUI/models/ethxgaze/`. On any missing prerequisite the engine silently keeps the previous engine's output."}),
                 "gaze_kalman_meas_std_deg": ("FLOAT", {"default": 3.0, "min": 0.1, "max": 20.0, "step": 0.1, "tooltip": "Kalman measurement noise (degrees). Higher = trust the model less and lean on the velocity model more — smoother. Used by blendshape_head_corrected and l2cs_* engines."}),
@@ -1455,6 +1476,8 @@ class PoseAndFaceDetectionV2:
                 "gaze_calibration_frame": ("INT", {"default": -1, "min": -1, "max": 999999, "tooltip": "W7-G2 per-shot gaze calibration (iris_geometric engine only). Set this to a frame index where the subject looks STRAIGHT AT THE CAMERA; the measured eye-in-head angles on that frame become the zero reference for the whole shot, removing per-person eye-shape bias (the last few degrees of error no model can fix). -1 = off."}),
                 # C0.1 — per-frame iris repaint at gaze-corrected position.
                 "apply_gaze_to_face_image": (["off", "warp", "overlay", "replace"], {"default": "off", "tooltip": "C0.1: After gaze is computed, optionally deliver the gaze correction into each 512x512 face crop so the face-encoder input visually matches the gaze the sampler will follow. 'off' = leave face_images untouched (default). 'warp' (Wan-Animate spec 1.5, RECOMMENDED over overlay/replace): moves the REAL iris pixels to the gaze-corrected position via a Delaunay piecewise-affine warp (same engine WanFaceController3DV2 uses) instead of painting a synthetic disk — the face encoder's training augmentations were scale/color-jitter/noise, never a hard-edged synthetic object, so a real-pixel warp stays in-distribution. Displacement is clamped to the eye aperture and gated by the same blur check as the crop pipeline. 'overlay'/'replace' (legacy): stamp a synthetic iris disk — 'overlay' draws it WITHOUT erasing the original iris; 'replace' paints eye-white first. Shift magnitude scales with the per-eye iris radius and the engine's magnitude_norm. Failures are non-fatal: a warning is logged and face_images is preserved."}),
+                "au_amplify": ("FLOAT", {"default": 1.0, "min": 1.0, "max": 1.5, "step": 0.01, "tooltip": "Wan-Animate spec 2.3: the face encoder compresses to a small fixed-capacity motion-basis vector, so a genuinely subtle real microexpression can sit near the compression noise floor. This pushes each frame's detected face landmarks a bit FURTHER along the direction they already moved from the neutral reference frame (au_amplify_neutral_frame) — amplifying REAL, DETECTED motion so more of it survives compression; it never synthesizes anything that wasn't already measured. 1.0 = off (default). 1.15-1.3 is the range the paper's own architecture analysis suggests; values are capped at 1.5 since the correction is only a 2D (eye-line roll+scale) head-pose approximation, not a full 3D one — the discrepancy grows with head yaw/pitch, so keep this modest for non-frontal shots. Delivered via the same Delaunay real-pixel warp as 'warp' gaze mode; gated by the same blur/quality check; on any per-frame failure that frame is left unamplified."}),
+                "au_amplify_neutral_frame": ("INT", {"default": 0, "min": 0, "max": 999999, "tooltip": "Frame index to use as the NEUTRAL reference for au_amplify — pick a frame where the subject's expression is relaxed/neutral (Wan-Animate spec 2.4: an already-tense or asymmetric reference eats into the same motion-basis budget the target microexpression needs). Ignored when au_amplify=1.0."}),
             },
             "optional": {
                 "bbox_override": ("BBOX", {"tooltip": "Optional external BBOX for the frame-0 anchor. Highest priority; overrides frame0_cx/cy/size widgets."}),
@@ -1534,6 +1557,8 @@ class PoseAndFaceDetectionV2:
         eye_y_fraction=0.30,
         face_cfg_scale=1.0,
         apply_gaze_to_face_image="off",
+        au_amplify=1.0,
+        au_amplify_neutral_frame=0,
         bbox_override=None,
         landmark_overrides_json="{}",
         retarget_image=None,
@@ -1589,6 +1614,8 @@ class PoseAndFaceDetectionV2:
                 eye_y_fraction,
                 face_cfg_scale,
                 apply_gaze_to_face_image,
+                au_amplify,
+                au_amplify_neutral_frame,
                 bbox_override,
                 landmark_overrides_json,
                 retarget_image,
@@ -1641,6 +1668,8 @@ class PoseAndFaceDetectionV2:
         eye_y_fraction=0.30,
         face_cfg_scale=1.0,
         apply_gaze_to_face_image="off",
+        au_amplify=1.0,
+        au_amplify_neutral_frame=0,
         bbox_override=None,
         landmark_overrides_json="{}",
         retarget_image=None,
@@ -3249,6 +3278,64 @@ class PoseAndFaceDetectionV2:
                     _gaze_paint_mode, _exc,
                 )
 
+        # C2.3: Wan-Animate spec 2.3 — pre-encode AU amplification. Pushes
+        # each frame's face a bit further along the direction it already
+        # moved from a neutral reference (au_amplify_neutral_frame), so more
+        # of a genuinely subtle real microexpression survives the face
+        # encoder's fixed-capacity motion-basis compression. Amplifies only
+        # DETECTED motion (never synthesizes); runs AFTER any gaze warp above
+        # so the two compose. Uses MediaPipe FaceMesh directly on each
+        # 512x512 crop (self-contained — independent of which gaze_engine is
+        # selected) and a 2D eye-line rigid alignment (translation+rotation+
+        # uniform-scale from the two outer eye corners) to separate head
+        # motion from expression motion before amplifying the residual.
+        if float(au_amplify) > 1.001 and face_images_np.size > 0:
+            try:
+                from .nodes_extras._face_warp import warp_face, warp_available
+                if not warp_available():
+                    raise RuntimeError("cv2 unavailable for _face_warp")
+                _is_float = np.issubdtype(face_images_np.dtype, np.floating)
+                _BLUR_GATE = 50.0
+                _neutral_idx = int(np.clip(au_amplify_neutral_frame, 0, face_images_np.shape[0] - 1))
+                _neutral_crop_u8 = (
+                    face_images_np[_neutral_idx] if not _is_float
+                    else np.clip(face_images_np[_neutral_idx] * 255.0, 0, 255).astype(np.uint8)
+                )
+                _neutral_mp = _run_mediapipe_on_face_crop(_neutral_crop_u8, (0, 0), (512, 512), 512, 512)
+                if _neutral_mp is None:
+                    raise RuntimeError("MediaPipe found no face on the neutral reference frame")
+                _neutral_pts = _neutral_mp['kps68_norm'][:, :2] * 512.0
+                _neutral_eye_l = np.asarray(_neutral_mp['right_eye_outer_px'], dtype=np.float64)
+                _neutral_eye_r = np.asarray(_neutral_mp['left_eye_outer_px'], dtype=np.float64)
+                _n_amp = face_images_np.shape[0]
+                for _idx in range(_n_amp):
+                    _crop = face_images_np[_idx]
+                    if compute_frame_blur_score(_crop) < _BLUR_GATE:
+                        continue  # spec 2.3.6-style gate: skip amplifying a low-quality frame
+                    _crop_u8 = _crop if not _is_float else np.clip(_crop * 255.0, 0, 255).astype(np.uint8)
+                    _cur_mp = _run_mediapipe_on_face_crop(_crop_u8, (0, 0), (512, 512), 512, 512)
+                    if _cur_mp is None:
+                        continue
+                    _cur_pts = _cur_mp['kps68_norm'][:, :2] * 512.0
+                    _cur_eye_l = np.asarray(_cur_mp['right_eye_outer_px'], dtype=np.float64)
+                    _cur_eye_r = np.asarray(_cur_mp['left_eye_outer_px'], dtype=np.float64)
+                    _amp_pts = amplify_landmarks_from_neutral(
+                        _cur_pts, _neutral_pts, _cur_eye_l, _cur_eye_r,
+                        _neutral_eye_l, _neutral_eye_r, float(au_amplify),
+                    )
+                    if np.allclose(_amp_pts, _cur_pts, atol=0.25):
+                        continue  # negligible amplification — skip the warp
+                    _crop_f = _crop.astype(np.float32) / 255.0 if not _is_float else _crop.astype(np.float32)
+                    _warped = warp_face(_crop_f, _cur_pts.astype(np.float32), _amp_pts.astype(np.float32))
+                    face_images_np[_idx] = (
+                        _warped if _is_float else np.clip(_warped * 255.0, 0, 255).astype(_crop.dtype)
+                    )
+                face_images_tensor = torch.from_numpy(face_images_np)
+            except Exception as _exc:                                    # noqa: BLE001
+                logging.getLogger(__name__).warning(
+                    "au_amplify failed (%s); leaving face_images unamplified.", _exc,
+                )
+
         # --- Debug visualisation ---
         debug_frames = []
         for idx in _IC.track(
@@ -3490,7 +3577,7 @@ class DrawViTPoseV2:
                     "tooltip": "Color of the drawn pupil; magenta gives strongest sampler signal."}),
                 # ---- C0.5: face passthrough (Wan 2.2 Animate face encoder convenience) ----
                 "face_images": ("IMAGE", {"tooltip": "OPTIONAL face crop IMAGE batch (typically the face_images_512 output of PoseAndFaceDetectionV2). When wired, the node validates frame-count parity with the pose batch, optionally force-resizes to 512x512, and forwards it on the 'face_video' output so a single DrawViTPoseV2 can feed the Wan-Animate sampler's pose+face inputs in one place."}),
-                "face_cfg_scale": ("FLOAT", {"default": 1.0, "min": 1.0, "max": 10.0, "step": 0.1, "tooltip": "Passthrough face CFG scale (Wan-Animate paper Sec. 4.3). Wire the FLOAT output of PoseAndFaceDetectionV2.face_cfg_scale here for tidy graph routing."}),
+                "face_cfg_scale": ("FLOAT", {"default": 1.0, "min": 1.0, "max": 10.0, "step": 0.1, "tooltip": "Passthrough face CFG scale (Wan-Animate paper Sec. 4.3) for tidy graph routing from PoseAndFaceDetectionV2.face_cfg_scale. NOTE: Kijai's ComfyUI-WanVideoWrapper has no face-CFG input to wire this into today — for real control over expression adherence use WanVideoAnimateEmbeds.face_strength (spec 2.2's stronger, more direct block-scale lever) instead."}),
                 "enforce_512_face": ("BOOLEAN", {"default": True, "tooltip": "If True and 'face_images' is provided at a non-512 size, force-resize each frame to 512x512 (bilinear) before forwarding. Default True so the encoder always sees the trained input shape."}),
             },
         }

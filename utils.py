@@ -496,3 +496,72 @@ def compute_eye_region_brightness(frame_rgb, top_frac=0.30, bottom_frac=0.55):
         luma = strip
     return float(np.mean(luma))
 
+
+def _eye_line_similarity(src_l, src_r, dst_l, dst_r):
+    """2D similarity transform (uniform scale + rotation + translation)
+    mapping the SRC eye-corner pair onto the DST eye-corner pair.
+
+    Returns a callable ``f(points) -> transformed_points``. Uses ONLY the
+    two outer eye corners as the rigid anchor — deliberately NOT the chin or
+    mouth corners (which move with expression and would partially cancel out
+    the very signal ``amplify_landmarks_from_neutral`` below wants to keep).
+    This corrects in-plane head roll and apparent scale (distance changes);
+    it does NOT undo out-of-plane yaw/pitch — an honest partial correction,
+    not a full 3D head-pose normalization.
+    """
+    src_l = np.asarray(src_l, dtype=np.float64)
+    src_r = np.asarray(src_r, dtype=np.float64)
+    dst_l = np.asarray(dst_l, dtype=np.float64)
+    dst_r = np.asarray(dst_r, dtype=np.float64)
+    src_vec = src_r - src_l
+    dst_vec = dst_r - dst_l
+    src_len = np.linalg.norm(src_vec)
+    dst_len = np.linalg.norm(dst_vec)
+    if src_len < 1e-6 or dst_len < 1e-6:
+        return lambda pts: np.asarray(pts, dtype=np.float64).copy()
+    scale = dst_len / src_len
+    src_ang = math.atan2(src_vec[1], src_vec[0])
+    dst_ang = math.atan2(dst_vec[1], dst_vec[0])
+    theta = dst_ang - src_ang
+    c, s = math.cos(theta), math.sin(theta)
+    R = np.array([[c, -s], [s, c]], dtype=np.float64)
+    src_mid = (src_l + src_r) / 2.0
+    dst_mid = (dst_l + dst_r) / 2.0
+
+    def transform(points):
+        pts = np.asarray(points, dtype=np.float64)
+        return (pts - src_mid) @ (scale * R).T + dst_mid
+
+    return transform
+
+
+def amplify_landmarks_from_neutral(cur_pts, neutral_pts, cur_eye_l, cur_eye_r,
+                                    neutral_eye_l, neutral_eye_r, amplify=1.0):
+    """Wan-Animate spec 2.3: push each CURRENT landmark a bit further along
+    the direction it ALREADY moved from the neutral reference — amplifying
+    real, detected motion so more of it survives the face encoder's
+    fixed-capacity motion-basis compression. Never synthesizes new motion.
+
+    Args:
+        cur_pts, neutral_pts: (N,2) landmark arrays in the SAME crop-local
+            pixel coordinate system (e.g. both from a 512x512 face crop).
+        cur_eye_l/r, neutral_eye_l/r: outer eye-corner anchors (see
+            ``_eye_line_similarity``) used to rigid-align neutral onto the
+            current frame's head pose before taking the displacement, so the
+            amplified delta is expression motion, not head motion.
+        amplify: >1.0 pushes further from neutral; 1.0 = no-op (returns
+            cur_pts unchanged).
+
+    Returns:
+        (N,2) amplified landmark array in the current frame's coordinates —
+        feed this as ``dst_lms`` to ``_face_warp.warp_face`` with ``cur_pts``
+        as ``src_lms`` to move the REAL pixels there.
+    """
+    cur_pts = np.asarray(cur_pts, dtype=np.float64)
+    if amplify <= 1.001:
+        return cur_pts.copy()
+    align = _eye_line_similarity(neutral_eye_l, neutral_eye_r, cur_eye_l, cur_eye_r)
+    neutral_aligned = align(neutral_pts)
+    displacement = cur_pts - neutral_aligned
+    return cur_pts + displacement * (float(amplify) - 1.0)
+
