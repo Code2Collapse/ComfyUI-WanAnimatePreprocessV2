@@ -26,6 +26,17 @@ from .quality_scorer_jitter import WanQualityScorerJitterV2
 from .pose_format_convert import WanPoseFormatConvertV2
 from .pose_detect_vitpose import WanPoseDetectViTPoseV2
 from .face_controller_3d import WanFaceController3DV2
+# WanExpressionCoefficientsV2 is NOT superseded by the WanFaceController3DV2
+# consolidation: that node's coeff_time_series_json logs the user's MANUALLY
+# APPLIED editor overrides (an authoring/audit trail), whereas this node
+# MEASURES real ARKit-52 blendshapes detected from footage via MediaPipe
+# (iris_data_json in, coeffs_json out) — usable on ANY video, including a
+# Wan-Animate generated output, which is exactly the "AU-extraction tooling"
+# a closed-loop fidelity critic (Wan-Animate spec Section 3.1) needs. It was
+# never wired into EXTRA_NODE_CLASS_MAPPINGS below, so it was unreachable —
+# see WanExpressionCriticV2 in expression_critic.py, which consumes its output.
+from .expression_coeffs import WanExpressionCoefficientsV2
+from .expression_critic import WanExpressionCriticV2
 
 # Phase 1.B — live preview route for the Face Director real-time editor.
 # Registers POST /c2c/fc3d_preview against ComfyUI's aiohttp server.
@@ -78,6 +89,8 @@ EXTRA_NODE_CLASS_MAPPINGS = {
     "WanPoseFormatConvertV2":   WanPoseFormatConvertV2,
     "WanPoseDetectViTPoseV2":   WanPoseDetectViTPoseV2,
     "WanFaceController3DV2":    WanFaceController3DV2,
+    "WanExpressionCoefficientsV2": WanExpressionCoefficientsV2,
+    "WanExpressionCriticV2":       WanExpressionCriticV2,
 }
 if _ETHXGAZE_OK:
     EXTRA_NODE_CLASS_MAPPINGS["WanGazeETHXGazeV2"] = WanGazeETHXGazeV2
@@ -91,6 +104,8 @@ EXTRA_NODE_DISPLAY_NAME_MAPPINGS = {
     "WanPoseFormatConvertV2":   "Wan Pose Format Convert — OP18 → BODY-25 / COCO-17 / MP-33 (V2)",
     "WanPoseDetectViTPoseV2":   "Wan Pose Detect — YOLO + ViTPose (V2)",
     "WanFaceController3DV2":    "Wan Face Controller 3D",
+    "WanExpressionCoefficientsV2": "Wan Expression Coefficients — ARKit-52 Export (V2)",
+    "WanExpressionCriticV2":       "Wan Expression Critic — Source vs Generated AU Error (V2)",
 }
 if _ETHXGAZE_OK:
     EXTRA_NODE_DISPLAY_NAME_MAPPINGS["WanGazeETHXGazeV2"] = (
