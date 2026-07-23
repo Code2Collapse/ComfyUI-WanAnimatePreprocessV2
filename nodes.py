@@ -1478,6 +1478,7 @@ class PoseAndFaceDetectionV2:
                 "apply_gaze_to_face_image": (["off", "warp", "overlay", "replace"], {"default": "off", "tooltip": "C0.1: After gaze is computed, optionally deliver the gaze correction into each 512x512 face crop so the face-encoder input visually matches the gaze the sampler will follow. 'off' = leave face_images untouched (default). 'warp' (Wan-Animate spec 1.5, RECOMMENDED over overlay/replace): moves the REAL iris pixels to the gaze-corrected position via a Delaunay piecewise-affine warp (same engine WanFaceController3DV2 uses) instead of painting a synthetic disk — the face encoder's training augmentations were scale/color-jitter/noise, never a hard-edged synthetic object, so a real-pixel warp stays in-distribution. Displacement is clamped to the eye aperture and gated by the same blur check as the crop pipeline. 'overlay'/'replace' (legacy): stamp a synthetic iris disk — 'overlay' draws it WITHOUT erasing the original iris; 'replace' paints eye-white first. Shift magnitude scales with the per-eye iris radius and the engine's magnitude_norm. Failures are non-fatal: a warning is logged and face_images is preserved."}),
                 "au_amplify": ("FLOAT", {"default": 1.0, "min": 1.0, "max": 1.5, "step": 0.01, "tooltip": "Wan-Animate spec 2.3: the face encoder compresses to a small fixed-capacity motion-basis vector, so a genuinely subtle real microexpression can sit near the compression noise floor. This pushes each frame's detected face landmarks a bit FURTHER along the direction they already moved from the neutral reference frame (au_amplify_neutral_frame) — amplifying REAL, DETECTED motion so more of it survives compression; it never synthesizes anything that wasn't already measured. 1.0 = off (default). 1.15-1.3 is the range the paper's own architecture analysis suggests; values are capped at 1.5 since the correction is only a 2D (eye-line roll+scale) head-pose approximation, not a full 3D one — the discrepancy grows with head yaw/pitch, so keep this modest for non-frontal shots. Delivered via the same Delaunay real-pixel warp as 'warp' gaze mode; gated by the same blur/quality check; on any per-frame failure that frame is left unamplified."}),
                 "au_amplify_neutral_frame": ("INT", {"default": 0, "min": 0, "max": 999999, "tooltip": "Frame index to use as the NEUTRAL reference for au_amplify — pick a frame where the subject's expression is relaxed/neutral (Wan-Animate spec 2.4: an already-tense or asymmetric reference eats into the same motion-basis budget the target microexpression needs). Ignored when au_amplify=1.0."}),
+                "export_expression_coeffs": ("BOOLEAN", {"default": False, "tooltip": "Wan-Animate spec 3.1 (closed-loop critic, foundation): export the 'expression_coeffs_json' output — per-frame ARKit-52 blendshapes measured from this run's iris_data. Off by default (no extra cost when unused). Run this node once on the source driving video and once on the Wan-Animate generated output, then wire the source run's expression_coeffs_json into DrawViTPoseV2.reference_expression_coeffs_json for a per-AU fidelity report."}),
             },
             "optional": {
                 "bbox_override": ("BBOX", {"tooltip": "Optional external BBOX for the frame-0 anchor. Highest priority; overrides frame0_cx/cy/size widgets."}),
@@ -1486,8 +1487,8 @@ class PoseAndFaceDetectionV2:
             },
         }
 
-    RETURN_TYPES = ("POSEDATA", "IMAGE", "STRING", "BBOX", "BBOX", "STRING", "IMAGE", "STRING", "STRING", "FLOAT", "FACE_RESTORE_INFO", "FLOAT", "IMAGE")
-    RETURN_NAMES = ("pose_data", "face_images", "key_frame_body_points", "bboxes", "face_bboxes", "iris_data", "debug_image", "right_pupil_xy", "left_pupil_xy", "lip_openness_ratio", "restore_info", "face_cfg_scale", "face_images_512")
+    RETURN_TYPES = ("POSEDATA", "IMAGE", "STRING", "BBOX", "BBOX", "STRING", "IMAGE", "STRING", "STRING", "FLOAT", "FACE_RESTORE_INFO", "FLOAT", "IMAGE", "STRING")
+    RETURN_NAMES = ("pose_data", "face_images", "key_frame_body_points", "bboxes", "face_bboxes", "iris_data", "debug_image", "right_pupil_xy", "left_pupil_xy", "lip_openness_ratio", "restore_info", "face_cfg_scale", "face_images_512", "expression_coeffs_json")
     OUTPUT_TOOLTIPS = (
         "Per-frame pose+face+iris dict bundle. Feed into Draw ViT Pose (V2).",
         "Cropped face IMAGE batch suitable for face-id encoders.",
@@ -1502,6 +1503,7 @@ class PoseAndFaceDetectionV2:
         "Per-frame {x1,y1,x2,y2,size,frame_shape} dict for paste-back nodes.",
         "CFG scale for the face conditioning input. Wire into the Wan-Animate sampler's face CFG. 1.0 = CFG off (paper default).",
         "Cropped face IMAGE batch force-resized to 512x512 (bilinear). Pre-shaped for the Wan 2.2 Animate face encoder; wire directly without an extra Resize node.",
+        "Wan-Animate spec 3.1: per-frame ARKit-52 blendshapes measured from this run's iris_data, as {fps,names,frames:[{frame,blendshapes}]}. Run this node on BOTH the source driving video and the Wan-Animate GENERATED output, then wire this output from the SOURCE run into DrawViTPoseV2.reference_expression_coeffs_json (with the GENERATED run's pose_data wired into DrawViTPoseV2.pose_data as usual) to get a per-AU fidelity report. Empty '{}' when export_expression_coeffs=False (default) or no MediaPipe blendshapes were captured this run.",
     )
     FUNCTION = "process"
     CATEGORY = "WanAnimatePreprocess_V2"
@@ -1559,6 +1561,7 @@ class PoseAndFaceDetectionV2:
         apply_gaze_to_face_image="off",
         au_amplify=1.0,
         au_amplify_neutral_frame=0,
+        export_expression_coeffs=False,
         bbox_override=None,
         landmark_overrides_json="{}",
         retarget_image=None,
@@ -1616,6 +1619,7 @@ class PoseAndFaceDetectionV2:
                 apply_gaze_to_face_image,
                 au_amplify,
                 au_amplify_neutral_frame,
+                export_expression_coeffs,
                 bbox_override,
                 landmark_overrides_json,
                 retarget_image,
@@ -1670,6 +1674,7 @@ class PoseAndFaceDetectionV2:
         apply_gaze_to_face_image="off",
         au_amplify=1.0,
         au_amplify_neutral_frame=0,
+        export_expression_coeffs=False,
         bbox_override=None,
         landmark_overrides_json="{}",
         retarget_image=None,
@@ -3512,6 +3517,35 @@ class PoseAndFaceDetectionV2:
             })],
         }
 
+        # Wan-Animate spec 3.1 (closed-loop critic, foundation): export the
+        # ARKit-52 blendshapes this run measured, per frame, in the same
+        # schema WanExpressionCoefficientsV2 used before it was folded in
+        # here. Off by default (export_expression_coeffs=False) — zero cost
+        # when unused. Never raises: a failure just leaves the JSON empty.
+        expression_coeffs_json = "{}"
+        if export_expression_coeffs:
+            try:
+                from .nodes_extras.expression_coeffs import _extract_blendshapes, ARKIT_52
+                per_frame_bs = [_extract_blendshapes(entry) for entry in iris_output]
+                names = []
+                for bs in per_frame_bs:
+                    if bs:
+                        names = [n for n in ARKIT_52 if n in bs] + [n for n in bs if n not in ARKIT_52]
+                        break
+                names = names or list(ARKIT_52)
+                expression_coeffs_json = json.dumps({
+                    "fps": float(gaze_fps),
+                    "names": names,
+                    "frames": [
+                        {"frame": i, "blendshapes": {n: float(bs.get(n, 0.0)) for n in names}}
+                        for i, bs in enumerate(per_frame_bs)
+                    ],
+                })
+            except Exception as _exc:                                    # noqa: BLE001
+                logging.getLogger(__name__).warning(
+                    "export_expression_coeffs failed (%s); expression_coeffs_json left empty.", _exc,
+                )
+
         return {
             "ui": _ui_payload,
             "result": (
@@ -3528,6 +3562,7 @@ class PoseAndFaceDetectionV2:
                 restore_info,
                 float(face_cfg_scale),
                 face_images_512_tensor,
+                expression_coeffs_json,
             ),
         }
 
@@ -3579,15 +3614,21 @@ class DrawViTPoseV2:
                 "face_images": ("IMAGE", {"tooltip": "OPTIONAL face crop IMAGE batch (typically the face_images_512 output of PoseAndFaceDetectionV2). When wired, the node validates frame-count parity with the pose batch, optionally force-resizes to 512x512, and forwards it on the 'face_video' output so a single DrawViTPoseV2 can feed the Wan-Animate sampler's pose+face inputs in one place."}),
                 "face_cfg_scale": ("FLOAT", {"default": 1.0, "min": 1.0, "max": 10.0, "step": 0.1, "tooltip": "Passthrough face CFG scale (Wan-Animate paper Sec. 4.3) for tidy graph routing from PoseAndFaceDetectionV2.face_cfg_scale. NOTE: Kijai's ComfyUI-WanVideoWrapper has no face-CFG input to wire this into today — for real control over expression adherence use WanVideoAnimateEmbeds.face_strength (spec 2.2's stronger, more direct block-scale lever) instead."}),
                 "enforce_512_face": ("BOOLEAN", {"default": True, "tooltip": "If True and 'face_images' is provided at a non-512 size, force-resize each frame to 512x512 (bilinear) before forwarding. Default True so the encoder always sees the trained input shape."}),
+                "reference_expression_coeffs_json": ("STRING", {"multiline": True, "default": "", "tooltip": "Wan-Animate spec 3.1 (closed-loop critic): wire in the 'expression_coeffs_json' output of a PoseAndFaceDetectionV2 run (export_expression_coeffs=True) on the SOURCE driving video. When non-empty, this node measures ARKit-52 blendshapes from ITS OWN pose_data.iris_data (i.e. the GENERATED Wan-Animate output side, since this node is downstream of the generation pass) and reports per-AU + per-segment error against the reference — a numeric fidelity signal instead of eyeballing frames. Leave empty to skip entirely (zero extra cost)."}),
+                "segment_length": ("INT", {"default": 77, "min": 1, "max": 100000, "tooltip": "Frames per segment for the critic's worst-segment breakdown — match WanVideoAnimateEmbeds.frame_window_size (default 77) so segments line up with Wan-Animate's own splice boundaries (spec 2.5/3.5). Only used when reference_expression_coeffs_json is wired."}),
+                "top_k_aus": ("INT", {"default": 10, "min": 1, "max": 52, "tooltip": "How many worst-tracked AUs the critic reports, worst-first. Only used when reference_expression_coeffs_json is wired."}),
             },
         }
 
-    RETURN_TYPES = ("IMAGE", "IMAGE", "FLOAT")
-    RETURN_NAMES = ("pose_images", "face_video", "face_cfg_scale")
+    RETURN_TYPES = ("IMAGE", "IMAGE", "FLOAT", "STRING", "STRING", "FLOAT")
+    RETURN_NAMES = ("pose_images", "face_video", "face_cfg_scale", "critic_report_json", "worst_aus_csv", "overall_mae")
     OUTPUT_TOOLTIPS = (
         "Rendered skeleton IMAGE batch. Feed into your Wan 2.2 Animate sampler.",
         "Passthrough face IMAGE batch (512x512 if enforce_512_face). Empty single-frame zero tensor if 'face_images' was not wired.",
         "Passthrough face_cfg_scale (Wan-Animate paper Sec. 4.3). 1.0 = CFG off.",
+        "Wan-Animate spec 3.1 closed-loop critic report (JSON): per-AU mean-absolute-error, per-frame error curve, per-segment breakdown worst-first. '{}' when reference_expression_coeffs_json was not wired.",
+        "CSV 'name,mae' for the top_k_aus worst-tracked AUs, worst first. Empty string when the critic did not run.",
+        "Mean of all per-AU MAE values (0.0 = perfect match to the reference). 0.0 when the critic did not run.",
     )
     FUNCTION = "process"
     CATEGORY = "WanAnimatePreprocess_V2"
@@ -3672,7 +3713,8 @@ class DrawViTPoseV2:
                 draw_iris=True, draw_gaze=True,
                 iris_radius=4, gaze_arrow_len=30,
                 iris_min_confidence=0.05, iris_color="white",
-                face_images=None, face_cfg_scale=1.0, enforce_512_face=True):
+                face_images=None, face_cfg_scale=1.0, enforce_512_face=True,
+                reference_expression_coeffs_json="", segment_length=77, top_k_aus=10):
         with torch.inference_mode():
             return self._process_impl(
                 pose_data, width, height, body_stick_width, hand_stick_width,
@@ -3681,6 +3723,7 @@ class DrawViTPoseV2:
                 iris_radius, gaze_arrow_len,
                 iris_min_confidence, iris_color,
                 face_images, face_cfg_scale, enforce_512_face,
+                reference_expression_coeffs_json, segment_length, top_k_aus,
             )
 
     def _process_impl(self, pose_data, width, height, body_stick_width, hand_stick_width,
@@ -3688,7 +3731,8 @@ class DrawViTPoseV2:
                 draw_iris=True, draw_gaze=True,
                 iris_radius=4, gaze_arrow_len=30,
                 iris_min_confidence=0.05, iris_color="white",
-                face_images=None, face_cfg_scale=1.0, enforce_512_face=True):
+                face_images=None, face_cfg_scale=1.0, enforce_512_face=True,
+                reference_expression_coeffs_json="", segment_length=77, top_k_aus=10):
         pose_metas = pose_data["pose_metas"]
         draw_hand = hand_stick_width != 0
 
@@ -3795,7 +3839,100 @@ class DrawViTPoseV2:
         if face_video_out is None:
             face_video_out = torch.zeros((1, 512, 512, 3), dtype=torch.float32)
 
-        return (pose_images_tensor, face_video_out, float(face_cfg_scale))
+        # Wan-Animate spec 3.1 (closed-loop critic): folded in here (not a
+        # standalone node) because this class already receives pose_data's
+        # iris_data — this run's own measured blendshapes — as its natural
+        # input. Ported verbatim from the (now-removed) standalone critic
+        # prototype: per-AU MAE, per-frame error curve, segment breakdown
+        # matching WanVideoAnimateEmbeds.frame_window_size, worst-AU sort.
+        # Off unless reference_expression_coeffs_json is wired — zero cost
+        # otherwise. Never raises: a failure just leaves the report empty.
+        critic_report_json = "{}"
+        worst_aus_csv = ""
+        overall_mae = 0.0
+        ref_json = (reference_expression_coeffs_json or "").strip()
+        if ref_json and ref_json != "{}":
+            try:
+                from .nodes_extras.expression_coeffs import _extract_blendshapes
+
+                try:
+                    ref_data = json.loads(ref_json)
+                except json.JSONDecodeError:
+                    ref_data = {}
+                ref_names = ref_data.get("names") or [] if isinstance(ref_data, dict) else []
+                ref_frames = ref_data.get("frames") or [] if isinstance(ref_data, dict) else []
+
+                gen_bs_per_frame = [_extract_blendshapes(entry) for entry in iris_data]
+                gen_names = set()
+                for bs in gen_bs_per_frame:
+                    gen_names.update(bs.keys())
+
+                names = sorted(set(ref_names) | gen_names)
+                n = min(len(ref_frames), len(gen_bs_per_frame))
+                truncated = len(ref_frames) != len(gen_bs_per_frame)
+
+                per_au_abs_err = {name: [] for name in names}
+                per_frame_err = []
+                for i in range(n):
+                    ref_entry = ref_frames[i] if isinstance(ref_frames[i], dict) else {}
+                    ref_bs = ref_entry.get("blendshapes", {}) if isinstance(ref_entry.get("blendshapes"), dict) else {}
+                    gen_bs = gen_bs_per_frame[i]
+                    frame_errs = []
+                    for name in names:
+                        e = abs(float(ref_bs.get(name, 0.0)) - float(gen_bs.get(name, 0.0)))
+                        per_au_abs_err[name].append(e)
+                        frame_errs.append(e)
+                    per_frame_err.append(float(sum(frame_errs) / len(frame_errs)) if frame_errs else 0.0)
+
+                per_au_mae = {
+                    name: (float(sum(errs) / len(errs)) if errs else 0.0)
+                    for name, errs in per_au_abs_err.items()
+                }
+                overall_mae = float(sum(per_au_mae.values()) / len(per_au_mae)) if per_au_mae else 0.0
+                worst_aus = sorted(per_au_mae.items(), key=lambda kv: kv[1], reverse=True)[:max(1, int(top_k_aus))]
+
+                seg_len = max(1, int(segment_length))
+                segments = []
+                for s0 in range(0, n, seg_len):
+                    s1 = min(n, s0 + seg_len)
+                    seg_errs = per_frame_err[s0:s1]
+                    segments.append({
+                        "start_frame": s0,
+                        "end_frame": s1 - 1,
+                        "n_frames": s1 - s0,
+                        "mean_error": float(sum(seg_errs) / len(seg_errs)) if seg_errs else 0.0,
+                    })
+                segments_worst_first = sorted(segments, key=lambda s: s["mean_error"], reverse=True)
+
+                report = {
+                    "n_frames_compared": n,
+                    "frame_count_mismatch": truncated,
+                    "reference_n_frames": len(ref_frames),
+                    "generated_n_frames": len(gen_bs_per_frame),
+                    "overall_mae": overall_mae,
+                    "per_au_mae": per_au_mae,
+                    "worst_aus": [{"name": name, "mae": mae} for name, mae in worst_aus],
+                    "per_frame_error": per_frame_err,
+                    "segments": segments,
+                    "segments_worst_first": segments_worst_first,
+                }
+                if truncated:
+                    report["note"] = (
+                        f"reference has {len(ref_frames)} frames, this run has "
+                        f"{len(gen_bs_per_frame)} — compared the first {n} "
+                        f"(frame-index truncation, no re-alignment attempted)."
+                    )
+                critic_report_json = json.dumps(report)
+                worst_aus_csv = "\n".join(f"{name},{mae:.4f}" for name, mae in worst_aus)
+            except Exception as _exc:                                    # noqa: BLE001
+                logging.getLogger(__name__).warning(
+                    "reference_expression_coeffs_json critic failed (%s); critic outputs left empty.", _exc,
+                )
+
+        return (
+            pose_images_tensor, face_video_out, float(face_cfg_scale),
+            critic_report_json, worst_aus_csv, float(overall_mae),
+        )
 
 
 # ====================================================================
