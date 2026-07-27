@@ -113,6 +113,25 @@ def eye_in_head_from_iris(mp_result: Dict[str, Any], eye: str) -> Optional[Dict[
     yaw = -rh * MAX_EYE_YAW_RAD - _CALIB[eye]["yaw"]
     pitch = -rv * MAX_EYE_PITCH_RAD - _CALIB[eye]["pitch"]
 
+    # HYBRID VERTICAL (2026-07-24): the aperture-relative vertical measure
+    # systematically UNDER-reads true vertical eyeball rotation, because the
+    # lids travel WITH vertical gaze (upper lid lifts when looking up, drops
+    # when looking down) — the iris barely moves relative to the lid frame
+    # even during a large vertical saccade. Confirmed live on an eyes-up-
+    # under-brows portrait: measured rv stayed near 0 while the blendshape
+    # engine (appearance-trained eyeLookUp/Down, no such failure mode) read
+    # the up-rotation correctly; composing the under-read vertical with the
+    # head-down pose then produced a large spurious "down" world gaze.
+    # Horizontal has no such problem (the canthi do not move with gaze), so:
+    # keep the MEASURED yaw, take pitch from the blendshape coefficients
+    # whenever they are available, and keep the aperture-measured pitch only
+    # as the no-blendshape fallback (FaceMesh path).
+    gaze_bs = mp_result.get("gaze_blendshape")
+    if isinstance(gaze_bs, dict) and isinstance(gaze_bs.get(eye), dict):
+        bs_pitch = gaze_bs[eye].get("pitch_rad")
+        if bs_pitch is not None and math.isfinite(float(bs_pitch)):
+            pitch = float(bs_pitch) - _CALIB[eye]["pitch"]
+
     # Confidence: high when the aperture is wide open and the iris radius is
     # sane; degrade toward the blink gate.
     conf = float(max(0.0, min(1.0, 1.0 - blink)))

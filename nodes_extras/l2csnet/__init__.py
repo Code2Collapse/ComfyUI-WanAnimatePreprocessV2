@@ -64,21 +64,38 @@ def decode_gaze(head_a: torch.Tensor, head_b: torch.Tensor,
     """Decode the two raw L2CS head outputs to continuous (yaw, pitch) RADIANS.
 
     ``head_a`` / ``head_b`` are the model's forward() outputs in order, i.e.
-    ``(fc_yaw_gaze, fc_pitch_gaze)``.
+    ``(fc_yaw_gaze, fc_pitch_gaze)`` — head_a is ALWAYS the true yaw head,
+    head_b is ALWAYS the true pitch head (see model.py forward()).
 
-    IMPORTANT — reproduce upstream EXACTLY: l2cs Pipeline.predict_gaze unpacks
-    ``gaze_pitch, gaze_yaw = self.model(img)`` while forward() returns
-    ``(fc_yaw_gaze, fc_pitch_gaze)``. So upstream decodes the FIRST head as
-    *pitch* and the SECOND head as *yaw*. We replicate that swap so results
-    match the released checkpoint / the pip `l2cs` package bit-for-bit (the
-    pack's downstream sign conventions were calibrated against it). Expectation
-    over 90 bins, *4-180 -> degrees (4-deg bins, -180..176), then deg->rad.
+    BUG FIX (verified against github.com/Ahmednull/L2CS-Net upstream,
+    cloned to third_party/L2CS-Net for direct comparison): the previous
+    version of this function replicated upstream pipeline.py's confusingly
+    -named intermediate variables (``gaze_pitch, gaze_yaw = self.model(img)``
+    -- upstream names head_a's output "gaze_pitch" even though it is the
+    true-yaw head) but then ALSO swapped the final RETURN order to
+    ``(yaw_rad, pitch_rad) = (decode(head_b), decode(head_a))``. Upstream's
+    own predict_gaze() does NOT do that: despite the confusing internal
+    names, its literal `return pitch_predicted, yaw_predicted` returns
+    ``(decode(head_a), decode(head_b))`` -- the SAME order as the model's
+    own heads. Verified end-to-end against l2cs/vis.py's draw_gaze(), the
+    only place upstream's convention has an unambiguous, testable meaning
+    (screen-space arrow direction): draw_gaze receives (results.pitch,
+    results.yaw) = (decode(head_a), decode(head_b)) and computes
+    ``dx = -sin(pitchyaw[0])*cos(pitchyaw[1])``, i.e. it needs
+    pitchyaw[0]=true_yaw and pitchyaw[1]=true_pitch -- confirming
+    decode(head_a)=true_yaw, decode(head_b)=true_pitch, in that order.
+    The previous code's swapped return meant every caller received pitch
+    data labeled yaw and vice versa -- a 90-degree-confused gaze estimate
+    that reads as "confidently wrong", not just noisy. Decode each head
+    DIRECTLY (no relabeling detour -- it never changed the computation,
+    only obscured which value ended up in which return slot).
+    Expectation over 90 bins, *4-180 -> degrees (4-deg bins, -180..176),
+    then deg->rad.
     """
-    gaze_pitch, gaze_yaw = head_a, head_b
-    pitch_p = torch.softmax(gaze_pitch, dim=1)
-    yaw_p = torch.softmax(gaze_yaw, dim=1)
-    pitch_deg = torch.sum(pitch_p * idx_tensor, dim=1) * 4 - 180
+    yaw_p = torch.softmax(head_a, dim=1)
+    pitch_p = torch.softmax(head_b, dim=1)
     yaw_deg = torch.sum(yaw_p * idx_tensor, dim=1) * 4 - 180
+    pitch_deg = torch.sum(pitch_p * idx_tensor, dim=1) * 4 - 180
     yaw_rad = yaw_deg.cpu().detach().numpy() * np.pi / 180.0
     pitch_rad = pitch_deg.cpu().detach().numpy() * np.pi / 180.0
     return yaw_rad, pitch_rad

@@ -122,9 +122,9 @@ def estimate_head_pose(
     K = _intrinsics(W, H)
     dist = np.zeros((4, 1), dtype=np.float64)
     try:
-        ok, rvec, tvec = cv2.solvePnP(
-            _MODEL_3D, pts_px, K, dist, flags=cv2.SOLVEPNP_ITERATIVE,
-        )
+        # Same EPNP-init + refine as estimate_head_pose_from_pixels — see
+        # _solve_pnp_stable for why plain ITERATIVE was a bug here.
+        ok, rvec, tvec = _solve_pnp_stable(pts_px, K, dist)
     except Exception as exc:  # noqa: BLE001
         logger.debug("[gaze_3d] solvePnP failed: %s", exc)
         return None
@@ -154,9 +154,7 @@ def estimate_head_pose_from_pixels(
     K = _intrinsics(W, H)
     dist = np.zeros((4, 1), dtype=np.float64)
     try:
-        ok, rvec, tvec = cv2.solvePnP(
-            _MODEL_3D, pts_px, K, dist, flags=cv2.SOLVEPNP_ITERATIVE,
-        )
+        ok, rvec, tvec = _solve_pnp_stable(pts_px, K, dist)
     except Exception as exc:  # noqa: BLE001
         logger.debug("[gaze_3d] solvePnP failed: %s", exc)
         return None
@@ -164,6 +162,35 @@ def estimate_head_pose_from_pixels(
         return None
     R, _ = cv2.Rodrigues(rvec)
     return R.astype(np.float64), tvec.astype(np.float64)
+
+
+def _solve_pnp_stable(pts_px: np.ndarray, K: np.ndarray, dist: np.ndarray):
+    """EPNP init + ITERATIVE refine with extrinsic guess.
+
+    BUG FIX (2026-07-24): both head-pose helpers here called plain
+    ``SOLVEPNP_ITERATIVE`` with no initial guess. ITERATIVE's internal
+    DLT initialisation is ill-conditioned for a shallow 6-point face
+    model, so on near-frontal faces it can converge to a solution with
+    tens of degrees of spurious pitch — confirmed live on a clean
+    dead-on portrait where ``blendshape_only`` read near-neutral
+    (mag 0.27) but the head-pose-composed engine read mag 0.81 pointing
+    steeply up, i.e. R_head alone injected ~20° of pitch. The same
+    spurious-basin behaviour also explains identical inputs flipping
+    between near-zero and large gaze across server sessions. This
+    EPNP-then-refine pattern is copied from the official ETH-XGaze
+    ``estimateHeadPose`` (third_party/ETH-XGaze/demo.py), which we
+    verified today reproduces that repo's reference output exactly.
+    """
+    ok, rvec, tvec = cv2.solvePnP(
+        _MODEL_3D, pts_px, K, dist, flags=cv2.SOLVEPNP_EPNP,
+    )
+    if not ok:
+        return False, None, None
+    ok, rvec, tvec = cv2.solvePnP(
+        _MODEL_3D, pts_px, K, dist, rvec, tvec, True,
+        flags=cv2.SOLVEPNP_ITERATIVE,
+    )
+    return ok, rvec, tvec
 
 
 def screen_dx_dy_from_camera_yaw_pitch(

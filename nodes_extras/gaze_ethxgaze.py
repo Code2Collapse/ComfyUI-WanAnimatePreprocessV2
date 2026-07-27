@@ -25,8 +25,12 @@ for ``epoch_24_ckpt.pth.tar`` in the following locations, in order:
 2.  ``third_party/ETH-XGaze/ckpt/``.
 3.  Any path the user supplies via the ``checkpoint_path_override`` widget.
 
-Download: https://drive.google.com/file/d/1Jy6rgmUYK-_nGcvldcF4qIK46t6mNk0c
-(see the ETH-XGaze repo README for the latest link).
+Download: https://drive.google.com/file/d/1Ma6zJrECNTjo_mToZ5GKk7EF-0FS4nEC
+(verified working 2026-07-24; the previous ID this comment cited,
+1Jy6rgmUYK-_nGcvldcF4qIK46t6mNk0c, is dead/permission-denied and was
+silently causing every "ethxgaze" gaze_engine request to fall back to
+blendshape_head_corrected. Re-check the ETH-XGaze repo README if this
+one also rots — Google Drive links are not stable long-term.)
 
 Output
 ------
@@ -187,14 +191,39 @@ def _load_face_model_68() -> Optional[np.ndarray]:
 #   right-eye outer (36), right-eye inner (39), left-eye inner (42),
 #   left-eye outer (45), nose-left  (31), nose-right (35) in iBUG-68.
 _FACE_MODEL_SUBSET_IDX = [20, 23, 26, 29, 15, 19]
-_IBUG68_PNP_IDX        = [36, 39, 42, 45, 31, 35]
+# BUG FIX (2026-07-24): this module read raw dlib/iBUG-68 indices
+# (36,39,42,45,31,35) directly against `meta['keypoints_face']`, but that
+# array is NOT 0-indexed dlib — see the "CRITICAL INDEXING NOTE" at
+# nodes.py:674 (verified there in May 2026 with live diagnostics, and
+# already correctly applied to _RIGHT_EYE_IDX/_LEFT_EYE_IDX in this same
+# file): index 0 of keypoints_face is a body-anchor point, and the 68
+# dlib landmarks live at slots 1-68 (dlib N -> array[N+1]). Reading
+# without the +1 offset pulled each "eye corner" from one slot early —
+# in the densely-packed eye/brow region that lands on a DIFFERENT real
+# landmark, not empty space, so solvePnP silently fit a plausible-looking
+# but wrong head pose (confirmed live: the 6 points clustered off the
+# true eye corners, and the resulting normalized face crop came out
+# heavily rotated/mis-cropped instead of upright).
+_IBUG68_PNP_IDX        = [37, 40, 43, 46, 32, 36]
 
 
 # ── ETH-XGaze inference helpers ──────────────────────────────────────
 def _build_camera_matrix(W: int, H: int) -> np.ndarray:
     """Fallback intrinsics when no per-clip calibration is available.
-    Mirrors the in-pipeline assumption used by head_pose_6dof.py."""
-    focal = max(W, H) * 1.2
+    Mirrors the in-pipeline assumption used by head_pose_6dof.py.
+
+    BUG FIX (2026-07-24): this used to multiply by an extra 1.2 that
+    head_pose_6dof.py's own ``focal = max(W, H)`` does NOT have, despite
+    the docstring above claiming parity. That 20% focal error biased
+    every solvePnP head-pose estimate this module produces, which fed
+    straight into both the face-normalization warp (visibly wrong crops
+    — over-zoomed, badly framed) and the camera-frame denormalization
+    (large, systematically-wrong gaze angles on dead-on-camera test
+    photos where the true answer is ~0°). Confirmed against gaze_3d.py's
+    independent ``focal = image_w`` convention too — both agree with
+    head_pose_6dof.py whenever W >= H (true for both regression photos),
+    so this file was the outlier, not the other two."""
+    focal = max(W, H)
     return np.array([
         [focal, 0.0,   W / 2.0],
         [0.0,   focal, H / 2.0],
@@ -360,13 +389,23 @@ def _patch_gaze_entry(entry: dict, eye_name: str,
     key = f"{eye_name}_gaze"
     g = entry.get(key) if isinstance(entry.get(key), dict) else {}
     # Direction in screen space — image-Y is down so flip pitch.
-    dx = math.sin(yaw_rad) * math.cos(pitch_rad)
+    # BUG FIX (2026-07-24): dx was missing the leading negative sign that
+    # every other engine in this file uses for the identical formula (see
+    # nodes.py's L2CS branch `_dx = -math.sin(_yaw) * math.cos(_pitch)`
+    # and its blendshape-only branch, both negated). Left un-negated,
+    # ETH-XGaze's arrow pointed the opposite horizontal direction from
+    # every other gaze_engine option for the same physical yaw.
+    dx = -math.sin(yaw_rad) * math.cos(pitch_rad)
     dy = -math.sin(pitch_rad)
     mag = float(math.hypot(dx, dy))
     if mag > 1e-6:
         dx /= mag; dy /= mag
-    mag_norm = min(1.0, abs(yaw_rad) / math.radians(30.0)
-                       + abs(pitch_rad) / math.radians(25.0))
+    # Same magnitude convention as nodes.py's engine dispatch (hypot of the
+    # per-axis ratios) — this was additive (|yaw|/30 + |pitch|/25) which
+    # inflated magnitude up to ~40% vs every other engine for the same
+    # physical gaze, making the ethxgaze arrow read "stronger" than it is.
+    mag_norm = min(1.0, math.hypot(yaw_rad / math.radians(30.0),
+                                   pitch_rad / math.radians(25.0)))
     g["yaw_rad"]        = float(yaw_rad)
     g["pitch_rad"]      = float(pitch_rad)
     g["dx"]             = round(float(dx), 4)
@@ -516,6 +555,18 @@ class WanGazeETHXGazeV2:
             lms6 = kps_arr[_IBUG68_PNP_IDX, :2].copy()
             lms6[:, 0] *= W
             lms6[:, 1] *= H
+            if os.environ.get("C2C_ETHXGAZE_DEBUG"):
+                import cv2 as _cv2dbg2
+                _dbg_dir2 = Path(os.environ.get("TEMP", ".")) / "c2c_ethxgaze_debug"
+                _dbg_dir2.mkdir(parents=True, exist_ok=True)
+                _annot = img_bgr.copy()
+                _labels = ["R_out(36)", "R_in(39)", "L_in(42)", "L_out(45)", "nose_L(31)", "nose_R(35)"]
+                _colors = [(0,0,255),(0,128,255),(0,255,255),(0,255,0),(255,0,0),(255,0,255)]
+                for _pi, (_px, _py) in enumerate(lms6):
+                    _cv2dbg2.circle(_annot, (int(_px), int(_py)), 4, _colors[_pi], -1)
+                    _cv2dbg2.putText(_annot, _labels[_pi], (int(_px)+5, int(_py)-5),
+                                     _cv2dbg2.FONT_HERSHEY_SIMPLEX, 0.4, _colors[_pi], 1, _cv2dbg2.LINE_AA)
+                _cv2dbg2.imwrite(str(_dbg_dir2 / f"lms6_frame{f_idx:03d}.png"), _annot)
             pose = _estimate_head_pose(lms6, face_model_6, cam, dist)
             if pose is None:
                 n_pnp_fail += 1; continue
@@ -537,11 +588,27 @@ class WanGazeETHXGazeV2:
             for k, (pitch_yaw) in enumerate(y):
                 pitch_rad = float(pitch_yaw[0])
                 yaw_rad   = float(pitch_yaw[1])
+                if os.environ.get("C2C_ETHXGAZE_DEBUG"):
+                    import cv2 as _cv2dbg
+                    _dbg_dir = Path(os.environ.get("TEMP", ".")) / "c2c_ethxgaze_debug"
+                    _dbg_dir.mkdir(parents=True, exist_ok=True)
+                    _cv2dbg.imwrite(str(_dbg_dir / f"crop_{i0+k:03d}.png"), batch[k])
+                    log.warning(
+                        "ETHXGAZE_DEBUG frame=%d raw_pitch_deg=%.2f raw_yaw_deg=%.2f "
+                        "R_det=%.4f",
+                        crop_fi[i0 + k], math.degrees(pitch_rad), math.degrees(yaw_rad),
+                        float(np.linalg.det(crop_R[i0 + k])) if (i0 + k) < len(crop_R) else -999,
+                    )
                 # Denormalize: the network predicts gaze in the head-normalized
                 # frame; rotate it back to the camera frame via the per-crop R.
                 Rmat = crop_R[i0 + k] if (i0 + k) < len(crop_R) else None
                 if Rmat is not None:
                     pitch_rad, yaw_rad = _denormalize_pitchyaw(pitch_rad, yaw_rad, Rmat)
+                if os.environ.get("C2C_ETHXGAZE_DEBUG"):
+                    log.warning(
+                        "ETHXGAZE_DEBUG frame=%d denorm_pitch_deg=%.2f denorm_yaw_deg=%.2f",
+                        crop_fi[i0 + k], math.degrees(pitch_rad), math.degrees(yaw_rad),
+                    )
                 fi = crop_fi[i0 + k]
                 entry = new_iris[fi]
                 # Blend with existing gaze if the user wants partial replacement.

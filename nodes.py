@@ -3012,6 +3012,14 @@ class PoseAndFaceDetectionV2:
             # keypoints went through.
             "source_size": (int(H), int(W)),
             "target_size": (int(height), int(width)),
+            # Expression-edit delivery (2026-07-24): the per-frame face-crop
+            # boxes (x1,x2,y1,y2 in source-frame pixels) that produced
+            # face_images. DrawViTPoseV2 needs them to map FC3D's edited
+            # landmarks (full-frame normalised) into face-crop space so the
+            # edits can be WARPED into the actual face pixels the Wan-Animate
+            # face encoder sees — without this, landmark edits only move the
+            # skeleton dots and the model keeps following the unedited crop.
+            "face_crop_boxes": [list(map(int, bb)) for bb in face_bboxes],
         }
 
         # C0.4: ETH-XGaze post-process override.
@@ -3477,7 +3485,16 @@ class PoseAndFaceDetectionV2:
             import base64  # noqa: PLC0415
             import cv2 as _cv2  # noqa: N813
             _pv_max = min(60, int(B))
-            _pv_long = 320  # longest side px
+            # Bug-fix: this feeds pose_gaze_viewer.js's ONLY visual check for
+            # micro-expression fidelity (skeleton/iris/gaze drawn over the
+            # ACTUAL frame). 320px/quality-72 was fine for "does the skeleton
+            # look roughly right" but far too soft to judge subtle expression
+            # detail — the browser then upscales this already-blurry, heavily
+            # compressed thumbnail to fill the (much larger) canvas panel,
+            # compounding the softness. 640px/quality-92 is near-lossless for
+            # photographic content and still cheap over a localhost websocket
+            # (this is a UI preview only — never feeds face_images/pose_data).
+            _pv_long = 640  # longest side px
             _idxs = ([0] if _pv_max <= 1
                      else [round(i * (B - 1) / (_pv_max - 1)) for i in range(_pv_max)])
             for _pi in sorted(set(_idxs)):
@@ -3488,7 +3505,7 @@ class PoseAndFaceDetectionV2:
                     _fr = _cv2.resize(_fr, (max(1, int(_ww * _sc)), max(1, int(_hh * _sc))),
                                       interpolation=_cv2.INTER_AREA)
                 _u8 = (np.clip(_fr, 0.0, 1.0) * 255.0).astype(np.uint8)[:, :, ::-1]  # RGB->BGR
-                _ok, _buf = _cv2.imencode(".jpg", _u8, [int(_cv2.IMWRITE_JPEG_QUALITY), 72])
+                _ok, _buf = _cv2.imencode(".jpg", _u8, [int(_cv2.IMWRITE_JPEG_QUALITY), 92])
                 if _ok:
                     _viewer_previews.append({
                         "frame": int(_pi),
@@ -3497,8 +3514,14 @@ class PoseAndFaceDetectionV2:
         except Exception:  # noqa: BLE001
             _viewer_previews = []
         _GAZE_ACCURACY = {
-            "ethxgaze": "~2.5° MAE", "pose_normalized_resnet50": "~3-4° MAE",
-            "l2cs_mpiigaze": "~3.9° MAE", "l2cs_gaze360": "~10.4° MAE",
+            # Honest labels: the CNN engines' MAE figures are WITHIN-dataset
+            # lab benchmarks. Cross-domain (in-the-wild portraits/video) they
+            # carry systematic bias — verified 2026-07-24 by reproducing the
+            # official ETH-XGaze demo output exactly (faithful port), then
+            # observing ~15° downward pitch bias on two clean at-camera
+            # photos. That is the model's domain gap, not a pipeline bug.
+            "ethxgaze": "~2.5° lab / wild varies", "pose_normalized_resnet50": "~3-4° MAE",
+            "l2cs_mpiigaze": "~3.9° lab / wild varies", "l2cs_gaze360": "~10.4° MAE",
             "iris_geometric": "iris-measured (deterministic)",
             "blendshape_head_corrected": "blendshape + head (approx)",
             "blendshape_only": "eye-in-head (approx)",
@@ -3617,6 +3640,7 @@ class DrawViTPoseV2:
                 "reference_expression_coeffs_json": ("STRING", {"multiline": True, "default": "", "tooltip": "Wan-Animate spec 3.1 (closed-loop critic): wire in the 'expression_coeffs_json' output of a PoseAndFaceDetectionV2 run (export_expression_coeffs=True) on the SOURCE driving video. When non-empty, this node measures ARKit-52 blendshapes from ITS OWN pose_data.iris_data (i.e. the GENERATED Wan-Animate output side, since this node is downstream of the generation pass) and reports per-AU + per-segment error against the reference — a numeric fidelity signal instead of eyeballing frames. Leave empty to skip entirely (zero extra cost)."}),
                 "segment_length": ("INT", {"default": 77, "min": 1, "max": 100000, "tooltip": "Frames per segment for the critic's worst-segment breakdown — match WanVideoAnimateEmbeds.frame_window_size (default 77) so segments line up with Wan-Animate's own splice boundaries (spec 2.5/3.5). Only used when reference_expression_coeffs_json is wired."}),
                 "top_k_aus": ("INT", {"default": 10, "min": 1, "max": 52, "tooltip": "How many worst-tracked AUs the critic reports, worst-first. Only used when reference_expression_coeffs_json is wired."}),
+                "apply_pose_edits_to_face": (["warp", "off"], {"default": "warp", "tooltip": "Expression-edit DELIVERY (2026-07-24). When pose_data carries edited face landmarks (WanFaceController3DV2 expression dials / dragged landmarks) AND face_images is wired, 'warp' moves the ACTUAL face-crop pixels from the original landmark positions to the edited ones (same Delaunay piecewise-affine engine as FC3D's preview), so the Wan-Animate face encoder sees the edit. Without this, landmark edits only change the drawn skeleton — the photographic face crop stays neutral and the sampler follows the crop, i.e. your expression edits silently do nothing. No-op when landmarks are unedited (zero cost), so the default stays 'warp'."}),
             },
         }
 
@@ -3714,7 +3738,8 @@ class DrawViTPoseV2:
                 iris_radius=4, gaze_arrow_len=30,
                 iris_min_confidence=0.05, iris_color="white",
                 face_images=None, face_cfg_scale=1.0, enforce_512_face=True,
-                reference_expression_coeffs_json="", segment_length=77, top_k_aus=10):
+                reference_expression_coeffs_json="", segment_length=77, top_k_aus=10,
+                apply_pose_edits_to_face="warp"):
         with torch.inference_mode():
             return self._process_impl(
                 pose_data, width, height, body_stick_width, hand_stick_width,
@@ -3724,6 +3749,7 @@ class DrawViTPoseV2:
                 iris_min_confidence, iris_color,
                 face_images, face_cfg_scale, enforce_512_face,
                 reference_expression_coeffs_json, segment_length, top_k_aus,
+                apply_pose_edits_to_face=apply_pose_edits_to_face,
             )
 
     def _process_impl(self, pose_data, width, height, body_stick_width, hand_stick_width,
@@ -3732,7 +3758,8 @@ class DrawViTPoseV2:
                 iris_radius=4, gaze_arrow_len=30,
                 iris_min_confidence=0.05, iris_color="white",
                 face_images=None, face_cfg_scale=1.0, enforce_512_face=True,
-                reference_expression_coeffs_json="", segment_length=77, top_k_aus=10):
+                reference_expression_coeffs_json="", segment_length=77, top_k_aus=10,
+                apply_pose_edits_to_face="warp"):
         pose_metas = pose_data["pose_metas"]
         draw_hand = hand_stick_width != 0
 
@@ -3836,6 +3863,97 @@ class DrawViTPoseV2:
                     "DrawViTPoseV2: face passthrough failed (%s); forwarding original face_images.", e,
                 )
                 face_video_out = face_images
+
+        # ---- Expression-edit delivery (2026-07-24) ----------------------
+        # FC3D (WanFaceController3DV2) edits land in pose_data["pose_metas"]
+        # as moved face landmarks, while pose_metas_original keeps the
+        # detector's pristine set. Until now those edits only changed the
+        # DRAWN skeleton — the photographic face crops passed through
+        # untouched, and the Wan-Animate face encoder (which follows the
+        # crop, not the dots) never saw the user's expression edits. Warp
+        # each crop from original→edited landmark positions with the same
+        # Delaunay engine FC3D's own preview uses. All landmark rows are
+        # passed as control points — unmoved rows anchor themselves
+        # (src==dst), so no row-indexing convention is assumed. No-op when
+        # nothing was edited.
+        if (str(apply_pose_edits_to_face) == "warp"
+                and face_video_out is not None
+                and isinstance(pose_data, dict)):
+            try:
+                _metas_e = pose_data.get("pose_metas") or []
+                _metas_o = pose_data.get("pose_metas_original") or []
+                _crops = pose_data.get("face_crop_boxes") or []
+                _src_hw = pose_data.get("source_size") or None
+                # Retarget moves the edited metas into the TARGET canvas's
+                # coordinate space while the originals stay in source space —
+                # a wholesale coordinate difference that is NOT a user edit.
+                # Only deliver when not retargeting.
+                if (_metas_e and _metas_o and _crops and _src_hw
+                        and pose_data.get("retarget_image") is None):
+                    from .nodes_extras._face_warp import warp_face as _warp_face, warp_available as _warp_ok
+                    # The bundle's pose_metas are AAPoseMeta OBJECTS while
+                    # pose_metas_original are plain dicts — use FC3D's own
+                    # dual-shape accessor so the delta we see is exactly the
+                    # edit FC3D wrote (returns full-frame-normalised (N,2)).
+                    from .nodes_extras.expression_3d_coeffs import _read_face_normalised as _read_fn
+                    if _warp_ok():
+                        _Hs, _Ws = float(_src_hw[0]), float(_src_hw[1])
+                        _fv = (face_video_out.detach().cpu().numpy()
+                               if hasattr(face_video_out, "detach")
+                               else np.asarray(face_video_out)).copy()
+                        _n = min(len(_metas_e), len(_metas_o), len(_crops), int(_fv.shape[0]))
+                        _n_warped = 0
+                        for _i in range(_n):
+                            _ke = _read_fn(_metas_e[_i])
+                            _ko = _read_fn(_metas_o[_i])
+                            if _ke is None or _ko is None:
+                                continue
+                            if _ke.shape != _ko.shape or _ke.shape[0] < 3:
+                                continue
+                            # Normalised full-frame units; ~1e-5 ≈ sub-0.01px.
+                            if float(np.abs(_ke - _ko).max()) < 1e-5:
+                                continue
+                            _x1, _x2, _y1, _y2 = [float(v) for v in _crops[_i][:4]]
+                            _cw = max(1.0, _x2 - _x1)
+                            _ch = max(1.0, _y2 - _y1)
+                            _th, _tw = float(_fv.shape[1]), float(_fv.shape[2])
+                            _src_px = np.empty_like(_ko)
+                            _dst_px = np.empty_like(_ke)
+                            _src_px[:, 0] = (_ko[:, 0] * _Ws - _x1) / _cw * _tw
+                            _src_px[:, 1] = (_ko[:, 1] * _Hs - _y1) / _ch * _th
+                            _dst_px[:, 0] = (_ke[:, 0] * _Ws - _x1) / _cw * _tw
+                            _dst_px[:, 1] = (_ke[:, 1] * _Hs - _y1) / _ch * _th
+                            # Drop control points far outside the crop (e.g.
+                            # the body-anchor row on half-body shots): warp_face
+                            # would CLAMP them onto the crop border, where they
+                            # form long degenerate triangles with the moved
+                            # interior landmarks and smear the shift to the
+                            # frame edge (proven in the offline synthetic test).
+                            # Face landmarks — the ones that actually move —
+                            # always live inside the face crop.
+                            _pad = 32.0
+                            _keep = ((_src_px[:, 0] > -_pad) & (_src_px[:, 0] < _tw + _pad)
+                                     & (_src_px[:, 1] > -_pad) & (_src_px[:, 1] < _th + _pad)
+                                     & (_dst_px[:, 0] > -_pad) & (_dst_px[:, 0] < _tw + _pad)
+                                     & (_dst_px[:, 1] > -_pad) & (_dst_px[:, 1] < _th + _pad))
+                            if int(_keep.sum()) < 3:
+                                continue
+                            _warped = _warp_face(_fv[_i].astype(np.float32),
+                                                 _src_px[_keep], _dst_px[_keep])
+                            _fv[_i] = np.clip(_warped, 0.0, 1.0)
+                            _n_warped += 1
+                        if _n_warped:
+                            face_video_out = torch.from_numpy(_fv).float()
+                            logging.getLogger(__name__).info(
+                                "DrawViTPoseV2: delivered pose-landmark edits into "
+                                "%d/%d face frames (apply_pose_edits_to_face=warp).",
+                                _n_warped, _n,
+                            )
+            except Exception as _exc:                                    # noqa: BLE001
+                logging.getLogger(__name__).warning(
+                    "DrawViTPoseV2: expression-edit face warp failed (%s); "
+                    "forwarding unwarped face_images.", _exc,
+                )
         if face_video_out is None:
             face_video_out = torch.zeros((1, 512, 512, 3), dtype=torch.float32)
 
