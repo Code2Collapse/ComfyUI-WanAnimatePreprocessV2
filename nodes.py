@@ -1755,6 +1755,7 @@ class PoseAndFaceDetectionV2:
                 "face_smoothing_strength": ("FLOAT", {"default": 0.6, "min": 0.0, "max": 1.0, "step": 0.05, "tooltip": "Higher = more smoothing"}),
                 # Constant-size face box
                 "use_constant_face_box": ("BOOLEAN", {"default": True, "tooltip": "Keep a constant pixel size face crop; position adapts."}),
+                "face_crop_scale": ("FLOAT", {"default": 1.3, "min": 1.0, "max": 3.0, "step": 0.05, "tooltip": "AREA expansion of the face box, passed straight to get_face_bboxes. 1.3 is the value Wan2.2's own process_pipepline.py uses at both call sites, so 1.3 = reference-exact. LOWER (1.1-1.2) crops tighter, which puts MORE pixels on the face after the 512 resize and is the single most effective knob for micro-expression detail; too low and a head turn can clip the jaw/ear. HIGHER gives more headroom and safety at the cost of face resolution. Applies to every crop_mode."}),
                 "face_box_size_px": ("INT", {"default": 512, "min": 64, "max": 1024, "step": 16, "tooltip": "Pixel size of the square face crop when constant mode is on. Default 512 matches Wan 2.2 Animate's face encoder input size; lower values trigger an extra upscale inside the encoder and waste detail."}),
                 # Iris estimation
                 "use_iris_smoothing": ("BOOLEAN", {"default": True, "tooltip": "Temporally smooth iris pixel positions across frames. Reduces per-frame jitter that Wan 2.2 Animate's face encoder picks up and reproduces as wobbly gaze."}),
@@ -1774,7 +1775,7 @@ class PoseAndFaceDetectionV2:
                 "gaze_max_yaw_deg": ("FLOAT", {"default": 30.0, "min": 5.0, "max": 60.0, "step": 1.0, "tooltip": "Saturation yaw angle in degrees that corresponds to blend shape value 1.0. 30\u00b0 covers the comfortable physiological range; raise for more dramatic eye motion."}),
                 "gaze_max_pitch_deg": ("FLOAT", {"default": 25.0, "min": 5.0, "max": 60.0, "step": 1.0, "tooltip": "Saturation pitch angle in degrees that corresponds to blend shape value 1.0. 25\u00b0 covers the comfortable physiological range."}),
                 # ---- Jitterless face crop (manual frame-0 anchor + keyframes) ----
-                "crop_mode": (["default", "auto", "jitterless"], {"default": "default", "tooltip": "default = raw detected bbox per frame (NO smoothing / NO constant size — crop is effectively 'off'). auto = legacy smoothed + optional constant-size box. jitterless = TRUE locked crop: every frame is exactly the same size (frame0_size, else face_box_size_px) and the face is held centred within a bounded tolerance even under fast motion — a Mocha-style planar hold. The ONLY thing that changes the size is explicit per-key-frame sizes in keyframes_json. If you instead want the crop to follow the subject's apparent scale (face fills a constant fraction of the tile as they walk toward camera), use 'auto'."}),
+                "crop_mode": (["default", "reference_smooth", "auto", "jitterless"], {"default": "default", "tooltip": "default = the REFERENCE behaviour, exactly: get_face_bboxes per frame -> crop -> resize 512, no smoothing (verified line-by-line against Wan2.2's process_pipepline.py). Correct framing, but the box is recomputed from jittering landmarks every frame so the tile wobbles. reference_smooth = RECOMMENDED. Identical geometry to 'default' (same box, same non-square aspect, same 512 stretch) with only the four box parameters (cx, cy, w, h) temporally filtered. Removes tile wobble WITHOUT touching a single face pixel. This matters because the Face Adapter's encoder is a plain conv stack over the whole tile with no landmark input, so it cannot tell crop wobble from real motion and box noise competes with the expression signal. auto = legacy smoothed + optional constant-size box. jitterless = locked constant-size crop (Mocha-style planar hold); stable but the face fills a varying fraction of the tile as the subject moves, which costs face resolution."}),
                 "frame0_cx": ("INT", {"default": -1, "min": -1, "max": 8192, "tooltip": "Frame 0 anchor center X in pixels. -1 = use detected face center on frame 0. Used only when crop_mode=jitterless."}),
                 "frame0_cy": ("INT", {"default": -1, "min": -1, "max": 8192, "tooltip": "Frame 0 anchor center Y in pixels. -1 = use detected face center on frame 0."}),
                 "frame0_size": ("INT", {"default": 0, "min": 0, "max": 4096, "step": 16, "tooltip": "Locked square crop size in pixels (used for the entire clip). 0 = fall back to face_box_size_px."}),
@@ -1905,6 +1906,7 @@ class PoseAndFaceDetectionV2:
         eye_open_mode="blinks_only",
         eye_open_blink_ear=0.18,
         preserve_face_aspect=True,
+        face_crop_scale=1.3,
         clahe_clip_limit=2.0,
         clahe_grid_size=8,
         detect_gamma=1.0,
@@ -1979,6 +1981,7 @@ class PoseAndFaceDetectionV2:
                 eye_open_mode,
                 eye_open_blink_ear,
                 preserve_face_aspect,
+                face_crop_scale,
                 clahe_clip_limit,
                 clahe_grid_size,
                 detect_gamma,
@@ -2053,6 +2056,7 @@ class PoseAndFaceDetectionV2:
         eye_open_mode="blinks_only",
         eye_open_blink_ear=0.18,
         preserve_face_aspect=True,
+        face_crop_scale=1.3,
         clahe_clip_limit=2.0,
         clahe_grid_size=8,
         detect_gamma=1.0,
@@ -2202,7 +2206,8 @@ class PoseAndFaceDetectionV2:
         # --- Raw face bboxes (from blurred pose keypoints; values are in pixel space) ---
         raw_face_bboxes = []
         for meta in pose_metas:
-            bbox_face = get_face_bboxes(meta['keypoints_face'][:, :2], scale=1.3, image_shape=(H, W))
+            bbox_face = get_face_bboxes(meta['keypoints_face'][:, :2],
+                                        scale=float(face_crop_scale), image_shape=(H, W))
             # Ensure ints and within bounds
             x1, x2, y1, y2 = map(int, bbox_face)
             x1 = max(0, min(W - 1, x1))
@@ -2231,12 +2236,83 @@ class PoseAndFaceDetectionV2:
             raw_face_aspects.append(_bh / max(_bw, 1.0))
 
         crop_mode_str = str(crop_mode)
+        reference_smooth = crop_mode_str == "reference_smooth"
         jitterless = crop_mode_str == "jitterless"
         crop_off = crop_mode_str == "default"
 
         if crop_off:
             # ── default: raw detected bboxes, no smoothing, no constant-size ──
             face_bboxes = list(raw_face_bboxes)
+        elif reference_smooth:
+            # ── reference_smooth ─────────────────────────────────────────
+            # The reference framing, de-jittered. Nothing about the GEOMETRY
+            # is invented here: the box is still exactly what get_face_bboxes
+            # produced (area-scaled, 3x upward bias, natural non-square
+            # aspect) and it is still stretched to 512x512 by resize_face_crop
+            # — identical to Wan2.2's process_pipepline.py. The ONLY change is
+            # that the four box PARAMETERS (cx, cy, w, h) are run through the
+            # same temporal filter the other modes use, instead of being
+            # recomputed raw from jittering landmarks every frame.
+            #
+            # Why this is the right lever for micro-expressions specifically:
+            # the Face Adapter's encoder (wan/modules/animate/motion_encoder.py,
+            # EncoderApp) is a plain conv stack over the whole 512x512 tile
+            # down to one 512-dim vector. It has NO landmark input and no
+            # spatial-alignment mechanism, so it cannot separate "the crop
+            # wobbled 3px" from "the face moved 3px" — raw per-frame box noise
+            # is encoded as motion and competes with the real expression
+            # signal. Filtering the box removes that fake motion while leaving
+            # every face PIXEL untouched (smoothing pixels would erase the
+            # micro-expression itself, which is why only the box is filtered).
+            _rc = np.stack(raw_centers, axis=0).astype(np.float32) \
+                if raw_centers else np.zeros((B, 2), np.float32)
+            _rw = np.array([float(b[1] - b[0]) for b in raw_face_bboxes], np.float32)
+            _rh = np.array([float(b[3] - b[2]) for b in raw_face_bboxes], np.float32)
+            _img_diag = float((W * W + H * H) ** 0.5)
+            _sc = _smooth_centers(
+                _rc, method=str(smoothing_method),
+                ema_strength=face_smoothing_strength, image_diag=_img_diag,
+                one_euro_min_cutoff=crop_one_euro_min_cutoff,
+                one_euro_beta=crop_one_euro_beta,
+                gaussian_window=int(crop_gaussian_window),
+            )
+            _size_beta = float(crop_size_one_euro_beta)
+            _sw = _smooth_1d(_rw, method=str(smoothing_method),
+                             ema_strength=face_smoothing_strength,
+                             scale_norm=max(float(np.mean(_rw)), 1.0),
+                             one_euro_min_cutoff=crop_one_euro_min_cutoff,
+                             one_euro_beta=_size_beta,
+                             gaussian_window=int(crop_gaussian_window))
+            _sh = _smooth_1d(_rh, method=str(smoothing_method),
+                             ema_strength=face_smoothing_strength,
+                             scale_norm=max(float(np.mean(_rh)), 1.0),
+                             one_euro_min_cutoff=crop_one_euro_min_cutoff,
+                             one_euro_beta=_size_beta,
+                             gaussian_window=int(crop_gaussian_window))
+            _mar = max(1.0, float(crop_safety_margin))
+            face_bboxes = []
+            for _i in range(B):
+                _w = float(np.clip(_sw[_i] * _mar, 8.0, float(W)))
+                _h = float(np.clip(_sh[_i] * _mar, 8.0, float(H)))
+                _cx, _cy = float(_sc[_i, 0]), float(_sc[_i, 1])
+                _x1 = int(round(_cx - _w / 2.0))
+                _y1 = int(round(_cy - _h / 2.0))
+                # Left unclamped on purpose — _crop_with_padding edge-pads so
+                # the face stays centred at frame edges instead of the box
+                # being shoved back inside (which is what put the face
+                # off-centre before).
+                face_bboxes.append((_x1, _x1 + int(round(_w)),
+                                    _y1, _y1 + int(round(_h))))
+            logging.getLogger(__name__).info(
+                "PoseAndFaceDetectionV2 [reference_smooth]: reference box geometry "
+                "(scale=%.2f) with cx/cy/w/h temporally filtered (%s). Box jitter "
+                "std: cx %.2f->%.2f px, w %.2f->%.2f px.",
+                float(face_crop_scale), str(smoothing_method),
+                float(np.std(np.diff(_rc[:, 0]))) if B > 1 else 0.0,
+                float(np.std(np.diff(_sc[:, 0]))) if B > 1 else 0.0,
+                float(np.std(np.diff(_rw))) if B > 1 else 0.0,
+                float(np.std(np.diff(_sw))) if B > 1 else 0.0,
+            )
         elif jitterless:
             # ── Jitterless crop pipeline ─────────────────────────────────
             # 1. Resolve the frame-0 anchor (size & center) with priority:
