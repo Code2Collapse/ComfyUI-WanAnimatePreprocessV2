@@ -688,6 +688,88 @@ _RIGHT_EYE_IDX = [37, 38, 39, 40, 41, 42]
 _LEFT_EYE_IDX  = [43, 44, 45, 46, 47, 48]
 _EYE_CONTOUR_INDICES = [_RIGHT_EYE_IDX, _LEFT_EYE_IDX]
 
+# Eye-Aspect-Ratio of a comfortably open eye. Used as the target when forcing
+# eyes open; a natural open eye sits around 0.28-0.35, a blink near 0.05-0.15.
+_EYE_OPEN_TARGET_EAR = 0.30
+# Never scale a lid open by more than this — past it the eyelid geometry stops
+# being a plausible deformation of the source face and the downstream warp
+# starts smearing rather than opening.
+_EYE_OPEN_MAX_SCALE = 3.0
+
+
+def force_eye_open_landmarks(kps_norm, W, H, amount,
+                             target_ear=_EYE_OPEN_TARGET_EAR,
+                             max_scale=_EYE_OPEN_MAX_SCALE):
+    """Open the eyelids of one frame's 69-row face-landmark array in place-safe
+    fashion (returns a NEW array), and report what it did.
+
+    Why this lives at the LANDMARK level even though Wan-Animate is 100%
+    pixel-driven: DrawViTPoseV2.apply_pose_edits_to_face already turns a
+    landmark delta (pose_metas vs pose_metas_original) into a real Delaunay
+    piecewise-affine warp of the face crop. So writing opened-eye landmarks
+    here IS the pixel edit — the existing warp executes it, using the frame's
+    own crop as the source, which is exactly the "preserve identity / pose /
+    mouth / lighting, move only the eye region" property that matters.
+
+    Geometry: the two eye CORNERS (p1, p4) are held fixed and define the eye's
+    axis; the four lid points are scaled along the perpendicular to that axis
+    about the corner midline. That opens the aperture without translating,
+    rotating or resizing the eye, so the warp stays local.
+
+    ``kps_norm`` is (>=69, 2+) normalised to the full frame. Only rows in
+    _RIGHT_EYE_IDX / _LEFT_EYE_IDX are touched. Scaling is clamped to
+    [1.0, max_scale] — this only ever OPENS, never closes.
+
+    Returns ``(new_kps, info)`` where info is
+    ``{"right_ear": float, "left_ear": float, "right_scale": float,
+       "left_scale": float, "changed": bool}``. NaN EARs mean the eye was
+    unusable (missing/zeroed landmarks) and it was left untouched.
+    """
+    out = np.array(kps_norm, dtype=np.float32, copy=True)
+    info = {"right_ear": float("nan"), "left_ear": float("nan"),
+            "right_scale": 1.0, "left_scale": 1.0, "changed": False}
+    amount = float(np.clip(amount, 0.0, 1.0))
+    if amount <= 0.0 or out.shape[0] <= max(_LEFT_EYE_IDX):
+        return out, info
+
+    for side, idx in (("right", _RIGHT_EYE_IDX), ("left", _LEFT_EYE_IDX)):
+        ear = _eye_aspect_ratio(out, idx, W, H)
+        info[f"{side}_ear"] = float(ear)
+        if not np.isfinite(ear) or ear <= 1e-6:
+            continue                      # unusable eye — leave it alone
+        if ear >= target_ear:
+            continue                      # already open enough
+
+        # Work in pixels so the aspect ratio of the frame can't skew the
+        # perpendicular direction.
+        px = out[idx, :2].astype(np.float64) * np.array([W, H], dtype=np.float64)
+        p1, p2, p3, p4, p5, p6 = px       # p1/p4 = outer/inner corner
+        axis = p4 - p1
+        axis_len = float(np.hypot(axis[0], axis[1]))
+        if axis_len < 1e-6:
+            continue
+        u = axis / axis_len
+        n = np.array([-u[1], u[0]], dtype=np.float64)   # perpendicular
+        centre = 0.5 * (p1 + p4)
+
+        k_full = float(np.clip(target_ear / ear, 1.0, max_scale))
+        k = 1.0 + (k_full - 1.0) * amount               # blend by `amount`
+        info[f"{side}_scale"] = k
+        if k <= 1.0 + 1e-6:
+            continue
+
+        for slot in (1, 2, 4, 5):                       # p2, p3, p5, p6
+            d = px[slot] - centre
+            along = float(np.dot(d, u))
+            perp = float(np.dot(d, n))
+            px[slot] = centre + along * u + (perp * k) * n
+
+        out[idx, 0] = (px[:, 0] / max(W, 1)).astype(np.float32)
+        out[idx, 1] = (px[:, 1] / max(H, 1)).astype(np.float32)
+        info["changed"] = True
+
+    return out, info
+
 # Gaze-arrow rendering tunables.
 # DEAD_ZONE_PX: iris-centroid offsets smaller than this are treated as
 # noise (MediaPipe landmark precision is roughly 1px on cropped faces).
@@ -1405,10 +1487,14 @@ def build_jitterless_boxes(
     face_smoothing_strength=0.6,
     one_euro_min_cutoff=1.0,
     one_euro_beta=0.05,
+    size_one_euro_beta=None,
     gaussian_window=7,
     lock_size=True,
     max_center_drift_frac=_JITTERLESS_MAX_CENTER_DRIFT_FRAC,
     hold_mask=None,
+    safety_margin=1.0,
+    containment_boxes=None,
+    containment_tolerance=0.0,
 ):
     """Build the jitterless per-frame square crop boxes.
 
@@ -1432,19 +1518,28 @@ def build_jitterless_boxes(
         return [], np.zeros((0,), np.float32), np.zeros((0, 2), np.float32)
 
     max_side = float(min(W, H))
+    margin = float(safety_margin) if safety_margin and safety_margin > 0 else 1.0
     if lock_size:
         # THE lock. One value, computed once, used for every frame. Rounding
         # happens ONCE here rather than per frame, so integer box widths cannot
         # wobble by +/-1px between frames.
-        size_const = float(np.clip(float(anchor_size), 8.0, max_side))
+        # safety_margin inflates it so filter lag / yaw-foreshortened
+        # detections / expression-driven bbox growth cannot clip the face.
+        size_const = float(np.clip(float(anchor_size) * margin, 8.0, max_side))
         sizes = np.full((B,), size_const, dtype=np.float32)
     else:
         sizes = np.clip(
-            np.asarray(target_sizes_raw, dtype=np.float32).reshape(-1), 8.0, max_side)
+            np.asarray(target_sizes_raw, dtype=np.float32).reshape(-1) * margin,
+            8.0, max_side)
+        # The SIZE trajectory is a different signal from the CENTRE trajectory:
+        # position wants heavy damping (kill detector jitter), scale wants to
+        # follow real zoom/approach or it under-sizes mid-move. Give size its
+        # own beta instead of inheriting the centre's.
+        _size_beta = one_euro_beta if size_one_euro_beta is None else float(size_one_euro_beta)
         sizes = _smooth_1d(
             sizes, method=str(smoothing_method),
             ema_strength=face_smoothing_strength, scale_norm=max(anchor_size, 1.0),
-            one_euro_min_cutoff=one_euro_min_cutoff, one_euro_beta=one_euro_beta,
+            one_euro_min_cutoff=one_euro_min_cutoff, one_euro_beta=_size_beta,
             gaussian_window=int(gaussian_window),
         )
         sizes = np.clip(sizes, 8.0, max_side)
@@ -1482,6 +1577,47 @@ def build_jitterless_boxes(
                 if not lock_size:
                     sizes[i] = sizes[i - 1]
 
+    # Containment: a HARD per-frame guarantee that the real detected face box
+    # is inside the crop, not a heuristic.
+    #
+    # DESIGN NOTE — this deliberately does NOT grow the crop when the size is
+    # locked. Growing one frame would silently break the exact-size guarantee
+    # that is the entire point of jitterless. Instead:
+    #   1. SHIFT the crop to contain the face (free — size is untouched), then
+    #   2. only if the face is genuinely LARGER than the locked crop, report
+    #      it. That is a "your locked size is too small for this shot"
+    #      condition the user must fix with face_box_size_px /
+    #      crop_safety_margin — silently resizing would hide it.
+    # When the size is not locked (auto / key-framed), growing is fine and is
+    # what happens.
+    n_shifted = 0
+    n_too_small = 0
+    if containment_boxes is not None:
+        tol = float(containment_tolerance)
+        for i in range(min(B, len(containment_boxes))):
+            fb = containment_boxes[i]
+            if fb is None:
+                continue
+            fx1, fx2, fy1, fy2 = (float(fb[0]), float(fb[1]), float(fb[2]), float(fb[3]))
+            need_w = (fx2 - fx1) + 2.0 * tol
+            need_h = (fy2 - fy1) + 2.0 * tol
+            need = max(need_w, need_h)
+            if need > float(sizes[i]):
+                if lock_size:
+                    n_too_small += 1
+                else:
+                    sizes[i] = float(np.clip(need, 8.0, max_side))
+            # Re-centre so the face box sits inside the crop.
+            half_i = float(sizes[i]) / 2.0
+            cx_i, cy_i = float(centers[i, 0]), float(centers[i, 1])
+            lo_x, hi_x = (fx2 + tol) - half_i, (fx1 - tol) + half_i
+            lo_y, hi_y = (fy2 + tol) - half_i, (fy1 - tol) + half_i
+            new_cx = min(max(cx_i, lo_x), hi_x) if lo_x <= hi_x else 0.5 * (fx1 + fx2)
+            new_cy = min(max(cy_i, lo_y), hi_y) if lo_y <= hi_y else 0.5 * (fy1 + fy2)
+            if abs(new_cx - cx_i) > 1e-3 or abs(new_cy - cy_i) > 1e-3:
+                n_shifted += 1
+            centers[i, 0], centers[i, 1] = new_cx, new_cy
+
     boxes = []
     for i in range(B):
         size_i_int = int(round(float(sizes[i])))
@@ -1490,6 +1626,9 @@ def build_jitterless_boxes(
         x1 = int(round(float(np.clip(centers[i, 0] - half, 0, max(0, W - size_i_int)))))
         y1 = int(round(float(np.clip(centers[i, 1] - half, 0, max(0, H - size_i_int)))))
         boxes.append((x1, x1 + size_i_int, y1, y1 + size_i_int))
+    build_jitterless_boxes.last_stats = {
+        "shifted": n_shifted, "too_small": n_too_small, "frames": B,
+    }
     return boxes, sizes, centers
 
 
@@ -1571,6 +1710,14 @@ class PoseAndFaceDetectionV2:
                 "crop_one_euro_min_cutoff": ("FLOAT", {"default": 1.0, "min": 0.05, "max": 10.0, "step": 0.05, "tooltip": "One-euro min cutoff (Hz) for crop center. Lower = stronger jitter rejection."}),
                 "crop_one_euro_beta": ("FLOAT", {"default": 0.05, "min": 0.0, "max": 5.0, "step": 0.01, "tooltip": "One-euro speed coefficient for crop center. Higher = filter relaxes faster on quick motion."}),
                 "crop_gaussian_window": ("INT", {"default": 7, "min": 3, "max": 51, "step": 2, "tooltip": "Window size (odd) for the Gaussian temporal blur of the crop center."}),
+                "crop_safety_margin": ("FLOAT", {"default": 1.12, "min": 1.0, "max": 2.0, "step": 0.01, "tooltip": "Inflate the crop by this factor before smoothing so filter lag, yaw-foreshortened detections and expression-driven bbox growth cannot clip the face. 1.0 = no margin (old behaviour). Applies to both 'auto' and 'jitterless'. If crop_containment_check reports corrections on more than a handful of frames, raise this toward 1.15-1.20 rather than fighting it downstream."}),
+                "crop_size_one_euro_beta": ("FLOAT", {"default": 0.20, "min": 0.0, "max": 2.0, "step": 0.01, "tooltip": "One-euro beta for the crop SIZE trajectory, separate from crop_one_euro_beta (which is the CENTER's). Position wants heavy damping to kill detector jitter; scale wants to follow real zoom/approach or the crop under-sizes mid-move. Only used when the size is allowed to vary (crop_mode='auto', or jitterless with explicit key-frame sizes) — a locked jitterless size ignores it by definition."}),
+                "crop_containment_check": ("BOOLEAN", {"default": True, "tooltip": "HARD per-frame guarantee that the actual detected face bbox ends up inside the final crop. After smoothing, any frame whose face escapes the crop is corrected. In 'jitterless' the correction SHIFTS the crop (the exact-size lock is preserved); growing would silently break the lock, so a face genuinely larger than the locked size is reported in the log instead — that means face_box_size_px / crop_safety_margin is too small for the shot. In 'auto' the crop may grow. Correction counts are logged."}),
+                "crop_containment_tolerance": ("INT", {"default": 4, "min": 0, "max": 128, "tooltip": "Extra pixels of slack required around the detected face bbox when crop_containment_check tests containment."}),
+                "auto_smoothing_method": (["legacy_ema", "one_euro", "ema", "gaussian", "none"], {"default": "legacy_ema", "tooltip": "Which filter crop_mode='auto' uses. 'legacy_ema' keeps auto's original bespoke EMA byte-for-byte (the default, so existing workflows are untouched); the others route auto through the same shared filters jitterless uses, honouring crop_one_euro_* / crop_gaussian_window. Ignored unless crop_mode='auto'."}),
+                "force_eyes_open": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05, "tooltip": "Force closed/blinking eyes open. 0 = off (default). 1 = fully open to a natural EAR of ~0.30; intermediate values blend.\n\nThis REACHES THE MODEL because it pairs with DrawViTPoseV2's apply_pose_edits_to_face warp: Wan-Animate's face conditioning is 100%% pixel-driven (landmarks only place the crop, the LIA motion encoder reads raw crop pixels), so this node writes opened-eye LANDMARKS and DrawViTPoseV2 warps the actual crop PIXELS to match — using each frame's own crop as the source, so identity, head pose, mouth and lighting are preserved and only the eye aperture changes. Wire face_images/face_images_512 -> DrawViTPoseV2.face_images and leave apply_pose_edits_to_face='warp' (the default) or this does nothing visible.\n\nOnly ever opens, never closes; eye corners stay fixed so the warp stays local."}),
+                "eye_open_mode": (["blinks_only", "all_frames"], {"default": "blinks_only", "tooltip": "Which frames force_eyes_open targets. 'blinks_only' = only frames whose measured Eye-Aspect-Ratio falls below eye_open_blink_ear (keeps natural performance, removes blinks). 'all_frames' = whole-shot override, for when the subject squints throughout."}),
+                "eye_open_blink_ear": ("FLOAT", {"default": 0.18, "min": 0.01, "max": 0.40, "step": 0.01, "tooltip": "Eye-Aspect-Ratio below which a frame counts as a blink for eye_open_mode='blinks_only'. A natural open eye is ~0.28-0.35, a full blink ~0.05-0.15. Raise toward 0.22 to also catch heavy-lidded frames."}),
                 # ---- Wan-Animate paper-driven gaze fixes (arXiv:2509.14055) ----
                 "eye_align_mode": (["default", "eye_upper_third"], {"default": "default", "tooltip": "Wan-Animate paper recommendation #1: 'eye_upper_third' vertically shifts the face crop so eyes land at the upper third of the 512x512 face encoder input. The encoder reads holistic face appearance, so consistent eye placement directly improves gaze fidelity. 'default' keeps legacy bbox center."}),
                 "eye_y_fraction": ("FLOAT", {"default": 0.30, "min": 0.10, "max": 0.60, "step": 0.01, "tooltip": "Target eye row as a fraction of crop height (0.30 = upper third). Only used when eye_align_mode = 'eye_upper_third'."}),
@@ -1672,6 +1819,17 @@ class PoseAndFaceDetectionV2:
         bbox_override=None,
         landmark_overrides_json="{}",
         retarget_image=None,
+        # Appended at the END (never mid-signature): the inner call site
+        # passes POSITIONALLY, so inserting a param anywhere above would
+        # silently shift every later argument.
+        crop_safety_margin=1.12,
+        crop_size_one_euro_beta=0.20,
+        crop_containment_check=True,
+        crop_containment_tolerance=4,
+        auto_smoothing_method="legacy_ema",
+        force_eyes_open=0.0,
+        eye_open_mode="blinks_only",
+        eye_open_blink_ear=0.18,
     ):
         if not isinstance(images, torch.Tensor) or images.ndim != 4 or images.shape[-1] != 3:
             raise ValueError(
@@ -1730,6 +1888,14 @@ class PoseAndFaceDetectionV2:
                 bbox_override,
                 landmark_overrides_json,
                 retarget_image,
+                crop_safety_margin,
+                crop_size_one_euro_beta,
+                crop_containment_check,
+                crop_containment_tolerance,
+                auto_smoothing_method,
+                force_eyes_open,
+                eye_open_mode,
+                eye_open_blink_ear,
             )
 
     def _process_impl(
@@ -1785,6 +1951,17 @@ class PoseAndFaceDetectionV2:
         bbox_override=None,
         landmark_overrides_json="{}",
         retarget_image=None,
+        # Appended at the END (never mid-signature): the inner call site
+        # passes POSITIONALLY, so inserting a param anywhere above would
+        # silently shift every later argument.
+        crop_safety_margin=1.12,
+        crop_size_one_euro_beta=0.20,
+        crop_containment_check=True,
+        crop_containment_tolerance=4,
+        auto_smoothing_method="legacy_ema",
+        force_eyes_open=0.0,
+        eye_open_mode="blinks_only",
+        eye_open_blink_ear=0.18,
     ):
         detector = model["yolo"]
         pose_model = model["vitpose"]
@@ -2099,10 +2276,26 @@ class PoseAndFaceDetectionV2:
                 face_smoothing_strength=face_smoothing_strength,
                 one_euro_min_cutoff=crop_one_euro_min_cutoff,
                 one_euro_beta=crop_one_euro_beta,
+                size_one_euro_beta=crop_size_one_euro_beta,
                 gaussian_window=int(crop_gaussian_window),
                 lock_size=lock_size,
                 hold_mask=_hold,
+                safety_margin=float(crop_safety_margin),
+                containment_boxes=(raw_face_bboxes if crop_containment_check else None),
+                containment_tolerance=float(crop_containment_tolerance),
             )
+            _cstats = getattr(build_jitterless_boxes, "last_stats", {}) or {}
+            if _cstats.get("shifted") or _cstats.get("too_small"):
+                logging.getLogger(__name__).info(
+                    "PoseAndFaceDetectionV2 [jitterless]: containment shifted %d/%d frames; "
+                    "%d frame(s) had a face LARGER than the locked crop.%s",
+                    int(_cstats.get("shifted", 0)), int(_cstats.get("frames", B)),
+                    int(_cstats.get("too_small", 0)),
+                    ("  The locked size is too small for this shot — raise "
+                     "face_box_size_px/frame0_size or crop_safety_margin. "
+                     "(Not auto-grown: that would break the exact-size lock.)"
+                     if _cstats.get("too_small") else ""),
+                )
         else:
             # ── Legacy auto pipeline ───────────────────────────────────────
             # Bug-fix (Wan-Animate spec 1.3, legacy-path counterpart): fold
@@ -2134,7 +2327,23 @@ class PoseAndFaceDetectionV2:
                     raw_centers[_idx] = np.array([_cx, _cy], dtype=np.float32)
 
             # --- Temporal smoothing for centers (motion-adaptive) ---
-            if use_face_smoothing and len(raw_centers) > 1:
+            # auto_smoothing_method="legacy_ema" (default) keeps auto's own
+            # bespoke EMA byte-for-byte so existing workflows are untouched.
+            # Any other value routes auto through the SAME shared filters
+            # jitterless uses, honouring crop_one_euro_* / crop_gaussian_window
+            # — previously auto ignored the smoothing_method widget entirely.
+            _auto_sm = str(auto_smoothing_method)
+            if use_face_smoothing and len(raw_centers) > 1 and _auto_sm != "legacy_ema":
+                smoothed_centers = list(_smooth_centers(
+                    np.stack(raw_centers, axis=0).astype(np.float32),
+                    method=_auto_sm,
+                    ema_strength=face_smoothing_strength,
+                    image_diag=float((W * W + H * H) ** 0.5),
+                    one_euro_min_cutoff=crop_one_euro_min_cutoff,
+                    one_euro_beta=crop_one_euro_beta,
+                    gaussian_window=int(crop_gaussian_window),
+                ))
+            elif use_face_smoothing and len(raw_centers) > 1:
                 base_strength = float(np.clip(face_smoothing_strength, 0.0, 1.0))
                 smoothed_centers = [raw_centers[0].copy()]
                 norm = max(1.0, (W + H) / 2.0)
@@ -2154,15 +2363,43 @@ class PoseAndFaceDetectionV2:
             # --- Build final face bboxes from smoothed centers ---
             face_bboxes = []
             if use_constant_face_box:
-                half = face_box_size_px / 2.0
-                for c in smoothed_centers:
+                # crop_safety_margin also applies here so 'auto' gets the same
+                # protection against filter lag / foreshortened detections.
+                _auto_side = int(round(float(face_box_size_px)
+                                       * max(1.0, float(crop_safety_margin))))
+                _auto_side = max(8, min(_auto_side, int(min(W, H))))
+                half = _auto_side / 2.0
+                _tol = float(crop_containment_tolerance)
+                _auto_shift = 0
+                for _i, c in enumerate(smoothed_centers):
                     cx, cy = float(c[0]), float(c[1])
+                    # Containment: shift so the real detected face box is
+                    # inside this constant-size crop (size stays constant).
+                    if crop_containment_check and _i < len(raw_face_bboxes):
+                        _fb = raw_face_bboxes[_i]
+                        if _fb is not None:
+                            fx1, fx2, fy1, fy2 = (float(_fb[0]), float(_fb[1]),
+                                                  float(_fb[2]), float(_fb[3]))
+                            lo_x, hi_x = (fx2 + _tol) - half, (fx1 - _tol) + half
+                            lo_y, hi_y = (fy2 + _tol) - half, (fy1 - _tol) + half
+                            n_cx = min(max(cx, lo_x), hi_x) if lo_x <= hi_x else 0.5 * (fx1 + fx2)
+                            n_cy = min(max(cy, lo_y), hi_y) if lo_y <= hi_y else 0.5 * (fy1 + fy2)
+                            if abs(n_cx - cx) > 1e-3 or abs(n_cy - cy) > 1e-3:
+                                _auto_shift += 1
+                            cx, cy = n_cx, n_cy
                     # Clamp so the square stays in bounds
-                    x1 = int(np.clip(cx - half, 0, W - face_box_size_px))
-                    y1 = int(np.clip(cy - half, 0, H - face_box_size_px))
-                    x2 = x1 + int(face_box_size_px)
-                    y2 = y1 + int(face_box_size_px)
+                    x1 = int(np.clip(cx - half, 0, W - _auto_side))
+                    y1 = int(np.clip(cy - half, 0, H - _auto_side))
+                    x2 = x1 + _auto_side
+                    y2 = y1 + _auto_side
                     face_bboxes.append((x1, x2, y1, y2))
+                if _auto_shift:
+                    logging.getLogger(__name__).info(
+                        "PoseAndFaceDetectionV2 [auto]: containment shifted %d/%d frames "
+                        "(constant box %dpx incl. %.2fx safety margin).",
+                        _auto_shift, len(smoothed_centers), _auto_side,
+                        float(crop_safety_margin),
+                    )
             else:
                 # If not constant size, just slightly pad the original (helps tilted heads)
                 for (x1, x2, y1, y2), c in zip(raw_face_bboxes, smoothed_centers):
@@ -2317,6 +2554,57 @@ class PoseAndFaceDetectionV2:
                 retarget_pose_metas = [AAPoseMeta.from_humanapi_meta(meta) for meta in pose_metas]
         else:
             retarget_pose_metas = [AAPoseMeta.from_humanapi_meta(meta) for meta in pose_metas]
+
+        # ---- force_eyes_open ------------------------------------------------
+        # Applied to retarget_pose_metas ONLY. Those become pose_data
+        # ["pose_metas"], while pose_data["pose_metas_original"] keeps the
+        # pristine detected dicts — so this edit shows up as exactly the kind of
+        # landmark DELTA that DrawViTPoseV2.apply_pose_edits_to_face already
+        # knows how to execute as a real pixel warp of the face crop. That is
+        # the whole mechanism: Wan-Animate never reads landmarks for content
+        # (LIA motion encoder reads raw crop pixels), so the landmark edit is
+        # only the instruction — DrawViTPoseV2 does the pixel work.
+        # Editing `pose_metas` here instead would poison BOTH sides of the
+        # comparison and produce a zero delta, i.e. silently no-op.
+        if float(force_eyes_open) > 0.0:
+            try:
+                from .nodes_extras.expression_3d_coeffs import (
+                    _read_face_normalised as _eo_read,
+                    _write_face_normalised as _eo_write,
+                )
+                _eo_thresh = float(eye_open_blink_ear)
+                _eo_all = (str(eye_open_mode) == "all_frames")
+                _eo_hit = 0
+                _eo_skipped = 0
+                for _fi, _rm in enumerate(retarget_pose_metas):
+                    _k = _eo_read(_rm)
+                    if _k is None or _k.shape[0] <= max(_LEFT_EYE_IDX):
+                        _eo_skipped += 1
+                        continue
+                    if not _eo_all:
+                        _er = _eye_aspect_ratio(_k, _RIGHT_EYE_IDX, W, H)
+                        _el = _eye_aspect_ratio(_k, _LEFT_EYE_IDX, W, H)
+                        _vals = [v for v in (_er, _el) if np.isfinite(v)]
+                        if not _vals or min(_vals) >= _eo_thresh:
+                            continue          # eyes already open on this frame
+                    _new, _info = force_eye_open_landmarks(
+                        _k, W, H, float(force_eyes_open),
+                    )
+                    if _info.get("changed"):
+                        _eo_write(_rm, _new[:, :2])
+                        _eo_hit += 1
+                logging.getLogger(__name__).info(
+                    "PoseAndFaceDetectionV2: force_eyes_open=%.2f (%s) opened %d/%d "
+                    "frames%s. Requires DrawViTPoseV2.apply_pose_edits_to_face='warp' "
+                    "+ face_images wired, or the edit stays landmark-only and never "
+                    "reaches the face encoder.",
+                    float(force_eyes_open), str(eye_open_mode), _eo_hit, B,
+                    (f" ({_eo_skipped} had no usable face landmarks)" if _eo_skipped else ""),
+                )
+            except Exception as _eo_exc:                                  # noqa: BLE001
+                logging.getLogger(__name__).warning(
+                    "force_eyes_open skipped (%s); landmarks left untouched.", _eo_exc,
+                )
 
         # use first bbox for return (legacy)
         bbox0 = bboxes[0]
@@ -4046,6 +4334,32 @@ class DrawViTPoseV2:
                 )
         if face_video_out is None:
             face_video_out = torch.zeros((1, 512, 512, 3), dtype=torch.float32)
+
+        # Dead-knob guard (Kijai wrapper behaviour, verified in
+        # nodes_sampler.py): predict_with_cfg() returns noise_pred_cond
+        # immediately when math.isclose(cfg_scale, 1.0), so the uncond pass —
+        # the ONLY place wananim_face_pixel_values is zeroed — never runs. In
+        # that regime (any distilled few-step setup, e.g. a 4-step lightx2v
+        # LoRA at cfg=1.0) face_cfg_scale has literally no effect path. Warn at
+        # RUNTIME rather than only in a tooltip, so the user finds out before
+        # spending a session tuning a knob that cannot do anything. The lever
+        # that always works, in every CFG regime, is
+        # WanVideoAnimateEmbeds.face_strength, which multiplies the face
+        # adapter residual unconditionally (x.add(residual_out, alpha=strength)).
+        try:
+            if abs(float(face_cfg_scale) - 1.0) > 1e-6:
+                logging.getLogger(__name__).warning(
+                    "DrawViTPoseV2: face_cfg_scale=%.3f is a PASSTHROUGH only. "
+                    "Kijai's sampler skips the uncond pass entirely when cfg==1.0 "
+                    "(distilled/lightx2v few-step workflows), so face_cfg_scale "
+                    "cannot affect face-conditioning strength there. Use "
+                    "WanVideoAnimateEmbeds.face_strength (multiplies the face "
+                    "adapter residual on every pass, in every CFG regime) — and "
+                    "pose_strength for the pose latents.",
+                    float(face_cfg_scale),
+                )
+        except (TypeError, ValueError):
+            pass
 
         # Wan-Animate spec 3.1 (closed-loop critic): folded in here (not a
         # standalone node) because this class already receives pose_data's
