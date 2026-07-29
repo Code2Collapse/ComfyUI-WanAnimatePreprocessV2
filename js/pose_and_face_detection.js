@@ -57,6 +57,16 @@ function applyVisibility(node) {
     const jitterless = cropMode === "jitterless";
     const auto       = cropMode === "auto";
     const smoothing  = String(get("smoothing_method")?.value ?? "one_euro");
+    const cropActive = jitterless || auto;          // crop_mode="default" = crop off
+    const gazeEngine = String(get("gaze_engine")?.value ?? "l2cs_gaze360");
+    const eyeAlign   = String(get("eye_align_mode")?.value ?? "default");
+    const auAmp      = Number(get("au_amplify")?.value ?? 1.0);
+    const containOn  = !!get("crop_containment_check")?.value;
+    const eyesOpen   = Number(get("force_eyes_open")?.value ?? 0.0) > 0.0;
+    // Every engine EXCEPT the purely geometric one runs the Kalman stage.
+    const kalmanEngine = ["blendshape_head_corrected", "blendshape_only",
+                          "l2cs_gaze360", "l2cs_mpiigaze",
+                          "pose_normalized_resnet50", "ethxgaze"].includes(gazeEngine);
 
     // visible[name] = true → show; everything not listed is always shown.
     const visible = {
@@ -87,6 +97,23 @@ function applyVisibility(node) {
         crop_one_euro_min_cutoff:   jitterless && smoothing === "one_euro",
         crop_one_euro_beta:         jitterless && smoothing === "one_euro",
         crop_gaussian_window:       jitterless && smoothing === "gaussian",
+        // crop hardening — meaningless when crop_mode="default" (crop off)
+        crop_safety_margin:         cropActive,
+        crop_containment_check:     cropActive,
+        crop_containment_tolerance: cropActive && containOn,
+        // size trajectory only exists where the size is allowed to vary:
+        // auto, or jitterless driven by explicit key-frame sizes.
+        crop_size_one_euro_beta:    cropActive && smoothing === "one_euro",
+        auto_smoothing_method:      auto,
+        // eye-open override sub-options
+        eye_open_mode:              eyesOpen,
+        eye_open_blink_ear:         eyesOpen && String(get("eye_open_mode")?.value) === "blinks_only",
+        // previously ungated
+        eye_y_fraction:             eyeAlign === "eye_upper_third",
+        au_amplify_neutral_frame:   auAmp > 1.0,
+        gaze_kalman_meas_std_deg:   kalmanEngine,
+        gaze_kalman_process_std:    kalmanEngine,
+        gaze_calibration_frame:     gazeEngine === "iris_geometric",
     };
     for (const w of node.widgets) {
         setHidden(w, (w.name in visible) ? !visible[w.name] : false);
@@ -115,10 +142,16 @@ app.registerExtension({
         const onNodeCreated = nodeType.prototype.onNodeCreated;
         nodeType.prototype.onNodeCreated = function () {
             const r = onNodeCreated?.apply(this, arguments);
+            // Every widget that GATES a sibling needs its own callback hook,
+            // not just a `visible` entry — otherwise toggling it re-renders
+            // nothing until some other widget happens to fire.
             for (const n of [
                 "use_blur_for_pose", "use_face_smoothing", "use_constant_face_box",
                 "use_iris_smoothing", "iris_smoothing_method", "gaze_lock_eyes",
                 "use_blendshape_gaze", "crop_mode", "smoothing_method",
+                "crop_containment_check", "auto_smoothing_method",
+                "force_eyes_open", "eye_open_mode",
+                "gaze_engine", "eye_align_mode", "au_amplify",
             ]) {
                 hookWidget(this, n);
             }

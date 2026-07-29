@@ -32,13 +32,30 @@ function setHidden(w, hidden) {
 
 function applyVisibility(node) {
     const get = (n) => node.widgets?.find(w => w.name === n);
+    // face_images and reference_expression_coeffs_json gate their sub-options
+    // by CONNECTION, not by a widget value — check the link, not a .value.
+    const linked = (n) => (node.inputs || []).find(i => i.name === n)?.link != null;
     const drawIris = !!get("draw_iris")?.value;
     const drawGaze = !!get("draw_gaze")?.value;
+    const hasFace  = linked("face_images");
+    // reference_expression_coeffs_json is a multiline STRING: it can be
+    // wired OR typed, so the critic is active if either is true.
+    const refW     = get("reference_expression_coeffs_json");
+    const hasRef   = linked("reference_expression_coeffs_json")
+                     || String(refW?.value ?? "").trim().length > 0;
     const visible = {
         iris_radius:         drawIris,
         iris_min_confidence: drawIris,
         iris_color:          drawIris,
         gaze_arrow_len:      drawGaze,
+        // face passthrough sub-options are meaningless with no face batch.
+        // (face_cfg_scale is forceInput now — connection-only, so it is not
+        // in node.widgets at all and needs no entry here.)
+        enforce_512_face:         hasFace,
+        apply_pose_edits_to_face: hasFace,
+        // closed-loop critic sub-options only matter once a reference is given
+        segment_length:      hasRef,
+        top_k_aus:           hasRef,
     };
     for (const w of node.widgets) {
         setHidden(w, (w.name in visible) ? !visible[w.name] : false);
@@ -67,7 +84,16 @@ app.registerExtension({
         const onNodeCreated = nodeType.prototype.onNodeCreated;
         nodeType.prototype.onNodeCreated = function () {
             const r = onNodeCreated?.apply(this, arguments);
-            for (const n of ["draw_iris", "draw_gaze"]) hookWidget(this, n);
+            for (const n of ["draw_iris", "draw_gaze",
+                             "reference_expression_coeffs_json"]) hookWidget(this, n);
+            // face_images / reference_* are gated by CONNECTION, so widget
+            // callbacks never fire for them — re-evaluate on link changes too.
+            const origConn = this.onConnectionsChange;
+            this.onConnectionsChange = function (...a) {
+                const rr = origConn?.apply(this, a);
+                setTimeout(() => applyVisibility(this), 0);
+                return rr;
+            };
             setTimeout(() => applyVisibility(this), 0);
             return r;
         };
