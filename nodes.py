@@ -557,18 +557,85 @@ from .retarget_pose import get_retarget_pose
 # ---------------------------------------------------
 # Image enhancement utilities
 # ---------------------------------------------------
-def preprocess_for_pose(img, use_clahe=True):
-    """Optional CLAHE contrast enhancement for ViTPose inputs."""
-    if not use_clahe:
+def preprocess_for_pose(img, use_clahe=True, clahe_clip=2.0, clahe_grid=8,
+                        gamma=1.0, white_balance=False, denoise=0.0,
+                        sharpen=0.0, saturation=1.0):
+    """Detection-side image conditioning for ViTPose / YOLO / MediaPipe.
+
+    Applied ONLY to the detector's input — never to the pixels that ship as
+    face_images or pose_data. Detection quality is what limits landmark
+    accuracy on bad footage, so cleaning the detector's view is free accuracy;
+    doing it to the OUTPUT would alter what the Wan-Animate face encoder sees
+    and is a different (and much riskier) decision.
+
+    Order matters and is deliberate:
+      white balance -> gamma -> CLAHE -> denoise -> sharpen -> saturation
+    Grey-world balance first (so CLAHE isn't amplifying a colour cast),
+    gamma before CLAHE (lift shadows into the range CLAHE can equalise),
+    denoise before sharpen (never sharpen noise), saturation last (it only
+    affects the chroma planes the luma work above ignored).
+
+    All steps are no-ops at their defaults, so the default path is
+    byte-identical to the original CLAHE-only behaviour.
+    """
+    if img is None:
+        return img
+    do_wb = bool(white_balance)
+    do_gamma = abs(float(gamma) - 1.0) > 1e-3
+    do_clahe = bool(use_clahe)
+    do_dn = float(denoise) > 1e-3
+    do_sh = float(sharpen) > 1e-3
+    do_sat = abs(float(saturation) - 1.0) > 1e-3
+    if not (do_wb or do_gamma or do_clahe or do_dn or do_sh or do_sat):
         return img
 
-    img_uint8 = (np.clip(img, 0, 1) * 255).astype(np.uint8)
-    lab = cv2.cvtColor(img_uint8, cv2.COLOR_RGB2LAB)
-    l, a, b = cv2.split(lab)
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    l = clahe.apply(l)
-    img_uint8 = cv2.cvtColor(cv2.merge((l, a, b)), cv2.COLOR_LAB2RGB)
-    return img_uint8.astype(np.float32) / 255.0
+    u8 = (np.clip(img, 0, 1) * 255).astype(np.uint8)
+
+    if do_wb:
+        # Grey-world: equalise per-channel means. Cheap, no model, and it
+        # rescues tungsten/underwater casts that otherwise skew skin tone and
+        # cost the face detector confidence.
+        f = u8.astype(np.float32)
+        means = f.reshape(-1, f.shape[-1]).mean(axis=0)
+        grey = float(means.mean())
+        with np.errstate(divide="ignore", invalid="ignore"):
+            gains = np.where(means > 1e-3, grey / means, 1.0)
+        gains = np.clip(gains, 0.5, 2.0)
+        u8 = np.clip(f * gains, 0, 255).astype(np.uint8)
+
+    if do_gamma:
+        g = float(np.clip(gamma, 0.1, 5.0))
+        lut = np.clip(((np.arange(256) / 255.0) ** (1.0 / g)) * 255.0, 0, 255).astype(np.uint8)
+        u8 = cv2.LUT(u8, lut)
+
+    if do_clahe or do_sat:
+        lab = cv2.cvtColor(u8, cv2.COLOR_RGB2LAB)
+        l, a, b = cv2.split(lab)
+        if do_clahe:
+            grid = max(1, int(clahe_grid))
+            clahe = cv2.createCLAHE(clipLimit=max(0.1, float(clahe_clip)),
+                                    tileGridSize=(grid, grid))
+            l = clahe.apply(l)
+        if do_sat:
+            s = float(np.clip(saturation, 0.0, 3.0))
+            a = np.clip((a.astype(np.float32) - 128.0) * s + 128.0, 0, 255).astype(np.uint8)
+            b = np.clip((b.astype(np.float32) - 128.0) * s + 128.0, 0, 255).astype(np.uint8)
+        u8 = cv2.cvtColor(cv2.merge((l, a, b)), cv2.COLOR_LAB2RGB)
+
+    if do_dn:
+        # Edge-preserving: a plain blur would cost ViTPose the very edges it
+        # localises keypoints from.
+        strength = float(np.clip(denoise, 0.0, 1.0))
+        u8 = cv2.bilateralFilter(u8, d=5, sigmaColor=25 + 75 * strength,
+                                 sigmaSpace=25 + 75 * strength)
+
+    if do_sh:
+        amt = float(np.clip(sharpen, 0.0, 2.0))
+        blur = cv2.GaussianBlur(u8, (0, 0), 1.2)
+        u8 = np.clip(u8.astype(np.float32) * (1.0 + amt)
+                     - blur.astype(np.float32) * amt, 0, 255).astype(np.uint8)
+
+    return u8.astype(np.float32) / 255.0
 
 
 # ---------------------------------------------------
@@ -1441,6 +1508,7 @@ def build_jitterless_boxes(
     safety_margin=1.0,
     containment_boxes=None,
     containment_tolerance=0.0,
+    aspect_ratios=None,
 ):
     """Build the jitterless per-frame square crop boxes.
 
@@ -1564,6 +1632,34 @@ def build_jitterless_boxes(
                 n_shifted += 1
             centers[i, 0], centers[i, 1] = new_cx, new_cy
 
+    # Aspect (height/width). Wan-Animate's own crop is NOT square: its
+    # get_face_bboxes expands the face box by an AREA factor and biases the
+    # top edge 3x harder than the bottom (forehead/hair in, chin tight), so
+    # a typical box is ~1.25 taller than wide, and that non-square tile is
+    # what gets resized to 512x512 for the encoder. Forcing a square crop
+    # here fed the Face Adapter a framing it was never trained on. Smoothing
+    # the aspect (rather than taking it raw per frame) keeps it jitter-free.
+    if aspect_ratios is None:
+        aspects = np.ones((B,), dtype=np.float32)
+    else:
+        aspects = np.clip(
+            np.asarray(aspect_ratios, dtype=np.float32).reshape(-1), 0.25, 4.0)
+        if aspects.shape[0] != B:
+            aspects = np.resize(aspects, (B,))
+        aspects = _smooth_1d(
+            aspects, method=str(smoothing_method),
+            ema_strength=face_smoothing_strength, scale_norm=1.0,
+            one_euro_min_cutoff=one_euro_min_cutoff,
+            one_euro_beta=(one_euro_beta if size_one_euro_beta is None
+                           else float(size_one_euro_beta)),
+            gaussian_window=int(gaussian_window),
+        )
+        aspects = np.clip(aspects, 0.25, 4.0)
+        if lock_size:
+            # A locked crop must also hold a locked SHAPE, or the tile's
+            # framing breathes frame to frame even though its width does not.
+            aspects = np.full((B,), float(np.median(aspects)), dtype=np.float32)
+
     boxes = []
     for i in range(B):
         size_i_int = int(round(float(sizes[i])))
@@ -1576,9 +1672,10 @@ def build_jitterless_boxes(
         # centred on the tracked point even when it hangs off the frame;
         # _crop_with_padding() edge-pads at extraction so the tile is still
         # full-size and the face is still dead-centre.
+        h_i_int = max(8, min(int(round(size_i_int * float(aspects[i]))), int(max(H, max_side))))
         x1 = int(round(float(centers[i, 0] - half)))
-        y1 = int(round(float(centers[i, 1] - half)))
-        boxes.append((x1, x1 + size_i_int, y1, y1 + size_i_int))
+        y1 = int(round(float(centers[i, 1] - h_i_int / 2.0)))
+        boxes.append((x1, x1 + size_i_int, y1, y1 + h_i_int))
     build_jitterless_boxes.last_stats = {
         "shifted": n_shifted, "too_small": n_too_small, "frames": B,
     }
@@ -1627,6 +1724,13 @@ class PoseAndFaceDetectionV2:
                 "pose_threshold":      ("FLOAT", {"default": 0.3,  "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "Per-keypoint score threshold. Below this a keypoint is treated as missing."}),
                 # Enhancement options
                 "use_clahe": ("BOOLEAN", {"default": True, "tooltip": "Apply CLAHE contrast enhancement for pose detection."}),
+                "clahe_clip_limit": ("FLOAT", {"default": 2.0, "min": 0.5, "max": 8.0, "step": 0.1, "tooltip": "CLAHE contrast-limit. Higher = stronger local contrast, which helps a flat/hazy or backlit shot but starts amplifying grain. 2.0 is the long-standing default; try 3-4 for genuinely flat footage. Only used when use_clahe is on."}),
+                "clahe_grid_size": ("INT", {"default": 8, "min": 1, "max": 16, "tooltip": "CLAHE tile grid (NxN). Smaller = more global/gentler; larger = more aggressively local, which can rescue a face lost in shadow but may introduce tile seams. Only used when use_clahe is on."}),
+                "detect_gamma": ("FLOAT", {"default": 1.0, "min": 0.1, "max": 3.0, "step": 0.05, "tooltip": "Gamma applied to the DETECTOR's input only. >1 lifts shadows (a face crushed into darkness becomes detectable), <1 pulls down blown highlights. Applied BEFORE CLAHE so there is signal in range for CLAHE to equalise. 1.0 = off."}),
+                "detect_white_balance": ("BOOLEAN", {"default": False, "tooltip": "Grey-world white balance on the DETECTOR's input only. Equalises the per-channel means to remove a colour cast (tungsten, underwater, heavy LUT). Skin tone drifting off-neutral is a common cause of low face-detection confidence. Runs first, so CLAHE is not amplifying a cast."}),
+                "detect_denoise": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05, "tooltip": "Edge-preserving (bilateral) denoise on the DETECTOR's input only. For grainy/high-ISO or heavily compressed footage where noise costs keypoint precision. Bilateral rather than blur so ViTPose keeps the edges it localises from. Runs before sharpen so noise is never sharpened. 0 = off."}),
+                "detect_sharpen": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 2.0, "step": 0.05, "tooltip": "Unsharp-mask amount on the DETECTOR's input only. Recovers landmark precision on soft/out-of-focus or upscaled footage. Runs after denoise. Overdoing it creates halos that pull landmarks toward edges — 0.3-0.6 is usually plenty. 0 = off."}),
+                "detect_saturation": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05, "tooltip": "Chroma scale on the DETECTOR's input only. Slightly boosting saturation can separate skin from a similarly-lit background; dropping toward 0 makes detection effectively luma-only, which occasionally helps on heavily colour-graded footage. 1.0 = off."}),
                 "use_blur_for_pose": ("BOOLEAN", {"default": False, "tooltip": "Apply Gaussian blur internally for YOLO and ViTPose BEFORE detection. Bug-fix (default was True): this softens the exact edges/fine detail ViTPose needs for keypoint precision, producing a visibly blurrier preview and a less accurate skeleton for every user until they discovered and disabled it. Only enable this for genuinely noisy/grainy source footage."}),
                 "blur_radius": ("INT", {"default": 5, "min": 1, "max": 20, "step": 1, "tooltip": "Gaussian blur kernel radius applied to the face mask edge to soften the boundary. Higher = wider feather. Kernel size = radius*2+1 px."}),
                 "blur_sigma": ("FLOAT", {"default": 2.0, "min": 0.1, "max": 5.0, "step": 0.1, "tooltip": "Gaussian blur sigma (standard deviation) for the face mask feather. Higher sigma = softer falloff. Tune together with blur_radius."}),
@@ -1668,6 +1772,7 @@ class PoseAndFaceDetectionV2:
                 "crop_containment_check": ("BOOLEAN", {"default": True, "tooltip": "HARD per-frame guarantee that the actual detected face bbox ends up inside the final crop. After smoothing, any frame whose face escapes the crop is corrected. In 'jitterless' the correction SHIFTS the crop (the exact-size lock is preserved); growing would silently break the lock, so a face genuinely larger than the locked size is reported in the log instead — that means face_box_size_px / crop_safety_margin is too small for the shot. In 'auto' the crop may grow. Correction counts are logged."}),
                 "crop_containment_tolerance": ("INT", {"default": 4, "min": 0, "max": 128, "tooltip": "Extra pixels of slack required around the detected face bbox when crop_containment_check tests containment."}),
                 "auto_smoothing_method": (["legacy_ema", "one_euro", "ema", "gaussian", "none"], {"default": "legacy_ema", "tooltip": "Which filter crop_mode='auto' uses. 'legacy_ema' keeps auto's original bespoke EMA byte-for-byte (the default, so existing workflows are untouched); the others route auto through the same shared filters jitterless uses, honouring crop_one_euro_* / crop_gaussian_window. Ignored unless crop_mode='auto'."}),
+                "preserve_face_aspect": ("BOOLEAN", {"default": True, "tooltip": "Frame the face crop the way Wan-Animate itself does. Its get_face_bboxes expands the face box by an AREA factor and biases the TOP edge 3x harder than the bottom (forehead/hair in, chin tight), producing a NON-square tile ~1.25x taller than wide, which is then resized to 512x512 for the Face Adapter (paper arXiv:2509.14055 sec 3.3). This pack previously forced a SQUARE crop in both 'auto' and 'jitterless', handing the encoder a framing it was never trained on — the most likely reason expression pickup felt weak. ON = reproduce the paper's aspect in every crop mode (recommended). OFF = legacy square crop. crop_mode='default' passes the paper box through untouched either way."}),
                 "force_eyes_open": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05, "tooltip": "Force closed/blinking eyes open. 0 = off (default). 1 = fully open to a natural EAR of ~0.30; intermediate values blend.\n\nThis REACHES THE MODEL because it pairs with DrawViTPoseV2's apply_pose_edits_to_face warp: Wan-Animate's face conditioning is 100%% pixel-driven (landmarks only place the crop, the LIA motion encoder reads raw crop pixels), so this node writes opened-eye LANDMARKS and DrawViTPoseV2 warps the actual crop PIXELS to match — using each frame's own crop as the source, so identity, head pose, mouth and lighting are preserved and only the eye aperture changes. Wire face_images/face_images_512 -> DrawViTPoseV2.face_images and leave apply_pose_edits_to_face='warp' (the default) or this does nothing visible.\n\nOnly ever opens, never closes; eye corners stay fixed so the warp stays local."}),
                 "eye_open_mode": (["blinks_only", "all_frames"], {"default": "blinks_only", "tooltip": "Which frames force_eyes_open targets. 'blinks_only' = only frames whose measured Eye-Aspect-Ratio falls below eye_open_blink_ear (keeps natural performance, removes blinks). 'all_frames' = whole-shot override, for when the subject squints throughout."}),
                 "eye_open_blink_ear": ("FLOAT", {"default": 0.18, "min": 0.01, "max": 0.40, "step": 0.01, "tooltip": "Eye-Aspect-Ratio below which a frame counts as a blink for eye_open_mode='blinks_only'. A natural open eye is ~0.28-0.35, a full blink ~0.05-0.15. Raise toward 0.22 to also catch heavy-lidded frames."}),
@@ -1783,6 +1888,14 @@ class PoseAndFaceDetectionV2:
         force_eyes_open=0.0,
         eye_open_mode="blinks_only",
         eye_open_blink_ear=0.18,
+        preserve_face_aspect=True,
+        clahe_clip_limit=2.0,
+        clahe_grid_size=8,
+        detect_gamma=1.0,
+        detect_white_balance=False,
+        detect_denoise=0.0,
+        detect_sharpen=0.0,
+        detect_saturation=1.0,
     ):
         if not isinstance(images, torch.Tensor) or images.ndim != 4 or images.shape[-1] != 3:
             raise ValueError(
@@ -1849,6 +1962,14 @@ class PoseAndFaceDetectionV2:
                 force_eyes_open,
                 eye_open_mode,
                 eye_open_blink_ear,
+                preserve_face_aspect,
+                clahe_clip_limit,
+                clahe_grid_size,
+                detect_gamma,
+                detect_white_balance,
+                detect_denoise,
+                detect_sharpen,
+                detect_saturation,
             )
 
     def _process_impl(
@@ -1915,6 +2036,14 @@ class PoseAndFaceDetectionV2:
         force_eyes_open=0.0,
         eye_open_mode="blinks_only",
         eye_open_blink_ear=0.18,
+        preserve_face_aspect=True,
+        clahe_clip_limit=2.0,
+        clahe_grid_size=8,
+        detect_gamma=1.0,
+        detect_white_balance=False,
+        detect_denoise=0.0,
+        detect_sharpen=0.0,
+        detect_saturation=1.0,
     ):
         detector = model["yolo"]
         pose_model = model["vitpose"]
@@ -1969,7 +2098,11 @@ class PoseAndFaceDetectionV2:
                     _ref_bbox = np.array([0, 0, _rt_np.shape[1], _rt_np.shape[0], 1.0], dtype=np.float32)
                 _rc, _rs = bbox_from_detector(_ref_bbox, input_resolution, rescale=rescale)
                 _ref_crop = crop(_rt_np, _rc, _rs, (input_resolution[0], input_resolution[1]))[0]
-                _ref_crop = preprocess_for_pose(_ref_crop, use_clahe)
+                _ref_crop = preprocess_for_pose(_ref_crop, use_clahe,
+                                       clahe_clip=clahe_clip_limit, clahe_grid=clahe_grid_size,
+                                       gamma=detect_gamma, white_balance=detect_white_balance,
+                                       denoise=detect_denoise, sharpen=detect_sharpen,
+                                       saturation=detect_saturation)
                 _ref_norm = ((_ref_crop - IMG_NORM_MEAN) / IMG_NORM_STD).transpose(2, 0, 1).astype(np.float32)
                 _ref_kp = pose_model(_ref_norm[None], np.array(_rc)[None], np.array(_rs)[None])
                 refer_pose_meta = load_pose_metas_from_kp2ds_seq(
@@ -2026,7 +2159,11 @@ class PoseAndFaceDetectionV2:
             center, scale = bbox_from_detector(bbox_use, input_resolution, rescale=rescale)
             img_crop = crop(img, center, scale, (input_resolution[0], input_resolution[1]))[0]
 
-            img_crop = preprocess_for_pose(img_crop, use_clahe)
+            img_crop = preprocess_for_pose(img_crop, use_clahe,
+                                       clahe_clip=clahe_clip_limit, clahe_grid=clahe_grid_size,
+                                       gamma=detect_gamma, white_balance=detect_white_balance,
+                                       denoise=detect_denoise, sharpen=detect_sharpen,
+                                       saturation=detect_saturation)
             img_norm = (img_crop - IMG_NORM_MEAN) / IMG_NORM_STD
             img_norm = img_norm.transpose(2, 0, 1).astype(np.float32)
 
@@ -2064,11 +2201,18 @@ class PoseAndFaceDetectionV2:
         # --- Convert to centers and raw face sizes (for smoothing) ---
         raw_centers = []
         raw_face_sizes = []
+        raw_face_aspects = []
         for (x1, x2, y1, y2) in raw_face_bboxes:
             cx = 0.5 * (x1 + x2)
             cy = 0.5 * (y1 + y2)
             raw_centers.append(np.array([cx, cy], dtype=np.float32))
             raw_face_sizes.append(float(max(x2 - x1, y2 - y1)))
+            # Wan-Animate's own crop is non-square (area-scaled + 3x upward
+            # bias); keep the paper's aspect so the tile we hand the encoder
+            # is framed the way it was trained. Width drives the size, aspect
+            # restores the height.
+            _bw, _bh = float(x2 - x1), float(y2 - y1)
+            raw_face_aspects.append(_bh / max(_bw, 1.0))
 
         crop_mode_str = str(crop_mode)
         jitterless = crop_mode_str == "jitterless"
@@ -2236,6 +2380,7 @@ class PoseAndFaceDetectionV2:
                 safety_margin=float(crop_safety_margin),
                 containment_boxes=(raw_face_bboxes if crop_containment_check else None),
                 containment_tolerance=float(crop_containment_tolerance),
+                aspect_ratios=(raw_face_aspects if preserve_face_aspect else None),
             )
             _cstats = getattr(build_jitterless_boxes, "last_stats", {}) or {}
             if _cstats.get("shifted") or _cstats.get("too_small"):
@@ -2340,12 +2485,21 @@ class PoseAndFaceDetectionV2:
                             if abs(n_cx - cx) > 1e-3 or abs(n_cy - cy) > 1e-3:
                                 _auto_shift += 1
                             cx, cy = n_cx, n_cy
-                    # Clamp so the square stays in bounds
-                    x1 = int(np.clip(cx - half, 0, W - _auto_side))
-                    y1 = int(np.clip(cy - half, 0, H - _auto_side))
-                    x2 = x1 + _auto_side
-                    y2 = y1 + _auto_side
-                    face_bboxes.append((x1, x2, y1, y2))
+                    # Paper framing: reproduce Wan-Animate's non-square,
+                    # top-biased crop instead of forcing a square (see
+                    # preserve_face_aspect). Height follows the tracked
+                    # aspect; width is the constant box side.
+                    if preserve_face_aspect and _i < len(raw_face_aspects):
+                        _asp = float(np.clip(raw_face_aspects[_i], 0.25, 4.0))
+                    else:
+                        _asp = 1.0
+                    _auto_h = max(8, int(round(_auto_side * _asp)))
+                    # NOT clamped into the frame — _crop_with_padding edge-pads
+                    # at extraction so the face stays centred (same fix as
+                    # jitterless; clamping here pushed the face off-centre too).
+                    x1 = int(round(cx - _auto_side / 2.0))
+                    y1 = int(round(cy - _auto_h / 2.0))
+                    face_bboxes.append((x1, x1 + _auto_side, y1, y1 + _auto_h))
                 if _auto_shift:
                     logging.getLogger(__name__).info(
                         "PoseAndFaceDetectionV2 [auto]: containment shifted %d/%d frames "
