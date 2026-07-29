@@ -2548,9 +2548,51 @@ class PoseAndFaceDetectionV2:
         _BLUR_THRESH = 50.0
         for _idx in range(1, len(face_bboxes)):
             _x1, _x2, _y1, _y2 = face_bboxes[_idx]
-            _candidate = images_np[_idx][_y1:_y2, _x1:_x2]
+            # MUST go through _crop_with_padding, not a raw numpy slice: crop
+            # boxes may now legitimately have NEGATIVE origins (that is how the
+            # face stays centred near a frame edge), and numpy reads a negative
+            # index as "from the end", so `images_np[i][-90:374]` silently
+            # yields an EMPTY array rather than the intended crop. That made
+            # this whole blur-hold check a no-op on exactly the frames where
+            # the box hangs off-frame.
+            _candidate = _crop_with_padding(images_np[_idx], _x1, _x2, _y1, _y2)
             if _candidate.size and compute_frame_blur_score(_candidate) < _BLUR_THRESH:
                 face_bboxes[_idx] = face_bboxes[_idx - 1]
+
+        # --- Centring self-check (always logged) -------------------------
+        # Reports how far the DETECTED face centre sits from the centre of the
+        # tile that actually ships as face_images. This is the number to look
+        # at when the face "looks offset" — it is measured on the real boxes,
+        # so it answers the question directly instead of eyeballing a sampler
+        # preview (which is mid-denoise and proves nothing about the crop).
+        try:
+            _offs = []
+            for _i, (_bx1, _bx2, _by1, _by2) in enumerate(face_bboxes):
+                if _i >= len(raw_centers):
+                    break
+                _tw = max(1, _bx2 - _bx1)
+                _th = max(1, _by2 - _by1)
+                _dx = float(raw_centers[_i][0]) - (_bx1 + _bx2) / 2.0
+                _dy = float(raw_centers[_i][1]) - (_by1 + _by2) / 2.0
+                _offs.append(math.hypot(_dx / _tw, _dy / _th))
+            if _offs:
+                _mx = max(_offs)
+                _lvl = logging.WARNING if _mx > 0.20 else logging.INFO
+                logging.getLogger(__name__).log(
+                    _lvl,
+                    "PoseAndFaceDetectionV2 [%s]: face-centre offset within the "
+                    "face_images tile — mean %.1f%%, max %.1f%% of tile "
+                    "(0%% = perfectly centred; >20%% is visibly off and the face "
+                    "encoder will struggle). Tile %dx%d.%s",
+                    crop_mode_str, 100.0 * float(np.mean(_offs)), 100.0 * _mx,
+                    face_bboxes[0][1] - face_bboxes[0][0],
+                    face_bboxes[0][3] - face_bboxes[0][2],
+                    ("  Raise crop_safety_margin / lower face_box_size_px, or "
+                     "use crop_mode='default' for the paper's exact per-frame "
+                     "face-tight crop." if _mx > 0.20 else ""),
+                )
+        except Exception:  # noqa: BLE001 — diagnostics must never break the node
+            pass
 
         # --- Face crops from sharp original frames ---
         # PAD, don't clamp (2026-07-24 bug fix). A crop box may legitimately
