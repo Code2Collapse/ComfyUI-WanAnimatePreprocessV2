@@ -1672,7 +1672,23 @@ def build_jitterless_boxes(
         # centred on the tracked point even when it hangs off the frame;
         # _crop_with_padding() edge-pads at extraction so the tile is still
         # full-size and the face is still dead-centre.
-        h_i_int = max(8, min(int(round(size_i_int * float(aspects[i]))), int(max(H, max_side))))
+        # Aspect-preserving fit. If the aspect-derived height does not fit the
+        # frame, scale BOTH sides down together — clamping the height alone
+        # silently rewrites the aspect (measured: a 512 box at the paper's
+        # 1.25 on 832x480 footage became 512x480 = 0.94, which is neither the
+        # paper framing nor the old square).
+        a_i = float(aspects[i])
+        w_i = float(size_i_int)
+        h_i = w_i * a_i
+        if h_i > H:
+            h_i = float(H)
+            w_i = h_i / max(a_i, 1e-6)
+        if w_i > W:
+            w_i = float(W)
+            h_i = w_i * a_i
+        size_i_int = max(8, int(round(w_i)))
+        h_i_int = max(8, int(round(h_i)))
+        half = size_i_int / 2.0
         x1 = int(round(float(centers[i, 0] - half)))
         y1 = int(round(float(centers[i, 1] - h_i_int / 2.0)))
         boxes.append((x1, x1 + size_i_int, y1, y1 + h_i_int))
@@ -2493,7 +2509,17 @@ class PoseAndFaceDetectionV2:
                         _asp = float(np.clip(raw_face_aspects[_i], 0.25, 4.0))
                     else:
                         _asp = 1.0
-                    _auto_h = max(8, int(round(_auto_side * _asp)))
+                    # Aspect-preserving fit (same rule as jitterless): scale
+                    # BOTH sides if the height will not fit, never clamp the
+                    # height alone — that silently rewrites the aspect.
+                    _aw, _ah = float(_auto_side), float(_auto_side) * _asp
+                    if _ah > H:
+                        _ah = float(H); _aw = _ah / max(_asp, 1e-6)
+                    if _aw > W:
+                        _aw = float(W); _ah = _aw * _asp
+                    _auto_side = max(8, int(round(_aw)))
+                    _auto_h = max(8, int(round(_ah)))
+                    half = _auto_side / 2.0
                     # NOT clamped into the frame — _crop_with_padding edge-pads
                     # at extraction so the face stays centred (same fix as
                     # jitterless; clamping here pushed the face off-centre too).
