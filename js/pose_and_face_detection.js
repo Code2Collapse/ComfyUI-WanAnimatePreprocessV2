@@ -55,9 +55,21 @@ function applyVisibility(node) {
     const blendGaze  = !!get("use_blendshape_gaze")?.value;
     const cropMode   = String(get("crop_mode")?.value ?? "default");
     const jitterless = cropMode === "jitterless";
+    const refSmooth  = cropMode === "reference_smooth";
     const auto       = cropMode === "auto";
     const smoothing  = String(get("smoothing_method")?.value ?? "one_euro");
-    const cropActive = jitterless || auto;          // crop_mode="default" = crop off
+    const autoSm     = String(get("auto_smoothing_method")?.value ?? "legacy_ema");
+    const cropActive = jitterless || auto;          // modes that BUILD their own box
+    // Which shared temporal filter is actually running, per mode. auto has its
+    // own selector and ignores smoothing_method entirely; reference_smooth and
+    // jitterless share smoothing_method. Getting this wrong is what hid the
+    // one_euro knobs from the modes that use them.
+    const filtered   = jitterless || refSmooth || auto;
+    const method     = auto ? autoSm : smoothing;
+    const oneEuro    = filtered && method === "one_euro";
+    const gaussian   = filtered && method === "gaussian";
+    const emaLike    = method === "ema" || method === "legacy_ema";
+    const useClahe   = !!get("use_clahe")?.value;
     const gazeEngine = String(get("gaze_engine")?.value ?? "l2cs_gaze360");
     const eyeAlign   = String(get("eye_align_mode")?.value ?? "default");
     const auAmp      = Number(get("au_amplify")?.value ?? 1.0);
@@ -72,11 +84,19 @@ function applyVisibility(node) {
     const visible = {
         blur_radius:                useBlur,
         blur_sigma:                 useBlur,
+        // CLAHE sub-options — the backend skips both when use_clahe is off
+        clahe_clip_limit:           useClahe,
+        clahe_grid_size:            useClahe,
         // face smoothing / constant-box only matter for crop_mode = auto
         use_face_smoothing:         auto,
-        face_smoothing_strength:    auto && faceSmooth,
+        // strength is the EMA coefficient — it does nothing under one_euro or
+        // gaussian, but it IS live for every ema-family method in every mode.
+        face_smoothing_strength:    (auto && faceSmooth && emaLike) || (filtered && emaLike),
         use_constant_face_box:      auto,
-        face_box_size_px:           auto && constBox,
+        // Also the jitterless anchor size: with frame0_size unset, this widget
+        // IS the locked crop size, so hiding it there left that mode's single
+        // most important control unreachable.
+        face_box_size_px:           (auto && constBox) || jitterless,
         // iris smoothing sub-options
         iris_smoothing_strength:    irisSmooth,
         iris_smoothing_method:      irisSmooth,
@@ -93,18 +113,24 @@ function applyVisibility(node) {
         frame0_cy:                  jitterless,
         frame0_size:                jitterless,
         keyframes_json:             jitterless,
-        smoothing_method:           jitterless,
-        crop_one_euro_min_cutoff:   jitterless && smoothing === "one_euro",
-        crop_one_euro_beta:         jitterless && smoothing === "one_euro",
-        crop_gaussian_window:       jitterless && smoothing === "gaussian",
-        // crop hardening — meaningless when crop_mode="default" (crop off)
-        crop_safety_margin:         cropActive,
+        // auto picks its filter with auto_smoothing_method instead
+        smoothing_method:           jitterless || refSmooth,
+        crop_one_euro_min_cutoff:   oneEuro,
+        crop_one_euro_beta:         oneEuro,
+        crop_gaussian_window:       gaussian,
+        // crop hardening — meaningless when crop_mode="default" (crop off).
+        // safety_margin is honoured by reference_smooth too; containment is
+        // not (that mode's box IS the detected box, so it always contains it).
+        crop_safety_margin:         cropActive || refSmooth,
         crop_containment_check:     cropActive,
         crop_containment_tolerance: cropActive && containOn,
-        // size trajectory only exists where the size is allowed to vary:
-        // auto, or jitterless driven by explicit key-frame sizes.
-        crop_size_one_euro_beta:    cropActive && smoothing === "one_euro",
+        // separate beta for the size/scale trajectory — only the two modes
+        // that filter w/h read it, and only under one_euro.
+        crop_size_one_euro_beta:    (jitterless || refSmooth) && smoothing === "one_euro",
         auto_smoothing_method:      auto,
+        // aspect override is applied while BUILDING a box; reference_smooth
+        // keeps the detected aspect by construction and default does no crop.
+        preserve_face_aspect:       cropActive,
         // eye-open override sub-options
         eye_open_mode:              eyesOpen,
         eye_open_blink_ear:         eyesOpen && String(get("eye_open_mode")?.value) === "blinks_only",
@@ -146,6 +172,7 @@ app.registerExtension({
             // not just a `visible` entry — otherwise toggling it re-renders
             // nothing until some other widget happens to fire.
             for (const n of [
+                "use_clahe",
                 "use_blur_for_pose", "use_face_smoothing", "use_constant_face_box",
                 "use_iris_smoothing", "iris_smoothing_method", "gaze_lock_eyes",
                 "use_blendshape_gaze", "crop_mode", "smoothing_method",
