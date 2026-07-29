@@ -125,12 +125,74 @@ MAX_GAZE_PITCH_RAD = math.radians(25.0)
 # ---------------------------------------------------------------------------
 # Model loading
 # ---------------------------------------------------------------------------
+MODEL_FILENAME = "face_landmarker.task"
+
+
+def _register_folder_path() -> None:
+    """Register a ``mediapipe`` key with folder_paths, the same mechanism
+    OnnxDetectionModelLoaderV2's .onnx models use, so the .task file is a
+    first-class ComfyUI model rather than a hardcoded path. Idempotent and
+    never fatal — outside ComfyUI this is simply a no-op."""
+    try:
+        import folder_paths  # type: ignore
+        key = "mediapipe"
+        base = os.path.join(folder_paths.models_dir, key)
+        os.makedirs(base, exist_ok=True)
+        existing = folder_paths.folder_names_and_paths.get(key)
+        if existing is None:
+            folder_paths.folder_names_and_paths[key] = ([base], {".task"})
+        else:
+            paths, exts = existing[0], existing[1]
+            if base not in paths:
+                paths.append(base)
+            try:
+                exts.add(".task")
+            except AttributeError:
+                pass
+    except Exception:  # noqa: BLE001 — folder_paths absent (unit tests)
+        pass
+
+
+def _candidate_model_paths() -> list:
+    """Every place face_landmarker.task may legitimately live, best first.
+
+    Searched (not hardcoded to one):
+      1. any path registered under the ``mediapipe`` folder_paths key,
+      2. ``ComfyUI/models/mediapipe/face_landmarker.task`` (our default,
+         and where the auto-download writes),
+      3. ``ComfyUI/models/face_landmarker.task`` (bare models/ root — some
+         users drop it here, so accept it rather than silently ignoring it),
+      4. ``<this pack>/models/mediapipe/`` for use outside ComfyUI.
+    """
+    out = []
+    try:
+        import folder_paths  # type: ignore
+        try:
+            p = folder_paths.get_full_path("mediapipe", MODEL_FILENAME)
+            if p:
+                out.append(p)
+        except Exception:
+            pass
+        out.append(os.path.join(folder_paths.models_dir, "mediapipe", MODEL_FILENAME))
+        out.append(os.path.join(folder_paths.models_dir, MODEL_FILENAME))
+    except Exception:
+        pass
+    out.append(os.path.join(os.path.dirname(__file__), "models", "mediapipe", MODEL_FILENAME))
+    seen, uniq = set(), []
+    for p in out:
+        if p and p not in seen:
+            seen.add(p)
+            uniq.append(p)
+    return uniq
+
+
 def _resolve_model_dir() -> str:
-    """Locate ``ComfyUI/models/mediapipe`` via folder_paths.
+    """Directory the auto-download writes into (``ComfyUI/models/mediapipe``).
 
     Falls back to a local ``models/mediapipe`` directory inside this pack
     if folder_paths cannot be imported (e.g. unit tests outside ComfyUI).
     """
+    _register_folder_path()
     try:
         import folder_paths  # type: ignore
         base = os.path.join(folder_paths.models_dir, "mediapipe")
@@ -143,7 +205,11 @@ def _resolve_model_dir() -> str:
 def _ensure_model_file() -> Optional[str]:
     """Return absolute path to ``face_landmarker.task`` (download if missing)."""
     global _DOWNLOAD_FAILED
-    path = os.path.join(_resolve_model_dir(), "face_landmarker.task")
+    # Accept the model wherever the user actually put it before downloading.
+    for cand in _candidate_model_paths():
+        if os.path.isfile(cand) and os.path.getsize(cand) > 100_000:
+            return cand
+    path = os.path.join(_resolve_model_dir(), MODEL_FILENAME)
     if os.path.isfile(path) and os.path.getsize(path) > 100_000:
         return path
     if _DOWNLOAD_FAILED:

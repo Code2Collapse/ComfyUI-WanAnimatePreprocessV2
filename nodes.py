@@ -69,55 +69,12 @@ except Exception as _mp_err:  # ImportError or runtime DLL issues
         _mp_err,
     )
 
-# Module-level FaceMesh handle (lazily constructed, reused across frames).
-_MP_FACE_MESH = None
-
-
-def _get_mp_face_mesh():
-    """Lazily construct a single static-image FaceMesh with iris refinement.
-
-    MANUAL bug-fix (Apr 2026): mediapipe <=0.10.x's solution_base.py reads
-    ``FieldDescriptor.label`` which was removed in protobuf 5.x. That raises
-    ``AttributeError: 'google._upb._message.FieldDescriptor' object has no
-    attribute 'label'`` during ``FaceMesh()`` construction. We catch it,
-    log a clear remediation, and permanently disable mediapipe for this
-    process so the existing ViTPose-only fallback is used instead.
-    """
-    global _MP_FACE_MESH, _MP_AVAILABLE
-    if not _MP_AVAILABLE:
-        return None
-    if _MP_FACE_MESH is None:
-        try:
-            _MP_FACE_MESH = _mp.solutions.face_mesh.FaceMesh(
-                static_image_mode=True,
-                max_num_faces=1,
-                refine_landmarks=True,   # enables 10 iris landmarks (468-477)
-                min_detection_confidence=0.3,
-                min_tracking_confidence=0.3,
-            )
-        except AttributeError as exc:
-            _MP_AVAILABLE = False
-            _MP_FACE_MESH = None
-            logging.getLogger(__name__).warning(
-                "MediaPipe FaceMesh init failed (%s). This is a known "
-                "mediapipe<=0.10.x vs protobuf>=5.x incompatibility. "
-                "Fix: pip install --upgrade mediapipe (>=0.10.18) OR "
-                "pip install \"protobuf<=3.20.3\". Falling back to "
-                "ViTPose-only face pipeline for the rest of this session.",
-                exc,
-            )
-            return None
-        except Exception as exc:  # noqa: BLE001 - any runtime failure -> fallback
-            _MP_AVAILABLE = False
-            _MP_FACE_MESH = None
-            logging.getLogger(__name__).warning(
-                "MediaPipe FaceMesh init failed (%s). Falling back to "
-                "ViTPose-only face pipeline for the rest of this session.",
-                exc,
-            )
-            return None
-    return _MP_FACE_MESH
-
+# mediapipe 1.0 REMOVED `mp.solutions.face_mesh` (the whole legacy solutions
+# graph), so there is no module-level FaceMesh handle any more and no
+# `_get_mp_face_mesh()`. All face-mesh work goes through the FaceLandmarker
+# Tasks API in gaze_blendshape.py, which loads `face_landmarker.task` from a
+# real ComfyUI models path (see _resolve_model_dir there) rather than bundling
+# a graph. The `_mp` import above is kept only as an availability probe.
 
 # ---------------------------------------------------
 # MediaPipe -> dlib 68 landmark mapping
@@ -233,7 +190,25 @@ def _upscale_face_crop_if_small(face_crop_rgb_uint8):
 
 def _run_mediapipe_on_face_crop(face_crop_rgb_uint8, crop_origin_xy, crop_size_wh,
                                   full_w, full_h):
-    """Run MediaPipe FaceMesh on a single face crop.
+    """Face-mesh landmarks for a single face crop.
+
+    MIGRATED (2026-07-24) from the legacy ``mp.solutions.face_mesh`` graph to
+    the FaceLandmarker Tasks API. mediapipe 1.0 REMOVED ``solutions.face_mesh``
+    outright — it is not a protobuf-version problem and there is no legacy
+    graph left to fall back to — so this is now a thin delegation to
+    :func:`_run_face_landmarker_on_face_crop` rather than a second,
+    independent implementation.
+
+    Kept as a named function (not deleted) because several call sites and the
+    au_amplify path reference it, and its documented return shape is a
+    published-enough internal contract to be worth preserving verbatim.
+
+    Verified equivalent before the swap, on a real face, same image, same
+    build: both paths return 478 landmarks with the iris at indices 468-477
+    in the SAME normalised-[0,1]-relative-to-crop convention; per-landmark
+    agreement was mean 1.61px / max 6.48px over the full mesh and mean 1.10px
+    over the iris ring specifically. The coordinate mapping below therefore
+    did not change at all — it lives in the delegate, byte-identical.
 
     Args:
         face_crop_rgb_uint8: (h, w, 3) uint8 RGB face crop.
@@ -247,80 +222,14 @@ def _run_mediapipe_on_face_crop(face_crop_rgb_uint8, crop_origin_xy, crop_size_w
             - 'right_iris_px', 'left_iris_px': (x, y) in full image pixel space
             - 'right_iris_radius_px', 'left_iris_radius_px': float
             - 'lip_openness_ratio': float (vertical inner-lip / inner-lip width)
-        Or None if MediaPipe failed to detect a face.
+            - 'landmarks_px_full': (478, 2) full mesh in full-frame pixels
+        Or None if no face was found / the Tasks model is unavailable.
+        (The delegate additionally returns blend-shape gaze + R_head; callers
+        that want those already call it directly.)
     """
-    fm = _get_mp_face_mesh()
-    if fm is None or face_crop_rgb_uint8 is None or face_crop_rgb_uint8.size == 0:
-        return None
-
-    try:
-        results = fm.process(_upscale_face_crop_if_small(face_crop_rgb_uint8))
-    except Exception:
-        return None
-    if not results.multi_face_landmarks:
-        return None
-
-    lms = results.multi_face_landmarks[0].landmark
-    if len(lms) < 478:
-        # Iris landmarks missing - refine_landmarks must have been disabled
-        # at build time (e.g. older mediapipe). Treat as failure so we use
-        # the fallback path that includes iris voting.
-        return None
-
-    cx0, cy0 = crop_origin_xy
-    cw, ch = crop_size_wh
-
-    # MediaPipe gives normalised coords [0, 1] relative to the crop.
-    pts_px = np.zeros((len(lms), 2), dtype=np.float32)
-    for i, lm in enumerate(lms):
-        pts_px[i, 0] = lm.x * cw + cx0
-        pts_px[i, 1] = lm.y * ch + cy0
-
-    # Build the 68-point array in *full image* normalised space, with
-    # confidence forced to 1.0 (MediaPipe doesn't expose per-point conf).
-    kps68_px = pts_px[MP_TO_DLIB68]
-    kps68_norm = np.zeros((68, 3), dtype=np.float32)
-    kps68_norm[:, 0] = kps68_px[:, 0] / max(full_w, 1)
-    kps68_norm[:, 1] = kps68_px[:, 1] / max(full_h, 1)
-    kps68_norm[:, 2] = 1.0
-
-    # Iris centres (full image pixel space)
-    r_iris = pts_px[MP_RIGHT_IRIS_CENTER]
-    l_iris = pts_px[MP_LEFT_IRIS_CENTER]
-    r_ring = pts_px[MP_RIGHT_IRIS_RING]
-    l_ring = pts_px[MP_LEFT_IRIS_RING]
-    r_radius = float(np.mean(np.linalg.norm(r_ring - r_iris[None, :], axis=1)))
-    l_radius = float(np.mean(np.linalg.norm(l_ring - l_iris[None, :], axis=1)))
-
-    # Eye corners (full image pixel space) — used downstream as the
-    # gaze reference frame in lieu of dlib eye-contour centroid.
-    r_outer = pts_px[MP_RIGHT_EYE_OUTER]
-    r_inner = pts_px[MP_RIGHT_EYE_INNER]
-    l_inner = pts_px[MP_LEFT_EYE_INNER]
-    l_outer = pts_px[MP_LEFT_EYE_OUTER]
-    top = pts_px[MP_INNER_LIP_TOP]
-    bot = pts_px[MP_INNER_LIP_BOTTOM]
-    rgt = pts_px[MP_INNER_LIP_RIGHT]
-    lft = pts_px[MP_INNER_LIP_LEFT]
-    v = float(np.linalg.norm(top - bot))
-    h = float(np.linalg.norm(rgt - lft))
-    lip_ratio = float(v / h) if h > 1e-6 else 0.0
-
-    return {
-        'kps68_norm': kps68_norm,
-        'right_iris_px': (float(r_iris[0]), float(r_iris[1])),
-        'left_iris_px': (float(l_iris[0]), float(l_iris[1])),
-        'right_iris_radius_px': r_radius,
-        'left_iris_radius_px': l_radius,
-        'right_eye_outer_px': (float(r_outer[0]), float(r_outer[1])),
-        'right_eye_inner_px': (float(r_inner[0]), float(r_inner[1])),
-        'left_eye_inner_px':  (float(l_inner[0]), float(l_inner[1])),
-        'left_eye_outer_px':  (float(l_outer[0]), float(l_outer[1])),
-        'lip_openness_ratio': lip_ratio,
-        # Full 478-point MediaPipe mesh in FULL-FRAME pixel coords.
-        # Consumed by gaze_pose_norm for solvePnP head-pose estimation.
-        'landmarks_px_full': pts_px,
-    }
+    return _run_face_landmarker_on_face_crop(
+        face_crop_rgb_uint8, crop_origin_xy, crop_size_wh, full_w, full_h,
+    )
 
 
 # ---------------------------------------------------

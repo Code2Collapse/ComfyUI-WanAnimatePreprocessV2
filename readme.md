@@ -1,5 +1,14 @@
 # ComfyUI-WanAnimatePreprocessV2
 
+> ### 📖 Full node & parameter reference
+> **[NODE_REFERENCE.md](NODE_REFERENCE.md)** documents **every node in this pack**:
+> each input's type, default, valid range and what it actually does, plus every
+> output. It is generated directly from the live `NODE_CLASS_MAPPINGS`, so the
+> descriptions there are the *same strings* you see as tooltips in ComfyUI and
+> cannot drift out of date. Start there when you want to know what a knob does;
+> read on here for how the pieces fit together.
+
+
 ## Improved Pose, Face & Iris Detection for Wan Video 2.2 Animate
 
 > Based on GitHub Issue **#1410** (WanVideoPreProcessor) and **#10** (WanAnimatePreProcessor)
