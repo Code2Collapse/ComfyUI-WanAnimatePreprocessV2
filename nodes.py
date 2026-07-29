@@ -1353,11 +1353,34 @@ def _gaussian_window(window):
 
 def _smooth_centers(centers_xy, method, *, ema_strength=0.6, image_diag=1.0,
                     one_euro_min_cutoff=1.0, one_euro_beta=0.05,
-                    gaussian_window=7):
+                    gaussian_window=7, zero_phase=True):
     """Apply a temporal filter to a (B, 2) array of (cx, cy)."""
     centers_xy = np.asarray(centers_xy, dtype=np.float32)
     if centers_xy.ndim != 2 or centers_xy.shape[0] < 2 or method == "none":
         return centers_xy.copy()
+
+    # ZERO-PHASE (2026-07-29). ema and one_euro are CAUSAL: each output only
+    # sees the past, so on any sustained motion the filtered centre trails the
+    # real one by a roughly constant amount. That lag is not jitter — it is a
+    # steady positional bias, and it lands in face_images as the face sitting
+    # consistently to one side of the tile for the whole move. Measured on a
+    # left-to-right pan: 21px mean horizontal offset in a 512 tile for the EMA
+    # path, 18px for one_euro, in the SAME direction on every frame.
+    #
+    # This node is not a streaming filter — the whole clip is already in
+    # memory — so there is no reason to accept causal lag. Running the filter
+    # forwards and backwards and averaging cancels the phase error exactly
+    # (the standard filtfilt trick) while keeping the jitter rejection: the
+    # backward pass lags by the same amount in the opposite direction.
+    # 'gaussian' is already symmetric, hence zero-phase, so it is excluded.
+    if zero_phase and method in ("ema", "one_euro"):
+        _kw = dict(ema_strength=ema_strength, image_diag=image_diag,
+                   one_euro_min_cutoff=one_euro_min_cutoff,
+                   one_euro_beta=one_euro_beta,
+                   gaussian_window=gaussian_window, zero_phase=False)
+        fwd = _smooth_centers(centers_xy, method, **_kw)
+        bwd = _smooth_centers(centers_xy[::-1], method, **_kw)[::-1]
+        return (0.5 * (fwd + bwd)).astype(np.float32)
 
     if method == "ema":
         out = np.empty_like(centers_xy)
@@ -1388,10 +1411,15 @@ def _smooth_centers(centers_xy, method, *, ema_strength=0.6, image_diag=1.0,
     if _GAZE_BS_IMPORTED and _gaze_bs is not None:
         _OEF = getattr(_gaze_bs, "OneEuroFilter", None)
     if _OEF is None:
-        # graceful fallback
+        # Graceful fallback. Must forward zero_phase: without it the fallback
+        # silently re-enabled zero-phase on a caller that explicitly asked for
+        # the causal filter, so the flag did nothing whenever OneEuroFilter was
+        # unavailable.
         return _smooth_centers(centers_xy, "ema",
                                ema_strength=ema_strength,
-                               image_diag=image_diag)
+                               image_diag=image_diag,
+                               gaussian_window=gaussian_window,
+                               zero_phase=zero_phase)
     fx = _OEF(freq=30.0, min_cutoff=one_euro_min_cutoff, beta=one_euro_beta)
     fy = _OEF(freq=30.0, min_cutoff=one_euro_min_cutoff, beta=one_euro_beta)
     out = np.empty_like(centers_xy)
@@ -1403,7 +1431,7 @@ def _smooth_centers(centers_xy, method, *, ema_strength=0.6, image_diag=1.0,
 
 def _smooth_1d(values, method, *, ema_strength=0.6, scale_norm=1.0,
                one_euro_min_cutoff=1.0, one_euro_beta=0.05,
-               gaussian_window=7):
+               gaussian_window=7, zero_phase=True):
     """Temporal filter for a 1-D scalar series (e.g. per-frame crop sizes).
 
     Same methods as _smooth_centers: one_euro (default), ema, gaussian, none.
@@ -1412,6 +1440,19 @@ def _smooth_1d(values, method, *, ema_strength=0.6, scale_norm=1.0,
     values = np.asarray(values, dtype=np.float32)
     if len(values) < 2 or method == "none":
         return values.copy()
+
+    # Zero-phase, for the same reason as _smooth_centers: a causal filter on
+    # the crop SIZE makes the tile trail the subject's real scale change, so
+    # the face keeps drifting toward/away from filling the tile during a
+    # dolly or an approach. See the long note there.
+    if zero_phase and method in ("ema", "one_euro"):
+        _kw = dict(ema_strength=ema_strength, scale_norm=scale_norm,
+                   one_euro_min_cutoff=one_euro_min_cutoff,
+                   one_euro_beta=one_euro_beta,
+                   gaussian_window=gaussian_window, zero_phase=False)
+        fwd = _smooth_1d(values, method, **_kw)
+        bwd = _smooth_1d(values[::-1], method, **_kw)[::-1]
+        return (0.5 * (fwd + bwd)).astype(np.float32)
 
     if method == "gaussian":
         k = _gaussian_window(gaussian_window)
@@ -1435,8 +1476,11 @@ def _smooth_1d(values, method, *, ema_strength=0.6, scale_norm=1.0,
     if _GAZE_BS_IMPORTED and _gaze_bs is not None:
         _OEF = getattr(_gaze_bs, "OneEuroFilter", None)
     if _OEF is None:
+        # forward zero_phase for the same reason as _smooth_centers
         return _smooth_1d(values, "ema", ema_strength=ema_strength,
-                          scale_norm=scale_norm)
+                          scale_norm=scale_norm,
+                          gaussian_window=gaussian_window,
+                          zero_phase=zero_phase)
     f = _OEF(freq=30.0, min_cutoff=one_euro_min_cutoff, beta=one_euro_beta)
     out = np.empty_like(values)
     for i in range(len(values)):
@@ -1451,6 +1495,48 @@ def _smooth_1d(values, method, *, ema_strength=0.6, scale_norm=1.0,
 # centre inside the middle ~24% of the tile, which is imperceptible as
 # "off-centre" but still lets the filter absorb per-frame detector jitter.
 _JITTERLESS_MAX_CENTER_DRIFT_FRAC = 0.12
+
+
+def _locked_crop_side(face_box_size_px, raw_face_bboxes, W, H, mode_label):
+    """Side length for the constant-size crop modes (auto / jitterless).
+
+    ``face_box_size_px`` is an ABSOLUTE pixel size, and that is the problem it
+    exists to solve here. Its old default of 512 has nothing to do with the
+    footage: on a 832x480 clip it clamps to min(W,H)=480, so the node cut a
+    480px window around a face that the detector measured at ~125px. The face
+    then occupied ~26% of the tile and the remaining 74% was background — and
+    after the stretch to 512x512 the face carried roughly a QUARTER of the
+    pixels it should. That is fatal for micro-expressions, which are a few
+    pixels of eyelid and mouth-corner movement, and it also reads as "the face
+    is off to one side" because a small subject inside a large window drifts
+    visibly while a face-tight crop cannot.
+
+    The reference pipeline never does this: it crops face-TIGHT per frame
+    (get_face_bboxes -> that frame's own box), so the face fills the tile by
+    construction. The constant-size modes exist to stop the box breathing, not
+    to detach it from the subject's actual size — so derive the locked side
+    from the DETECTED face and then hold it fixed for the whole clip.
+
+    Returns the median detected face side (robust to a few bad frames), which
+    keeps the reference's face-fill while still being one constant number.
+    ``face_box_size_px > 0`` remains an explicit override.
+    """
+    if face_box_size_px and int(face_box_size_px) > 0:
+        return float(face_box_size_px)
+    sides = [max(float(b[1] - b[0]), float(b[3] - b[2]))
+             for b in (raw_face_bboxes or []) if b is not None]
+    if not sides:
+        return float(min(W, H)) * 0.5
+    side = float(np.median(sides))
+    side = float(np.clip(side, 64.0, float(min(W, H))))
+    logging.getLogger(__name__).info(
+        "PoseAndFaceDetectionV2 [%s]: face_box_size_px=0 (auto) -> locked crop "
+        "side %.0fpx, derived from the median DETECTED face box over %d frames. "
+        "The face fills ~%.0f%% of the tile (a fixed 512 would have given ~%.0f%%).",
+        mode_label, side, len(sides), 100.0,
+        100.0 * side / max(float(min(W, H)), 1.0),
+    )
+    return side
 
 
 def _crop_with_padding(frame, x1, x2, y1, y2):
@@ -1756,7 +1842,7 @@ class PoseAndFaceDetectionV2:
                 # Constant-size face box
                 "use_constant_face_box": ("BOOLEAN", {"default": True, "tooltip": "Keep a constant pixel size face crop; position adapts."}),
                 "face_crop_scale": ("FLOAT", {"default": 1.3, "min": 1.0, "max": 3.0, "step": 0.05, "tooltip": "AREA expansion of the face box, passed straight to get_face_bboxes. 1.3 is the value Wan2.2's own process_pipepline.py uses at both call sites, so 1.3 = reference-exact. LOWER (1.1-1.2) crops tighter, which puts MORE pixels on the face after the 512 resize and is the single most effective knob for micro-expression detail; too low and a head turn can clip the jaw/ear. HIGHER gives more headroom and safety at the cost of face resolution. Applies to every crop_mode."}),
-                "face_box_size_px": ("INT", {"default": 512, "min": 64, "max": 1024, "step": 16, "tooltip": "Pixel size of the square face crop when constant mode is on. Default 512 matches Wan 2.2 Animate's face encoder input size; lower values trigger an extra upscale inside the encoder and waste detail."}),
+                "face_box_size_px": ("INT", {"default": 0, "min": 0, "max": 1024, "step": 16, "tooltip": "Side of the constant-size face crop, in SOURCE pixels, for crop_mode=auto (with use_constant_face_box) and jitterless.\n\n0 = AUTO (recommended): the side is derived from the median DETECTED face box across the clip, then held constant for every frame. You get the reference pipeline's face-tight framing - the face FILLS the tile - while the size still never breathes, which is the whole point of these modes.\n\nA fixed value is an ABSOLUTE pixel size and is almost always wrong unless you know your footage: the old 512 default clamps to min(width,height), so on an 832x480 clip it cut a 480px window around a ~125px face. The face then filled about a quarter of the tile and the rest was background, throwing away roughly 3/4 of the resolution a micro-expression needs and making the subject look off to one side. Set a fixed value only to lock a specific framing across separate renders."}),
                 # Iris estimation
                 "use_iris_smoothing": ("BOOLEAN", {"default": True, "tooltip": "Temporally smooth iris pixel positions across frames. Reduces per-frame jitter that Wan 2.2 Animate's face encoder picks up and reproduces as wobbly gaze."}),
                 "iris_smoothing_strength": ("FLOAT", {"default": 0.4, "min": 0.0, "max": 1.0, "step": 0.05, "tooltip": "EMA mix weight when iris_smoothing_method='ema'. Higher = more smoothing, more lag. Ignored for one_euro / none."}),
@@ -2404,7 +2490,8 @@ class PoseAndFaceDetectionV2:
                 if frame0_size and int(frame0_size) > 0:
                     anchor_size = float(frame0_size)
                 else:
-                    anchor_size = float(face_box_size_px)
+                    anchor_size = _locked_crop_side(
+                        face_box_size_px, raw_face_bboxes, W, H, "jitterless")
             anchor_size = float(np.clip(anchor_size, 8.0, max(W, H)))
             anchor_cx = 0.0 if anchor_cx is None else float(np.clip(anchor_cx, 0.0, W - 1))
             anchor_cy = 0.0 if anchor_cy is None else float(np.clip(anchor_cy, 0.0, H - 1))
@@ -2594,18 +2681,35 @@ class PoseAndFaceDetectionV2:
                 ))
             elif use_face_smoothing and len(raw_centers) > 1:
                 base_strength = float(np.clip(face_smoothing_strength, 0.0, 1.0))
-                smoothed_centers = [raw_centers[0].copy()]
                 norm = max(1.0, (W + H) / 2.0)
-                for i in range(1, len(raw_centers)):
-                    curr = raw_centers[i]
-                    prev = smoothed_centers[-1]
-                    motion = float(np.mean(np.abs(curr - prev)) / norm)
-                    # More motion -> less smoothing
-                    k = 5.0
-                    dynamic_strength = base_strength * np.exp(-motion * k)
-                    alpha = 1.0 - dynamic_strength  # 1=no smoothing, 0=full smoothing
-                    smoothed = alpha * curr + (1.0 - alpha) * prev
-                    smoothed_centers.append(smoothed.astype(np.float32))
+
+                def _legacy_ema(seq):
+                    """auto's own motion-adaptive EMA, unchanged, one direction."""
+                    out = [seq[0].copy()]
+                    for _j in range(1, len(seq)):
+                        curr = seq[_j]
+                        prev = out[-1]
+                        motion = float(np.mean(np.abs(curr - prev)) / norm)
+                        # More motion -> less smoothing
+                        k = 5.0
+                        dynamic_strength = base_strength * np.exp(-motion * k)
+                        alpha = 1.0 - dynamic_strength  # 1=no smoothing, 0=full
+                        out.append((alpha * curr + (1.0 - alpha) * prev).astype(np.float32))
+                    return out
+
+                # Zero-phase, same reason as _smooth_centers. This branch is
+                # auto's bespoke EMA and never went through the shared filter,
+                # so it kept its causal lag after that fix: on a sustained pan
+                # the crop trailed the subject by a near-constant amount and
+                # the face sat to one side of the tile for the whole move
+                # (measured 34px of a 512 tile, always the same direction).
+                # Forward+backward average cancels it; the per-step response is
+                # untouched, so a still subject smooths exactly as before.
+                _fwd = _legacy_ema(raw_centers)
+                _bwd = _legacy_ema(raw_centers[::-1])[::-1]
+                smoothed_centers = [
+                    (0.5 * (a + b)).astype(np.float32) for a, b in zip(_fwd, _bwd)
+                ]
             else:
                 smoothed_centers = raw_centers
 
@@ -2614,8 +2718,9 @@ class PoseAndFaceDetectionV2:
             if use_constant_face_box:
                 # crop_safety_margin also applies here so 'auto' gets the same
                 # protection against filter lag / foreshortened detections.
-                _auto_side = int(round(float(face_box_size_px)
-                                       * max(1.0, float(crop_safety_margin))))
+                _auto_base = _locked_crop_side(
+                    face_box_size_px, raw_face_bboxes, W, H, "auto")
+                _auto_side = int(round(_auto_base * max(1.0, float(crop_safety_margin))))
                 _auto_side = max(8, min(_auto_side, int(min(W, H))))
                 half = _auto_side / 2.0
                 _tol = float(crop_containment_tolerance)
@@ -2647,20 +2752,29 @@ class PoseAndFaceDetectionV2:
                     # Aspect-preserving fit (same rule as jitterless): scale
                     # BOTH sides if the height will not fit, never clamp the
                     # height alone — that silently rewrites the aspect.
+                    # Fit into a LOCAL pair — never back into _auto_side. That
+                    # variable is the clip-wide constant box side; reassigning
+                    # it here fed the fitted (smaller) width into the NEXT
+                    # frame, so one frame that needed shrinking shrank every
+                    # frame after it and the "constant" box decayed down the
+                    # clip. `half` had the same problem: it was recomputed at
+                    # the END of an iteration and then used by the containment
+                    # clamp at the START of the next one, so the clamp window
+                    # was built from a different size than the box, which
+                    # shifted the centre sideways.
                     _aw, _ah = float(_auto_side), float(_auto_side) * _asp
                     if _ah > H:
                         _ah = float(H); _aw = _ah / max(_asp, 1e-6)
                     if _aw > W:
                         _aw = float(W); _ah = _aw * _asp
-                    _auto_side = max(8, int(round(_aw)))
+                    _fit_w = max(8, int(round(_aw)))
                     _auto_h = max(8, int(round(_ah)))
-                    half = _auto_side / 2.0
                     # NOT clamped into the frame — _crop_with_padding edge-pads
                     # at extraction so the face stays centred (same fix as
                     # jitterless; clamping here pushed the face off-centre too).
-                    x1 = int(round(cx - _auto_side / 2.0))
+                    x1 = int(round(cx - _fit_w / 2.0))
                     y1 = int(round(cy - _auto_h / 2.0))
-                    face_bboxes.append((x1, x1 + _auto_side, y1, y1 + _auto_h))
+                    face_bboxes.append((x1, x1 + _fit_w, y1, y1 + _auto_h))
                 if _auto_shift:
                     logging.getLogger(__name__).info(
                         "PoseAndFaceDetectionV2 [auto]: containment shifted %d/%d frames "
