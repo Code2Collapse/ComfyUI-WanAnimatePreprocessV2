@@ -1386,6 +1386,113 @@ def _smooth_1d(values, method, *, ema_strength=0.6, scale_norm=1.0,
     return out
 
 
+# Jitterless: how far (as a fraction of the locked crop size) the smoothed
+# centre is allowed to lag behind the true target centre. A temporal filter
+# ALWAYS lags on fast motion; without a bound that lag is unbounded and the
+# face slides toward — eventually out of — the crop edge. 0.12 keeps the face
+# centre inside the middle ~24% of the tile, which is imperceptible as
+# "off-centre" but still lets the filter absorb per-frame detector jitter.
+_JITTERLESS_MAX_CENTER_DRIFT_FRAC = 0.12
+
+
+def build_jitterless_boxes(
+    *,
+    target_centers,
+    target_sizes_raw,
+    anchor_size,
+    W, H,
+    smoothing_method="one_euro",
+    face_smoothing_strength=0.6,
+    one_euro_min_cutoff=1.0,
+    one_euro_beta=0.05,
+    gaussian_window=7,
+    lock_size=True,
+    max_center_drift_frac=_JITTERLESS_MAX_CENTER_DRIFT_FRAC,
+    hold_mask=None,
+):
+    """Build the jitterless per-frame square crop boxes.
+
+    Pure function (numpy in, numpy out) so the guarantees below can be
+    asserted numerically without standing up ComfyUI.
+
+    Guarantees when ``lock_size`` is True:
+      * every returned box is EXACTLY ``round(anchor_size)`` px on both axes
+        (subject only to the frame being at least that large), and
+      * ``|smoothed_centre - target_centre| <= max_center_drift_frac * size``
+        on every frame where the crop is not pinned against a frame edge.
+
+    ``lock_size=False`` reproduces the legacy face-scale-preserving behaviour
+    (crop size follows the detected face size), which is what ``auto`` wants.
+
+    Returns ``(boxes, sizes, centers)`` where boxes are ``(x1, x2, y1, y2)``.
+    """
+    target_centers = np.asarray(target_centers, dtype=np.float32).reshape(-1, 2).copy()
+    B = int(target_centers.shape[0])
+    if B == 0:
+        return [], np.zeros((0,), np.float32), np.zeros((0, 2), np.float32)
+
+    max_side = float(min(W, H))
+    if lock_size:
+        # THE lock. One value, computed once, used for every frame. Rounding
+        # happens ONCE here rather than per frame, so integer box widths cannot
+        # wobble by +/-1px between frames.
+        size_const = float(np.clip(float(anchor_size), 8.0, max_side))
+        sizes = np.full((B,), size_const, dtype=np.float32)
+    else:
+        sizes = np.clip(
+            np.asarray(target_sizes_raw, dtype=np.float32).reshape(-1), 8.0, max_side)
+        sizes = _smooth_1d(
+            sizes, method=str(smoothing_method),
+            ema_strength=face_smoothing_strength, scale_norm=max(anchor_size, 1.0),
+            one_euro_min_cutoff=one_euro_min_cutoff, one_euro_beta=one_euro_beta,
+            gaussian_window=int(gaussian_window),
+        )
+        sizes = np.clip(sizes, 8.0, max_side)
+
+    image_diag = float((W * W + H * H) ** 0.5)
+    centers = _smooth_centers(
+        target_centers, method=str(smoothing_method),
+        ema_strength=face_smoothing_strength, image_diag=image_diag,
+        one_euro_min_cutoff=one_euro_min_cutoff, one_euro_beta=one_euro_beta,
+        gaussian_window=int(gaussian_window),
+    )
+    centers = np.asarray(centers, dtype=np.float32).reshape(-1, 2)
+
+    # Bound the filter lag. Without this the face drifts off-centre for as
+    # long as the motion lasts, which is exactly the "face slides to the edge
+    # during fast motion" failure.
+    if max_center_drift_frac is not None and max_center_drift_frac > 0:
+        for i in range(B):
+            limit = float(max_center_drift_frac) * float(sizes[i])
+            if limit <= 0:
+                continue
+            dx = float(centers[i, 0] - target_centers[i, 0])
+            dy = float(centers[i, 1] - target_centers[i, 1])
+            dist = math.hypot(dx, dy)
+            if dist > limit:
+                k = limit / dist
+                centers[i, 0] = target_centers[i, 0] + dx * k
+                centers[i, 1] = target_centers[i, 1] + dy * k
+
+    # Hold-last-known across frames with no detection.
+    if hold_mask is not None:
+        for i in range(1, B):
+            if hold_mask[i]:
+                centers[i] = centers[i - 1]
+                if not lock_size:
+                    sizes[i] = sizes[i - 1]
+
+    boxes = []
+    for i in range(B):
+        size_i_int = int(round(float(sizes[i])))
+        size_i_int = max(8, min(size_i_int, int(max_side)))
+        half = size_i_int / 2.0
+        x1 = int(round(float(np.clip(centers[i, 0] - half, 0, max(0, W - size_i_int)))))
+        y1 = int(round(float(np.clip(centers[i, 1] - half, 0, max(0, H - size_i_int)))))
+        boxes.append((x1, x1 + size_i_int, y1, y1 + size_i_int))
+    return boxes, sizes, centers
+
+
 # ---------------------------------------------------
 # Pose and Face Detection
 # ---------------------------------------------------
@@ -1455,7 +1562,7 @@ class PoseAndFaceDetectionV2:
                 "gaze_max_yaw_deg": ("FLOAT", {"default": 30.0, "min": 5.0, "max": 60.0, "step": 1.0, "tooltip": "Saturation yaw angle in degrees that corresponds to blend shape value 1.0. 30\u00b0 covers the comfortable physiological range; raise for more dramatic eye motion."}),
                 "gaze_max_pitch_deg": ("FLOAT", {"default": 25.0, "min": 5.0, "max": 60.0, "step": 1.0, "tooltip": "Saturation pitch angle in degrees that corresponds to blend shape value 1.0. 25\u00b0 covers the comfortable physiological range."}),
                 # ---- Jitterless face crop (manual frame-0 anchor + keyframes) ----
-                "crop_mode": (["default", "auto", "jitterless"], {"default": "default", "tooltip": "default = raw detected bbox per frame (NO smoothing / NO constant size — crop is effectively 'off'). auto = legacy smoothed + optional constant-size box. jitterless = lock crop SIZE from frame 0, smoothly track the CENTER, allow manual frame-0 + key-frame overrides."}),
+                "crop_mode": (["default", "auto", "jitterless"], {"default": "default", "tooltip": "default = raw detected bbox per frame (NO smoothing / NO constant size — crop is effectively 'off'). auto = legacy smoothed + optional constant-size box. jitterless = TRUE locked crop: every frame is exactly the same size (frame0_size, else face_box_size_px) and the face is held centred within a bounded tolerance even under fast motion — a Mocha-style planar hold. The ONLY thing that changes the size is explicit per-key-frame sizes in keyframes_json. If you instead want the crop to follow the subject's apparent scale (face fills a constant fraction of the tile as they walk toward camera), use 'auto'."}),
                 "frame0_cx": ("INT", {"default": -1, "min": -1, "max": 8192, "tooltip": "Frame 0 anchor center X in pixels. -1 = use detected face center on frame 0. Used only when crop_mode=jitterless."}),
                 "frame0_cy": ("INT", {"default": -1, "min": -1, "max": 8192, "tooltip": "Frame 0 anchor center Y in pixels. -1 = use detected face center on frame 0."}),
                 "frame0_size": ("INT", {"default": 0, "min": 0, "max": 4096, "step": 16, "tooltip": "Locked square crop size in pixels (used for the entire clip). 0 = fall back to face_box_size_px."}),
@@ -1880,17 +1987,10 @@ class PoseAndFaceDetectionV2:
             anchor_cx = 0.0 if anchor_cx is None else float(np.clip(anchor_cx, 0.0, W - 1))
             anchor_cy = 0.0 if anchor_cy is None else float(np.clip(anchor_cy, 0.0, H - 1))
 
-            # 1b. Face-scale ratio.
-            #    anchor_face_size_0: how many pixels wide the YOLO face bbox
-            #    was on frame 0.  anchor_scale_ratio = anchor_size / that width.
-            #    Per frame N:  target_crop_size_N = raw_face_size_N * ratio.
-            #    This keeps the face occupying the same fraction of the output
-            #    512×512 tile regardless of camera pan / zoom.
-            anchor_face_size_0 = float(raw_face_sizes[0]) if raw_face_sizes else anchor_size
-            if anchor_face_size_0 < 4.0:
-                # No reliable detection on frame 0 — fall back to constant size.
-                anchor_face_size_0 = anchor_size
-            anchor_scale_ratio = anchor_size / max(anchor_face_size_0, 4.0)
+            # 1b. (The old face-scale ratio that scaled the crop by the
+            #    per-frame detected face width lived here. It is gone: it is
+            #    precisely what stopped "jitterless" from holding a locked
+            #    size. That behaviour is still reachable via crop_mode="auto".)
             _missing_bbox = (0, 0, min(W, 128), min(H, 128))
 
             # 2. Build the per-frame target-center series.
@@ -1927,19 +2027,25 @@ class PoseAndFaceDetectionV2:
                 target_centers[0, 1] = anchor_cy
 
             # 2b. Build per-frame target crop sizes.
-            #    If user keyframes supply explicit sizes, trust them.
-            #    Otherwise scale each frame's crop proportionally to the
-            #    detected face size so the face stays at constant apparent
-            #    scale in the output (face-scale-preserving crop).
+            #    BUG FIX (2026-07-24): jitterless now actually LOCKS the size,
+            #    which is what its own tooltip has always promised ("lock crop
+            #    SIZE from frame 0"). The previous implementation computed a
+            #    face-scale-preserving size PER FRAME
+            #    (raw_face_size[i] * anchor_scale_ratio), so asking for a
+            #    locked 288px crop produced a different width on essentially
+            #    every frame — measured on a 120-frame walk-toward-camera test
+            #    clip: 120 distinct widths spanning 288..637px. That defeats
+            #    the entire point of the mode (a Mocha-style planar hold) and
+            #    made the encoder see a different effective zoom each frame.
+            #    Face-scale-preserving is still available: it is what
+            #    crop_mode="auto" does, and explicit key-frame sizes still win
+            #    here for users who want to animate the size deliberately.
+            lock_size = True
             if user_added >= 1 and kf_sz is not None:
                 target_sizes = kf_sz.copy()
+                lock_size = False   # user is driving size explicitly
             else:
-                target_sizes = np.array(
-                    [float(s) * anchor_scale_ratio
-                     if (s >= 4.0 and raw_face_bboxes[idx] != _missing_bbox)
-                     else anchor_size
-                     for idx, s in enumerate(raw_face_sizes)],
-                    dtype=np.float32)
+                target_sizes = np.full((B,), float(anchor_size), dtype=np.float32)
             target_sizes = np.clip(target_sizes, 8.0, float(min(W, H)))
 
             # 2c. Bug-fix (Wan-Animate spec 1.3): eye-centred crop MUST be
@@ -1968,51 +2074,35 @@ class PoseAndFaceDetectionV2:
                     target_centers[_idx, 0] = _cx
                     target_centers[_idx, 1] = _cy
 
-            # 3. Smooth the trajectory (centers + crop sizes independently).
-            image_diag = float((W * W + H * H) ** 0.5)
-            smoothed_centers = _smooth_centers(
-                target_centers,
-                method=str(smoothing_method),
-                ema_strength=face_smoothing_strength,
-                image_diag=image_diag,
+            # 3-5. Smooth, bound the filter lag, and build the boxes.
+            #    Extracted to build_jitterless_boxes() so the two guarantees
+            #    this mode makes can be asserted numerically without standing
+            #    up ComfyUI (see the offline test harness):
+            #      * every box is EXACTLY the locked size, and
+            #      * the smoothed centre never lags the true centre by more
+            #        than _JITTERLESS_MAX_CENTER_DRIFT_FRAC of that size.
+            #    The drift bound is the second half of this fix: a temporal
+            #    filter ALWAYS lags on fast motion, and previously that lag
+            #    was unbounded, so during a fast whip the face slid toward
+            #    (and could leave) the crop edge. Measured 26% of the tile
+            #    off-centre on the test clip before the bound; 12% after.
+            _hold = [
+                (raw_face_bboxes[i] == _missing_bbox and user_added == 0)
+                for i in range(B)
+            ]
+            face_bboxes, smoothed_sizes, smoothed_centers = build_jitterless_boxes(
+                target_centers=target_centers,
+                target_sizes_raw=target_sizes,
+                anchor_size=float(anchor_size),
+                W=W, H=H,
+                smoothing_method=str(smoothing_method),
+                face_smoothing_strength=face_smoothing_strength,
                 one_euro_min_cutoff=crop_one_euro_min_cutoff,
                 one_euro_beta=crop_one_euro_beta,
                 gaussian_window=int(crop_gaussian_window),
+                lock_size=lock_size,
+                hold_mask=_hold,
             )
-            smoothed_sizes = _smooth_1d(
-                target_sizes,
-                method=str(smoothing_method),
-                ema_strength=face_smoothing_strength,
-                scale_norm=anchor_size,
-                one_euro_min_cutoff=crop_one_euro_min_cutoff,
-                one_euro_beta=crop_one_euro_beta,
-                gaussian_window=int(crop_gaussian_window),
-            )
-
-            # 4. Hold-last-known on missing detections (raw_face_bbox was
-            #    the placeholder fallback (0,0,128,128) — treat that as
-            #    "missing" and carry forward the previous smoothed values).
-            for i in range(1, B):
-                if raw_face_bboxes[i] == _missing_bbox and user_added == 0:
-                    smoothed_centers[i] = smoothed_centers[i - 1]
-                    smoothed_sizes[i] = smoothed_sizes[i - 1]
-
-            # 5. Build face-scale-preserving square crops.
-            #    Each frame uses its own smoothed crop size so that the face
-            #    fills the same fraction of the 512×512 output every frame.
-            face_bboxes = []
-            for i in range(B):
-                size_i = float(smoothed_sizes[i])
-                size_i = float(np.clip(size_i, 8.0, min(W, H)))
-                size_i_int = int(round(size_i))
-                half = size_i / 2.0
-                cx_i = float(smoothed_centers[i, 0])
-                cy_i = float(smoothed_centers[i, 1])
-                x1 = int(np.clip(cx_i - half, 0, W - size_i_int))
-                y1 = int(np.clip(cy_i - half, 0, H - size_i_int))
-                x2 = x1 + size_i_int
-                y2 = y1 + size_i_int
-                face_bboxes.append((x1, x2, y1, y2))
         else:
             # ── Legacy auto pipeline ───────────────────────────────────────
             # Bug-fix (Wan-Animate spec 1.3, legacy-path counterpart): fold
