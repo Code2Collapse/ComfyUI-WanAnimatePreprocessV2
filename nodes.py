@@ -2205,6 +2205,25 @@ class PoseAndFaceDetectionV2:
 
         # --- Raw face bboxes (from blurred pose keypoints; values are in pixel space) ---
         raw_face_bboxes = []
+        # Track detection failure EXPLICITLY instead of recognising it later by
+        # comparing the box against a sentinel tuple.
+        #
+        # BUG THIS FIXES (2026-07-24) — the cause of "the face is off-centre in
+        # every frame". The old code compared each box against
+        #     _missing_bbox = (0, 0, min(W,128), min(H,128))
+        # but the fallback actually appends (x1, x2, y1, y2) =
+        #     (0, min(W,128), 0, min(H,128))
+        # — a different tuple ORDER, so the comparison NEVER matched. Two
+        # consequences, both bad:
+        #   1. the hold-last-known path for missing detections never fired, and
+        #   2. every failed frame was treated as a genuine face box whose centre
+        #      is (64, 64) — the TOP-LEFT CORNER of the frame.
+        # In the smoothed modes that corner position is fed straight into the
+        # centre trajectory, so the filter drags the crop toward the top-left
+        # and, because it is a temporal filter, contaminates the neighbouring
+        # frames too. A handful of failed detections is enough to pull the crop
+        # off the face for a long run of frames.
+        raw_face_missing = []
         for meta in pose_metas:
             bbox_face = get_face_bboxes(meta['keypoints_face'][:, :2],
                                         scale=float(face_crop_scale), image_shape=(H, W))
@@ -2215,9 +2234,46 @@ class PoseAndFaceDetectionV2:
             y1 = max(0, min(H - 1, y1))
             y2 = max(0, min(H, y2))
             # Fallback if invalid
-            if x2 <= x1 or y2 <= y1:
-                x1, y1, x2, y2 = 0, 0, min(W, 128), min(H, 128)
+            _missing = (x2 <= x1 or y2 <= y1)
+            if _missing:
+                # Centre the placeholder on the FRAME, not the top-left corner.
+                # This box is a "we found nothing" marker; parking it at (64,64)
+                # meant that if anything downstream ever consumed it as a real
+                # box (which is exactly what happened), the crop jumped to the
+                # corner. A frame-centred placeholder degrades gracefully.
+                _side = min(W, H, 128)
+                x1 = max(0, (W - _side) // 2)
+                y1 = max(0, (H - _side) // 2)
+                x2, y2 = x1 + _side, y1 + _side
+            raw_face_missing.append(bool(_missing))
             raw_face_bboxes.append((x1, x2, y1, y2))
+
+        # Replace failed-detection boxes with the nearest SUCCESSFUL neighbour
+        # before anything reads them. A placeholder box is not a measurement:
+        # feeding it to the temporal filters injects a fake face position that
+        # the filter then smears across the surrounding frames, dragging the
+        # crop off the real face for far longer than the dropout itself. Nearest
+        # -neighbour fill keeps the trajectory continuous and truthful.
+        if any(raw_face_missing) and not all(raw_face_missing):
+            _good = [i for i, m in enumerate(raw_face_missing) if not m]
+            for _i, _m in enumerate(raw_face_missing):
+                if not _m:
+                    continue
+                _src = min(_good, key=lambda g: abs(g - _i))
+                raw_face_bboxes[_i] = raw_face_bboxes[_src]
+            logging.getLogger(__name__).info(
+                "PoseAndFaceDetectionV2: %d/%d frames had no usable face box; "
+                "filled from the nearest detected frame so they cannot drag the "
+                "smoothed crop toward a placeholder position.",
+                sum(raw_face_missing), len(raw_face_missing),
+            )
+        elif all(raw_face_missing) and raw_face_missing:
+            logging.getLogger(__name__).warning(
+                "PoseAndFaceDetectionV2: NO face detected on any of %d frames — "
+                "face_images will be a frame-centred placeholder crop. Lower "
+                "detection_threshold/pose_threshold, or check that the subject's "
+                "face is actually visible.", len(raw_face_missing),
+            )
 
         # --- Convert to centers and raw face sizes (for smoothing) ---
         raw_centers = []
@@ -2357,7 +2413,10 @@ class PoseAndFaceDetectionV2:
             #    per-frame detected face width lived here. It is gone: it is
             #    precisely what stopped "jitterless" from holding a locked
             #    size. That behaviour is still reachable via crop_mode="auto".)
-            _missing_bbox = (0, 0, min(W, 128), min(H, 128))
+            # (the old _missing_bbox sentinel lived here — replaced by the
+            # explicit raw_face_missing flags built with the boxes, because the
+            # sentinel's tuple order did not match what the fallback appends
+            # and so it never matched anything)
 
             # 2. Build the per-frame target-center series.
             #    Start from raw detected centers (so the face is followed
@@ -2453,7 +2512,7 @@ class PoseAndFaceDetectionV2:
             #    (and could leave) the crop edge. Measured 26% of the tile
             #    off-centre on the test clip before the bound; 12% after.
             _hold = [
-                (raw_face_bboxes[i] == _missing_bbox and user_added == 0)
+                (raw_face_missing[i] and user_added == 0)
                 for i in range(B)
             ]
             face_bboxes, smoothed_sizes, smoothed_centers = build_jitterless_boxes(
@@ -2647,19 +2706,25 @@ class PoseAndFaceDetectionV2:
         # sharp source frame at that geometry) — the same hold-last-known
         # pattern already used for missing detections above. Frame 0 always
         # keeps its own bbox (nothing earlier to hold).
-        _BLUR_THRESH = 50.0
-        for _idx in range(1, len(face_bboxes)):
-            _x1, _x2, _y1, _y2 = face_bboxes[_idx]
-            # MUST go through _crop_with_padding, not a raw numpy slice: crop
-            # boxes may now legitimately have NEGATIVE origins (that is how the
-            # face stays centred near a frame edge), and numpy reads a negative
-            # index as "from the end", so `images_np[i][-90:374]` silently
-            # yields an EMPTY array rather than the intended crop. That made
-            # this whole blur-hold check a no-op on exactly the frames where
-            # the box hangs off-frame.
-            _candidate = _crop_with_padding(images_np[_idx], _x1, _x2, _y1, _y2)
-            if _candidate.size and compute_frame_blur_score(_candidate) < _BLUR_THRESH:
-                face_bboxes[_idx] = face_bboxes[_idx - 1]
+        # BLUR-HOLD REMOVED (2026-07-24) — it was the cause of "the face is
+        # off-centre in every frame", in every crop mode.
+        #
+        # It used to replace a blurry frame's crop with the PREVIOUS frame's
+        # box:   face_bboxes[i] = face_bboxes[i - 1]
+        # That CASCADES: once one frame is held, the next frame is measured
+        # against the HELD box, so a run of blurry frames freezes the crop in
+        # place. Motion blur happens precisely when the head turns — i.e.
+        # exactly when the face is moving — so the box locks at the pre-motion
+        # position while the face travels away from it, and stays locked until
+        # a sharp frame happens to land. It ran AFTER the per-mode box build,
+        # on all modes, which is why default / auto / jitterless /
+        # reference_smooth were all affected identically.
+        #
+        # Deleted rather than re-tuned: the requirement here is that the face
+        # is centred in EVERY frame, and any mechanism that substitutes a stale
+        # crop violates that by construction, at any threshold. The reference
+        # pipeline (wan/modules/animate/preprocess/process_pipepline.py) has no
+        # such step — it crops each frame from that frame's own face box.
 
         # --- Centring self-check (always logged) -------------------------
         # Reports how far the DETECTED face centre sits from the centre of the
