@@ -1386,6 +1386,43 @@ def _smooth_1d(values, method, *, ema_strength=0.6, scale_norm=1.0,
 _JITTERLESS_MAX_CENTER_DRIFT_FRAC = 0.12
 
 
+def _crop_with_padding(frame, x1, x2, y1, y2):
+    """Crop ``frame`` to the (possibly out-of-frame) box, edge-padding as needed.
+
+    Returns exactly (y2-y1, x2-x1) pixels ALWAYS, so a crop box that hangs off
+    the frame still yields a full-size tile with the requested centre at the
+    tile's centre. Clamping the box back inside the frame instead — the old
+    behaviour — silently moves the subject off-centre, which is the failure
+    this exists to prevent.
+
+    Edge-replicate (not black) padding: the face encoder was trained with
+    scale/colour/noise augmentation on real face crops, so a hard synthetic
+    border is further out of distribution than smeared edge pixels.
+    """
+    h, w = frame.shape[:2]
+    x1i, x2i, y1i, y2i = int(x1), int(x2), int(y1), int(y2)
+    tw, th = max(0, x2i - x1i), max(0, y2i - y1i)
+    if tw == 0 or th == 0:
+        return frame[0:0, 0:0]
+    # Fast path: fully inside.
+    if x1i >= 0 and y1i >= 0 and x2i <= w and y2i <= h:
+        return frame[y1i:y2i, x1i:x2i]
+    sx1, sy1 = max(0, x1i), max(0, y1i)
+    sx2, sy2 = min(w, x2i), min(h, y2i)
+    if sx2 <= sx1 or sy2 <= sy1:
+        # Box lies entirely outside the frame — replicate the nearest pixel.
+        cy = min(max(0, (y1i + y2i) // 2), h - 1)
+        cx = min(max(0, (x1i + x2i) // 2), w - 1)
+        return np.repeat(np.repeat(frame[cy:cy + 1, cx:cx + 1], th, axis=0), tw, axis=1)
+    inner = frame[sy1:sy2, sx1:sx2]
+    pad_top, pad_left = sy1 - y1i, sx1 - x1i
+    pad_bot, pad_right = y2i - sy2, x2i - sx2
+    pads = [(pad_top, pad_bot), (pad_left, pad_right)]
+    if inner.ndim == 3:
+        pads.append((0, 0))
+    return np.pad(inner, pads, mode="edge")
+
+
 def build_jitterless_boxes(
     *,
     target_centers,
@@ -1532,8 +1569,15 @@ def build_jitterless_boxes(
         size_i_int = int(round(float(sizes[i])))
         size_i_int = max(8, min(size_i_int, int(max_side)))
         half = size_i_int / 2.0
-        x1 = int(round(float(np.clip(centers[i, 0] - half, 0, max(0, W - size_i_int)))))
-        y1 = int(round(float(np.clip(centers[i, 1] - half, 0, max(0, H - size_i_int)))))
+        # NOT clamped into the frame (2026-07-24 bug fix). Clamping is what
+        # broke centring: with a locked size close to a frame dimension the
+        # box has zero room to move (H - side == 0) and gets pinned to the
+        # edge, leaving the face permanently off-centre. The box is emitted
+        # centred on the tracked point even when it hangs off the frame;
+        # _crop_with_padding() edge-pads at extraction so the tile is still
+        # full-size and the face is still dead-centre.
+        x1 = int(round(float(centers[i, 0] - half)))
+        y1 = int(round(float(centers[i, 1] - half)))
         boxes.append((x1, x1 + size_i_int, y1, y1 + size_i_int))
     build_jitterless_boxes.last_stats = {
         "shifted": n_shifted, "too_small": n_too_small, "frames": B,
@@ -2355,9 +2399,28 @@ class PoseAndFaceDetectionV2:
                 face_bboxes[_idx] = face_bboxes[_idx - 1]
 
         # --- Face crops from sharp original frames ---
+        # PAD, don't clamp (2026-07-24 bug fix). A crop box may legitimately
+        # extend past the frame edge — that is exactly what happens when the
+        # head is near the top of frame (where heads are) and the locked
+        # jitterless size is a large fraction of the frame height. The old
+        # code clamped the box back inside, which silently DESTROYED centring:
+        # measured on 832x480 with the default 512 crop, the box could not move
+        # vertically at all (H - side == 0) so the face sat ~90px = 19% of the
+        # tile off-centre on EVERY frame.
+        #
+        # Why centring matters here specifically: Wan-Animate's Face Adapter
+        # takes "the raw facial image directly as the driving input", located
+        # by cropping the face region and "resized to 512x512" (paper 3.3,
+        # arXiv:2509.14055), and the reference pipeline
+        # (wan/modules/animate/preprocess/process_pipepline.py) crops a
+        # per-frame FACE-TIGHT bbox so the face is centred and fills the tile
+        # by construction. An off-centre face is out-of-distribution input to
+        # that encoder. Edge-replicate padding keeps the face dead-centre and
+        # introduces no hard synthetic border (the encoder was trained with
+        # scale/colour/noise augmentation, not with black bars).
         face_images = []
         for idx, (x1, x2, y1, y2) in enumerate(face_bboxes):
-            face_image = images_np[idx][y1:y2, x1:x2]
+            face_image = _crop_with_padding(images_np[idx], x1, x2, y1, y2)
             if face_image.size == 0:
                 fallback_size = int(min(H, W) * 0.3)
                 fx1 = (W - fallback_size) // 2
