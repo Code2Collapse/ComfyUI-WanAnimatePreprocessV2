@@ -4013,7 +4013,7 @@ class DrawViTPoseV2:
                     "tooltip": "Color of the drawn pupil; magenta gives strongest sampler signal."}),
                 # ---- C0.5: face passthrough (Wan 2.2 Animate face encoder convenience) ----
                 "face_images": ("IMAGE", {"tooltip": "OPTIONAL face crop IMAGE batch (typically the face_images_512 output of PoseAndFaceDetectionV2). When wired, the node validates frame-count parity with the pose batch, optionally force-resizes to 512x512, and forwards it on the 'face_video' output so a single DrawViTPoseV2 can feed the Wan-Animate sampler's pose+face inputs in one place."}),
-                "face_cfg_scale": ("FLOAT", {"default": 1.0, "min": 1.0, "max": 10.0, "step": 0.1, "tooltip": "Passthrough face CFG scale (Wan-Animate paper Sec. 4.3) for tidy graph routing from PoseAndFaceDetectionV2.face_cfg_scale. NOTE: Kijai's ComfyUI-WanVideoWrapper has no face-CFG input to wire this into today — for real control over expression adherence use WanVideoAnimateEmbeds.face_strength (spec 2.2's stronger, more direct block-scale lever) instead."}),
+                "face_cfg_scale": ("FLOAT", {"default": 1.0, "min": 1.0, "max": 10.0, "step": 0.1, "forceInput": True, "tooltip": "Passthrough face CFG scale, CONNECTION-ONLY (forceInput) so there is exactly one source of truth: PoseAndFaceDetectionV2.face_cfg_scale. It used to be a second independently-editable widget with the same default, so you could set 2.0 upstream, leave 1.0 here, and get no warning that they had diverged. Unconnected = 1.0 (no-op), which matches the old default. NOTE: Kijai's ComfyUI-WanVideoWrapper has no face-CFG input to wire this into today — for real control over expression adherence use WanVideoAnimateEmbeds.face_strength (spec 2.2's stronger, more direct block-scale lever) instead."}),
                 "enforce_512_face": ("BOOLEAN", {"default": True, "tooltip": "If True and 'face_images' is provided at a non-512 size, force-resize each frame to 512x512 (bilinear) before forwarding. Default True so the encoder always sees the trained input shape."}),
                 "reference_expression_coeffs_json": ("STRING", {"multiline": True, "default": "", "tooltip": "Wan-Animate spec 3.1 (closed-loop critic): wire in the 'expression_coeffs_json' output of a PoseAndFaceDetectionV2 run (export_expression_coeffs=True) on the SOURCE driving video. When non-empty, this node measures ARKit-52 blendshapes from ITS OWN pose_data.iris_data (i.e. the GENERATED Wan-Animate output side, since this node is downstream of the generation pass) and reports per-AU + per-segment error against the reference — a numeric fidelity signal instead of eyeballing frames. Leave empty to skip entirely (zero extra cost)."}),
                 "segment_length": ("INT", {"default": 77, "min": 1, "max": 100000, "tooltip": "Frames per segment for the critic's worst-segment breakdown — match WanVideoAnimateEmbeds.frame_window_size (default 77) so segments line up with Wan-Animate's own splice boundaries (spec 2.5/3.5). Only used when reference_expression_coeffs_json is wired."}),
@@ -4138,6 +4138,36 @@ class DrawViTPoseV2:
                 face_images=None, face_cfg_scale=1.0, enforce_512_face=True,
                 reference_expression_coeffs_json="", segment_length=77, top_k_aus=10,
                 apply_pose_edits_to_face="warp"):
+        # Migration guard for the face_cfg_scale -> forceInput change.
+        # face_cfg_scale used to be an editable WIDGET at position 7 of this
+        # node's optional widgets; forceInput removes it from widgets_values,
+        # so a workflow saved BEFORE the change has one extra leading value and
+        # everything after it shifts by one. The dangerous one is
+        # apply_pose_edits_to_face (last), which would receive top_k_aus's INT
+        # and silently disable the expression-delivery warp. Coerce the
+        # shift-prone params back to something valid instead of trusting them.
+        if str(apply_pose_edits_to_face) not in ("warp", "off"):
+            logging.getLogger(__name__).warning(
+                "DrawViTPoseV2: apply_pose_edits_to_face=%r is not a valid mode — "
+                "this is the signature of a workflow saved before face_cfg_scale "
+                "became a connection-only input (widget values shifted by one). "
+                "Falling back to 'warp'. Re-save the workflow to clear this.",
+                apply_pose_edits_to_face,
+            )
+            apply_pose_edits_to_face = "warp"
+        try:
+            segment_length = max(1, int(segment_length))
+        except (TypeError, ValueError):
+            segment_length = 77
+        try:
+            top_k_aus = max(1, min(52, int(top_k_aus)))
+        except (TypeError, ValueError):
+            top_k_aus = 10
+        try:
+            face_cfg_scale = float(face_cfg_scale)
+        except (TypeError, ValueError):
+            face_cfg_scale = 1.0
+
         pose_metas = pose_data["pose_metas"]
         draw_hand = hand_stick_width != 0
 
