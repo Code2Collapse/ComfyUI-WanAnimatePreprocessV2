@@ -89,10 +89,19 @@ function applyVisibility(node) {
 
     // visible[name] = true → show; everything not listed is always shown.
     const visible = {
+        // crop_mode is gone - there is one crop behaviour and no choice to make
+        crop_mode:                  false,
+        // colour/exposure conditioning is DERIVED from each frame now
+        // (see preprocess_for_pose); these stay only as expert overrides
+        detect_gamma:               false,
+        detect_white_balance:       false,
+        detect_denoise:             false,
+        detect_sharpen:             false,
+        detect_saturation:          false,
+        clahe_clip_limit:           false,
+        clahe_grid_size:            false,
         blur_radius:                useBlur,
         blur_sigma:                 useBlur,
-        clahe_clip_limit:           useClahe,
-        clahe_grid_size:            useClahe,
         // --- crop geometry -------------------------------------------------
         // Only two modes are offered now (expression_lock, default). Both use
         // the reference face-tight box with a RAW per-frame centre, so every
@@ -100,10 +109,10 @@ function applyVisibility(node) {
         // is inert and stays hidden. They remain in INPUT_TYPES so existing
         // workflows keep loading with their values intact — widgets are matched
         // by position, and deleting them would shift every later value.
-        smoothing_method:           exprLock,       // filters the SIZE only
-        crop_size_one_euro_beta:    exprLock && smoothing === "one_euro",
-        crop_gaussian_window:       exprLock && smoothing === "gaussian",
-        face_smoothing_strength:    exprLock && emaLike,
+        smoothing_method:           false,
+        crop_size_one_euro_beta:    false,
+        crop_gaussian_window:       false,
+        face_smoothing_strength:    false,
         crop_one_euro_min_cutoff:   legacyMode && method === "one_euro",
         crop_one_euro_beta:         legacyMode && method === "one_euro",
         crop_safety_margin:         legacyMode,

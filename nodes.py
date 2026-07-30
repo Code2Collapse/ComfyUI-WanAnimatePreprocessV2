@@ -580,6 +580,33 @@ def preprocess_for_pose(img, use_clahe=True, clahe_clip=2.0, clahe_grid=8,
     """
     if img is None:
         return img
+
+    # AUTO (2026-07-30). The five manual knobs below were unusable in practice:
+    # nobody can be expected to guess a gamma or a saturation multiplier for a
+    # detector they cannot see the input of. They are now DERIVED from the
+    # frame, and the manual values act only as overrides when moved off their
+    # defaults. This is what makes hard footage work without being tuned —
+    # underwater and heavy-LUT shots in particular, where the whole reason the
+    # detector fails is that skin has drifted far off neutral.
+    if use_clahe:
+        _f = img if np.issubdtype(img.dtype, np.floating) else img.astype(np.float32) / 255.0
+        _f = np.clip(_f, 0.0, 1.0)
+        if _f.ndim == 3 and _f.shape[2] >= 3:
+            _means = np.array([_f[..., c].mean() for c in range(3)], np.float32)
+            _grey = float(_means.mean())
+            # Colour cast: how far the channel means are from each other,
+            # relative to overall level. Underwater is the extreme case — the
+            # red channel collapses, so this is large and WB switches itself on.
+            _cast = float(_means.std() / max(_grey, 1e-3))
+            if not white_balance and _cast > 0.08:
+                white_balance = True
+        # Exposure: a frame sitting far from mid-grey loses the detector the
+        # contrast it needs. Pull it toward 0.45 with gamma, bounded so a
+        # deliberately dark or bright look is not flattened.
+        _lum = float(_f[..., :3].mean()) if _f.ndim == 3 else float(_f.mean())
+        if abs(gamma - 1.0) < 1e-6 and 1e-3 < _lum < 0.999:
+            _g = float(np.log(max(_lum, 1e-3)) / np.log(0.45))
+            gamma = float(np.clip(_g, 0.55, 1.8))
     do_wb = bool(white_balance)
     do_gamma = abs(float(gamma) - 1.0) > 1e-3
     do_clahe = bool(use_clahe)
@@ -2377,18 +2404,20 @@ class PoseAndFaceDetectionV2:
             _bw, _bh = float(x2 - x1), float(y2 - y1)
             raw_face_aspects.append(_bh / max(_bw, 1.0))
 
+        # ONE crop behaviour. There is no menu any more: every mode that
+        # filtered the crop CENTRE de-registered the face inside the tile,
+        # and Wan-Animate compresses that tile to 20 numbers per frame
+        # (Generator motion_dim=20), so the budget went to rigid motion
+        # instead of expression. Measured within-tile wander: this path
+        # 0.9px, the retired modes 26-61px. Keeping a choice there only
+        # offered ways to get a worse result.
         crop_mode_str = str(crop_mode)
-        if crop_mode_str in ("reference_smooth", "auto", "jitterless"):
-            # Still honoured so saved workflows do not change behaviour
-            # silently, but no longer offered in the UI: all three filter
-            # the crop CENTRE, which de-registers the face inside the tile
-            # and spends the encoder's 20-dim budget on rigid motion.
-            logging.getLogger(__name__).warning(
-                "PoseAndFaceDetectionV2: crop_mode=%r is deprecated and costs facial "
-                "detail. It filters the crop centre, so the face wanders inside the "
-                "512 tile (measured 26-61px) while a micro-expression is 2-5px — and "
-                "Wan-Animate has only 20 numbers per frame to carry all of it. Switch "
-                "to crop_mode='expression_lock'.", crop_mode_str)
+        if crop_mode_str not in ('expression_lock', 'default'):
+            logging.getLogger(__name__).info(
+                "PoseAndFaceDetectionV2: crop_mode=%r no longer exists; using the "
+                "single supported crop (reference face-tight box, raw per-frame "
+                "centre, stabilised size).", crop_mode_str)
+        crop_mode_str = 'expression_lock'
         # expression_lock shares reference_smooth's code path but keeps the
         # RAW per-frame centre. See the branch below for why that is the whole
         # ballgame for micro-expressions.
