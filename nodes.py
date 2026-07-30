@@ -1861,7 +1861,7 @@ class PoseAndFaceDetectionV2:
                 "gaze_max_yaw_deg": ("FLOAT", {"default": 30.0, "min": 5.0, "max": 60.0, "step": 1.0, "tooltip": "Saturation yaw angle in degrees that corresponds to blend shape value 1.0. 30\u00b0 covers the comfortable physiological range; raise for more dramatic eye motion."}),
                 "gaze_max_pitch_deg": ("FLOAT", {"default": 25.0, "min": 5.0, "max": 60.0, "step": 1.0, "tooltip": "Saturation pitch angle in degrees that corresponds to blend shape value 1.0. 25\u00b0 covers the comfortable physiological range."}),
                 # ---- Jitterless face crop (manual frame-0 anchor + keyframes) ----
-                "crop_mode": (["default", "expression_lock", "reference_smooth", "auto", "jitterless"], {"default": "expression_lock", "tooltip": "expression_lock = RECOMMENDED for micro-expressions, secondary motion (water, blood, sweat, a strip of tape lifting in the wind) and anything subtle. The centre is taken RAW from the per-frame detection so the face is registered in the same place in every tile, and only the box SIZE is stabilised.\n\nWhy that matters: Wan-Animate encodes the whole 512x512 tile to just 20 numbers per frame (motion_dim=20, model_animate.py). It has no landmark input and no alignment stage, so it cannot separate the face MOVING inside the tile from the face CHANGING. Filtering the centre makes the box lag the head, so the face wanders inside the tile - measured 26-61px on a normal pan - while a micro-expression is only 2-5px of eyelid and lip travel. The 20 dims then get spent on rigid motion instead of expression. Measured within-tile wander: expression_lock and default ~0.7px, reference_smooth 2.8px, jitterless 3.2px, auto 7.1px.\n\ndefault = the REFERENCE behaviour: per-frame face-tight box, no smoothing at all. Equally good registration; the only thing it does not do is stop the tile size breathing.\n\nreference_smooth / auto / jitterless = STABILITY modes. They filter the centre, trading expression fidelity for a calmer tile. Use them when the shot is jittery and a steady crop matters more than subtle facial detail. Do NOT use them for micro-expression work."}),
+                "crop_mode": (["expression_lock", "default"], {"default": "expression_lock", "tooltip": "How the face crop box is built.\n\nexpression_lock (default) = the reference face-tight box, with the centre taken RAW from each frame's detection and only the box SIZE stabilised. Use this.\n\ndefault = the reference behaviour exactly, byte for byte with Wan2.2's process_pipepline.py: per-frame box, no smoothing of anything. Use it to A/B against the official pipeline.\n\nWhy there is nothing else to choose: Wan-Animate compresses the whole 512x512 face tile to 20 numbers per frame (motion_dim=20, model_animate.py) with no landmark input and no alignment stage, so it cannot tell the face MOVING inside the tile from the face CHANGING. Smoothing the crop centre makes the box lag the head, the face then wanders 26-61px inside the tile on a normal pan, and since a micro-expression is only 2-5px of eyelid and lip travel those 20 numbers get spent on rigid motion instead of expression. Both modes here keep within-tile wander under 1px. The old reference_smooth / auto / jitterless modes still run if a saved workflow selects them, but they are no longer offered because they measurably destroy the thing this node exists to preserve."}),
                 "frame0_cx": ("INT", {"default": -1, "min": -1, "max": 8192, "tooltip": "Frame 0 anchor center X in pixels. -1 = use detected face center on frame 0. Used only when crop_mode=jitterless."}),
                 "frame0_cy": ("INT", {"default": -1, "min": -1, "max": 8192, "tooltip": "Frame 0 anchor center Y in pixels. -1 = use detected face center on frame 0."}),
                 "frame0_size": ("INT", {"default": 0, "min": 0, "max": 4096, "step": 16, "tooltip": "Locked square crop size in pixels (used for the entire clip). 0 = fall back to face_box_size_px."}),
@@ -2378,6 +2378,17 @@ class PoseAndFaceDetectionV2:
             raw_face_aspects.append(_bh / max(_bw, 1.0))
 
         crop_mode_str = str(crop_mode)
+        if crop_mode_str in ("reference_smooth", "auto", "jitterless"):
+            # Still honoured so saved workflows do not change behaviour
+            # silently, but no longer offered in the UI: all three filter
+            # the crop CENTRE, which de-registers the face inside the tile
+            # and spends the encoder's 20-dim budget on rigid motion.
+            logging.getLogger(__name__).warning(
+                "PoseAndFaceDetectionV2: crop_mode=%r is deprecated and costs facial "
+                "detail. It filters the crop centre, so the face wanders inside the "
+                "512 tile (measured 26-61px) while a micro-expression is 2-5px — and "
+                "Wan-Animate has only 20 numbers per frame to carry all of it. Switch "
+                "to crop_mode='expression_lock'.", crop_mode_str)
         # expression_lock shares reference_smooth's code path but keeps the
         # RAW per-frame centre. See the branch below for why that is the whole
         # ballgame for micro-expressions.
