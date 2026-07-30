@@ -1890,7 +1890,7 @@ class PoseAndFaceDetectionV2:
                 "gaze_fps": ("FLOAT", {"default": 30.0, "min": 1.0, "max": 240.0, "step": 1.0, "tooltip": "Video fps used by the Kalman dt. Set to match your source clip; affects velocity coupling, not absolute angles."}),
                 "gaze_calibration_frame": ("INT", {"default": -1, "min": -1, "max": 999999, "tooltip": "W7-G2 per-shot gaze calibration (iris_geometric engine only). Set this to a frame index where the subject looks STRAIGHT AT THE CAMERA; the measured eye-in-head angles on that frame become the zero reference for the whole shot, removing per-person eye-shape bias (the last few degrees of error no model can fix). -1 = off."}),
                 # C0.1 — per-frame iris repaint at gaze-corrected position.
-                "apply_gaze_to_face_image": (["off", "warp", "overlay", "replace"], {"default": "off", "tooltip": "C0.1: After gaze is computed, optionally deliver the gaze correction into each 512x512 face crop so the face-encoder input visually matches the gaze the sampler will follow. 'off' = leave face_images untouched (default). 'warp' (Wan-Animate spec 1.5, RECOMMENDED over overlay/replace): moves the REAL iris pixels to the gaze-corrected position via a Delaunay piecewise-affine warp (same engine WanFaceController3DV2 uses) instead of painting a synthetic disk — the face encoder's training augmentations were scale/color-jitter/noise, never a hard-edged synthetic object, so a real-pixel warp stays in-distribution. Displacement is clamped to the eye aperture and gated by the same blur check as the crop pipeline. 'overlay'/'replace' (legacy): stamp a synthetic iris disk — 'overlay' draws it WITHOUT erasing the original iris; 'replace' paints eye-white first. Shift magnitude scales with the per-eye iris radius and the engine's magnitude_norm. Failures are non-fatal: a warning is logged and face_images is preserved."}),
+                "apply_gaze_to_face_image": (["warp", "off", "overlay", "replace"], {"default": "warp", "tooltip": "Deliver the computed gaze into the 512x512 face crop by moving REAL iris pixels.\n\n'warp' (DEFAULT) = a Delaunay piecewise-affine warp shifts the actual iris pixels to the gaze-corrected position. Displacement is clamped to the eye aperture, frames markedly blurrier than the clip's own median are skipped, and any failure is non-fatal.\n\nWhy this must be on for a gaze estimate to do anything at all: Wan-Animate's pose conditioning image is a 20-point BODY skeleton plus five coarse head dots - nose, two eyes, two ears - and nothing else (draw_aapose_new). No face mesh, no iris. So every gaze engine, the iris smoother and the gaze lock write numbers the model never sees. The ONLY route from a gaze estimate to the render is the PIXELS of face_images, which is what this edits.\n\nIf the estimate already agrees with the performer's real iris position this correctly changes nothing - the eyes are already right in the pixels. The node logs how many frames it actually touched, so it can never look broken when it is simply idle.\n\n'off' = never touch the crop. 'overlay'/'replace' = legacy; they stamp a synthetic iris disk, which is out-of-distribution for an encoder trained with scale/colour/noise augmentation only."}),
                 "au_amplify": ("FLOAT", {"default": 1.0, "min": 1.0, "max": 1.5, "step": 0.01, "tooltip": "Wan-Animate spec 2.3: the face encoder compresses to a small fixed-capacity motion-basis vector, so a genuinely subtle real microexpression can sit near the compression noise floor. This pushes each frame's detected face landmarks a bit FURTHER along the direction they already moved from the neutral reference frame (au_amplify_neutral_frame) — amplifying REAL, DETECTED motion so more of it survives compression; it never synthesizes anything that wasn't already measured. 1.0 = off (default). 1.15-1.3 is the range the paper's own architecture analysis suggests; values are capped at 1.5 since the correction is only a 2D (eye-line roll+scale) head-pose approximation, not a full 3D one — the discrepancy grows with head yaw/pitch, so keep this modest for non-frontal shots. Delivered via the same Delaunay real-pixel warp as 'warp' gaze mode; gated by the same blur/quality check; on any per-frame failure that frame is left unamplified."}),
                 "au_amplify_neutral_frame": ("INT", {"default": 0, "min": 0, "max": 999999, "tooltip": "Frame index to use as the NEUTRAL reference for au_amplify — pick a frame where the subject's expression is relaxed/neutral (Wan-Animate spec 2.4: an already-tense or asymmetric reference eats into the same motion-basis budget the target microexpression needs). Ignored when au_amplify=1.0."}),
                 "export_expression_coeffs": ("BOOLEAN", {"default": False, "tooltip": "Wan-Animate spec 3.1 (closed-loop critic, foundation): export the 'expression_coeffs_json' output — per-frame ARKit-52 blendshapes measured from this run's iris_data. Off by default (no extra cost when unused). Run this node once on the source driving video and once on the Wan-Animate generated output, then wire the source run's expression_coeffs_json into DrawViTPoseV2.reference_expression_coeffs_json for a per-AU fidelity report."}),
@@ -3966,9 +3966,26 @@ class PoseAndFaceDetectionV2:
                 _GAIN = 3.0
                 _RING_N = 8               # points synthesized around the iris
                 _APERTURE_CLAMP = 0.65    # spec 1.5.3: clamp to ~0.6-0.7x aperture
-                _BLUR_GATE = 50.0         # same threshold as the spec-1.4 crop gate
                 _n = min(face_images_np.shape[0], len(all_iris), len(face_bboxes),
                          len(pose_metas))
+                # Blur gate, RELATIVE to this clip (fixed 2026-07-30). It was an
+                # ABSOLUTE Laplacian-variance threshold of 50.0, which is
+                # meaningless without a reference: a sharp studio portrait measures
+                # ~62, so anything even slightly softer - compressed video, shallow
+                # depth of field, or simply a face small enough in frame that its
+                # crop is UPSCALED into the 512 tile - fell under it. The result was
+                # that on most real footage EVERY frame was skipped and
+                # apply_gaze_to_face_image silently did nothing, with no message.
+                # What the gate is for is 'do not warp a frame much blurrier than
+                # the rest of the shot' (motion blur, autofocus hunt), so measure
+                # against this clip's own median instead of an absolute number.
+                _scores = np.array(
+                    [compute_frame_blur_score(face_images_np[_i]) for _i in range(_n)],
+                    dtype=np.float32,
+                )
+                _blur_gate = max(1.0, 0.5 * float(np.median(_scores))) if _n else 1.0
+                _gz_warped = 0
+                _gz_skipped = 0
                 for _idx in range(_n):
                     _bb = face_bboxes[_idx]
                     if _bb is None:
@@ -3983,7 +4000,8 @@ class PoseAndFaceDetectionV2:
                     # crop pipeline — skip warping (leave the crop as the
                     # normal pipeline produced it) on a low-quality frame
                     # rather than warp already-bad pixels.
-                    if compute_frame_blur_score(_crop) < _BLUR_GATE:
+                    if _scores[_idx] < _blur_gate:
+                        _gz_skipped += 1
                         continue
                     _it = all_iris[_idx]
                     # Anchor points: the full 68-ish iBUG face landmark set,
@@ -4072,6 +4090,7 @@ class PoseAndFaceDetectionV2:
                         _any_eye = True
                     if not _any_eye:
                         continue
+                    _gz_warped += 1
                     _src_lms = np.vstack(_src_rows).astype(np.float32)
                     _dst_lms = np.vstack(_dst_rows).astype(np.float32)
                     _crop_f = _crop.astype(np.float32) / 255.0 if not _is_float else _crop.astype(np.float32)
@@ -4080,6 +4099,25 @@ class PoseAndFaceDetectionV2:
                         _warped if _is_float else np.clip(_warped * 255.0, 0, 255).astype(_crop.dtype)
                     )
                 face_images_tensor = torch.from_numpy(face_images_np)
+                # Never fail silently: this is the ONLY route from a gaze
+                # estimate to the render, so if it does nothing the user must be
+                # told rather than left guessing.
+                if _gz_warped:
+                    logging.getLogger(__name__).info(
+                        "PoseAndFaceDetectionV2: gaze warp moved iris pixels on %d/%d "
+                        "face crops (%d skipped as blurrier than half this clip's median "
+                        "sharpness of %.1f).", _gz_warped, _n, _gz_skipped,
+                        float(np.median(_scores)) if _n else 0.0,
+                    )
+                else:
+                    logging.getLogger(__name__).warning(
+                        "PoseAndFaceDetectionV2: apply_gaze_to_face_image='warp' changed "
+                        "nothing on any of %d frames (%d skipped as too blurry). Usually "
+                        "this means the gaze estimate already agrees with the performer's "
+                        "real iris position - the healthy case, the eyes are already "
+                        "correct in face_images. It can also mean no iris was detected.",
+                        _n, _gz_skipped,
+                    )
             except Exception as _exc:                                    # noqa: BLE001
                 logging.getLogger(__name__).warning(
                     "apply_gaze_to_face_image=warp failed (%s); "
