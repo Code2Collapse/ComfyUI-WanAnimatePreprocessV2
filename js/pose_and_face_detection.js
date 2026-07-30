@@ -56,6 +56,11 @@ function applyVisibility(node) {
     const cropMode   = String(get("crop_mode")?.value ?? "default");
     const jitterless = cropMode === "jitterless";
     const refSmooth  = cropMode === "reference_smooth";
+    // expression_lock shares reference_smooth's branch but takes the centre
+    // RAW, so the centre filter knobs are inert there — only the SIZE is
+    // filtered, and crop_safety_margin is forced to 1.0 (no filter lag to
+    // absorb, and inflating the box just costs face resolution).
+    const exprLock   = cropMode === "expression_lock";
     const auto       = cropMode === "auto";
     const smoothing  = String(get("smoothing_method")?.value ?? "one_euro");
     const autoSm     = String(get("auto_smoothing_method")?.value ?? "legacy_ema");
@@ -64,7 +69,7 @@ function applyVisibility(node) {
     // own selector and ignores smoothing_method entirely; reference_smooth and
     // jitterless share smoothing_method. Getting this wrong is what hid the
     // one_euro knobs from the modes that use them.
-    const filtered   = jitterless || refSmooth || auto;
+    const filtered   = jitterless || refSmooth || auto || exprLock;
     const method     = auto ? autoSm : smoothing;
     const oneEuro    = filtered && method === "one_euro";
     const gaussian   = filtered && method === "gaussian";
@@ -114,19 +119,20 @@ function applyVisibility(node) {
         frame0_size:                jitterless,
         keyframes_json:             jitterless,
         // auto picks its filter with auto_smoothing_method instead
-        smoothing_method:           jitterless || refSmooth,
-        crop_one_euro_min_cutoff:   oneEuro,
-        crop_one_euro_beta:         oneEuro,
+        smoothing_method:           jitterless || refSmooth || exprLock,
+        // centre filter knobs do nothing when the centre is raw
+        crop_one_euro_min_cutoff:   oneEuro && !exprLock,
+        crop_one_euro_beta:         oneEuro && !exprLock,
         crop_gaussian_window:       gaussian,
         // crop hardening — meaningless when crop_mode="default" (crop off).
         // safety_margin is honoured by reference_smooth too; containment is
         // not (that mode's box IS the detected box, so it always contains it).
-        crop_safety_margin:         cropActive || refSmooth,
+        crop_safety_margin:         cropActive || refSmooth,   // NOT exprLock: forced to 1.0
         crop_containment_check:     cropActive,
         crop_containment_tolerance: cropActive && containOn,
         // separate beta for the size/scale trajectory — only the two modes
         // that filter w/h read it, and only under one_euro.
-        crop_size_one_euro_beta:    (jitterless || refSmooth) && smoothing === "one_euro",
+        crop_size_one_euro_beta:    (jitterless || refSmooth || exprLock) && smoothing === "one_euro",
         auto_smoothing_method:      auto,
         // aspect override is applied while BUILDING a box; reference_smooth
         // keeps the detected aspect by construction and default does no crop.
