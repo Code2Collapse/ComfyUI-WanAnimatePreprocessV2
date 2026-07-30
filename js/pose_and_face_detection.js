@@ -61,6 +61,8 @@ function applyVisibility(node) {
     // filtered, and crop_safety_margin is forced to 1.0 (no filter lag to
     // absorb, and inflating the box just costs face resolution).
     const exprLock   = cropMode === "expression_lock";
+    // a saved workflow may still carry one of the retired modes
+    const legacyMode = !exprLock && cropMode !== "default";
     const auto       = cropMode === "auto";
     const smoothing  = String(get("smoothing_method")?.value ?? "one_euro");
     const autoSm     = String(get("auto_smoothing_method")?.value ?? "legacy_ema");
@@ -89,63 +91,56 @@ function applyVisibility(node) {
     const visible = {
         blur_radius:                useBlur,
         blur_sigma:                 useBlur,
-        // CLAHE sub-options — the backend skips both when use_clahe is off
         clahe_clip_limit:           useClahe,
         clahe_grid_size:            useClahe,
-        // face smoothing / constant-box only matter for crop_mode = auto
-        use_face_smoothing:         auto,
-        // strength is the EMA coefficient — it does nothing under one_euro or
-        // gaussian, but it IS live for every ema-family method in every mode.
-        face_smoothing_strength:    (auto && faceSmooth && emaLike) || (filtered && emaLike),
-        use_constant_face_box:      auto,
-        // Also the jitterless anchor size: with frame0_size unset, this widget
-        // IS the locked crop size, so hiding it there left that mode's single
-        // most important control unreachable.
-        face_box_size_px:           (auto && constBox) || jitterless,
-        // iris smoothing sub-options
+        // --- crop geometry -------------------------------------------------
+        // Only two modes are offered now (expression_lock, default). Both use
+        // the reference face-tight box with a RAW per-frame centre, so every
+        // widget that only fed a centre filter, a locked size, or a lag margin
+        // is inert and stays hidden. They remain in INPUT_TYPES so existing
+        // workflows keep loading with their values intact — widgets are matched
+        // by position, and deleting them would shift every later value.
+        smoothing_method:           exprLock,       // filters the SIZE only
+        crop_size_one_euro_beta:    exprLock && smoothing === "one_euro",
+        crop_gaussian_window:       exprLock && smoothing === "gaussian",
+        face_smoothing_strength:    exprLock && emaLike,
+        crop_one_euro_min_cutoff:   legacyMode && method === "one_euro",
+        crop_one_euro_beta:         legacyMode && method === "one_euro",
+        crop_safety_margin:         legacyMode,
+        crop_containment_check:     legacyMode,
+        crop_containment_tolerance: legacyMode && containOn,
+        preserve_face_aspect:       legacyMode,
+        auto_smoothing_method:      legacyMode,
+        use_face_smoothing:         legacyMode,
+        use_constant_face_box:      legacyMode,
+        face_box_size_px:           legacyMode,
+        frame0_cx:                  legacyMode,
+        frame0_cy:                  legacyMode,
+        frame0_size:                legacyMode,
+        keyframes_json:             legacyMode,
+        // --- gaze / iris ---------------------------------------------------
+        // These land in pose_data. The pose conditioning image is a BODY
+        // skeleton (draw_aapose_new) with five coarse head dots and no iris,
+        // so none of it reaches the model as conditioning — it only populates
+        // this node's iris/pupil/debug OUTPUTS. Gated behind their own toggles
+        // so they stop crowding the node when unused.
         iris_smoothing_strength:    irisSmooth,
         iris_smoothing_method:      irisSmooth,
         iris_one_euro_min_cutoff:   irisSmooth && irisMethod === "one_euro",
         iris_one_euro_beta:         irisSmooth && irisMethod === "one_euro",
-        // gaze sub-options
         gaze_lock_strength:         gazeLock,
         gaze_one_euro_min_cutoff:   blendGaze,
         gaze_one_euro_beta:         blendGaze,
         gaze_max_yaw_deg:           blendGaze,
         gaze_max_pitch_deg:         blendGaze,
-        // manual-keyframe crop controls only matter for crop_mode = jitterless
-        frame0_cx:                  jitterless,
-        frame0_cy:                  jitterless,
-        frame0_size:                jitterless,
-        keyframes_json:             jitterless,
-        // auto picks its filter with auto_smoothing_method instead
-        smoothing_method:           jitterless || refSmooth || exprLock,
-        // centre filter knobs do nothing when the centre is raw
-        crop_one_euro_min_cutoff:   oneEuro && !exprLock,
-        crop_one_euro_beta:         oneEuro && !exprLock,
-        crop_gaussian_window:       gaussian,
-        // crop hardening — meaningless when crop_mode="default" (crop off).
-        // safety_margin is honoured by reference_smooth too; containment is
-        // not (that mode's box IS the detected box, so it always contains it).
-        crop_safety_margin:         cropActive || refSmooth,   // NOT exprLock: forced to 1.0
-        crop_containment_check:     cropActive,
-        crop_containment_tolerance: cropActive && containOn,
-        // separate beta for the size/scale trajectory — only the two modes
-        // that filter w/h read it, and only under one_euro.
-        crop_size_one_euro_beta:    (jitterless || refSmooth || exprLock) && smoothing === "one_euro",
-        auto_smoothing_method:      auto,
-        // aspect override is applied while BUILDING a box; reference_smooth
-        // keeps the detected aspect by construction and default does no crop.
-        preserve_face_aspect:       cropActive,
-        // eye-open override sub-options
-        eye_open_mode:              eyesOpen,
-        eye_open_blink_ear:         eyesOpen && String(get("eye_open_mode")?.value) === "blinks_only",
-        // previously ungated
-        eye_y_fraction:             eyeAlign === "eye_upper_third",
-        au_amplify_neutral_frame:   auAmp > 1.0,
         gaze_kalman_meas_std_deg:   kalmanEngine,
         gaze_kalman_process_std:    kalmanEngine,
         gaze_calibration_frame:     gazeEngine === "iris_geometric",
+        // --- pixel edits to face_images (these DO reach the model) ---------
+        eye_open_mode:              eyesOpen,
+        eye_open_blink_ear:         eyesOpen && String(get("eye_open_mode")?.value) === "blinks_only",
+        eye_y_fraction:             eyeAlign === "eye_upper_third",
+        au_amplify_neutral_frame:   auAmp > 1.0,
     };
     for (const w of node.widgets) {
         setHidden(w, (w.name in visible) ? !visible[w.name] : false);
