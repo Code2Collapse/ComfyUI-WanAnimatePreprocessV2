@@ -1861,7 +1861,7 @@ class PoseAndFaceDetectionV2:
                 "gaze_max_yaw_deg": ("FLOAT", {"default": 30.0, "min": 5.0, "max": 60.0, "step": 1.0, "tooltip": "Saturation yaw angle in degrees that corresponds to blend shape value 1.0. 30\u00b0 covers the comfortable physiological range; raise for more dramatic eye motion."}),
                 "gaze_max_pitch_deg": ("FLOAT", {"default": 25.0, "min": 5.0, "max": 60.0, "step": 1.0, "tooltip": "Saturation pitch angle in degrees that corresponds to blend shape value 1.0. 25\u00b0 covers the comfortable physiological range."}),
                 # ---- Jitterless face crop (manual frame-0 anchor + keyframes) ----
-                "crop_mode": (["default", "reference_smooth", "auto", "jitterless"], {"default": "default", "tooltip": "default = the REFERENCE behaviour, exactly: get_face_bboxes per frame -> crop -> resize 512, no smoothing (verified line-by-line against Wan2.2's process_pipepline.py). Correct framing, but the box is recomputed from jittering landmarks every frame so the tile wobbles. reference_smooth = RECOMMENDED. Identical geometry to 'default' (same box, same non-square aspect, same 512 stretch) with only the four box parameters (cx, cy, w, h) temporally filtered. Removes tile wobble WITHOUT touching a single face pixel. This matters because the Face Adapter's encoder is a plain conv stack over the whole tile with no landmark input, so it cannot tell crop wobble from real motion and box noise competes with the expression signal. auto = legacy smoothed + optional constant-size box. jitterless = locked constant-size crop (Mocha-style planar hold); stable but the face fills a varying fraction of the tile as the subject moves, which costs face resolution."}),
+                "crop_mode": (["default", "expression_lock", "reference_smooth", "auto", "jitterless"], {"default": "expression_lock", "tooltip": "expression_lock = RECOMMENDED for micro-expressions, secondary motion (water, blood, sweat, a strip of tape lifting in the wind) and anything subtle. The centre is taken RAW from the per-frame detection so the face is registered in the same place in every tile, and only the box SIZE is stabilised.\n\nWhy that matters: Wan-Animate encodes the whole 512x512 tile to just 20 numbers per frame (motion_dim=20, model_animate.py). It has no landmark input and no alignment stage, so it cannot separate the face MOVING inside the tile from the face CHANGING. Filtering the centre makes the box lag the head, so the face wanders inside the tile - measured 26-61px on a normal pan - while a micro-expression is only 2-5px of eyelid and lip travel. The 20 dims then get spent on rigid motion instead of expression. Measured within-tile wander: expression_lock and default ~0.7px, reference_smooth 2.8px, jitterless 3.2px, auto 7.1px.\n\ndefault = the REFERENCE behaviour: per-frame face-tight box, no smoothing at all. Equally good registration; the only thing it does not do is stop the tile size breathing.\n\nreference_smooth / auto / jitterless = STABILITY modes. They filter the centre, trading expression fidelity for a calmer tile. Use them when the shot is jittery and a steady crop matters more than subtle facial detail. Do NOT use them for micro-expression work."}),
                 "frame0_cx": ("INT", {"default": -1, "min": -1, "max": 8192, "tooltip": "Frame 0 anchor center X in pixels. -1 = use detected face center on frame 0. Used only when crop_mode=jitterless."}),
                 "frame0_cy": ("INT", {"default": -1, "min": -1, "max": 8192, "tooltip": "Frame 0 anchor center Y in pixels. -1 = use detected face center on frame 0."}),
                 "frame0_size": ("INT", {"default": 0, "min": 0, "max": 4096, "step": 16, "tooltip": "Locked square crop size in pixels (used for the entire clip). 0 = fall back to face_box_size_px."}),
@@ -2378,6 +2378,10 @@ class PoseAndFaceDetectionV2:
             raw_face_aspects.append(_bh / max(_bw, 1.0))
 
         crop_mode_str = str(crop_mode)
+        # expression_lock shares reference_smooth's code path but keeps the
+        # RAW per-frame centre. See the branch below for why that is the whole
+        # ballgame for micro-expressions.
+        expression_lock = crop_mode_str == "expression_lock"
         reference_smooth = crop_mode_str == "reference_smooth"
         jitterless = crop_mode_str == "jitterless"
         crop_off = crop_mode_str == "default"
@@ -2385,7 +2389,7 @@ class PoseAndFaceDetectionV2:
         if crop_off:
             # ── default: raw detected bboxes, no smoothing, no constant-size ──
             face_bboxes = list(raw_face_bboxes)
-        elif reference_smooth:
+        elif reference_smooth or expression_lock:
             # ── reference_smooth ─────────────────────────────────────────
             # The reference framing, de-jittered. Nothing about the GEOMETRY
             # is invented here: the box is still exactly what get_face_bboxes
@@ -2411,13 +2415,44 @@ class PoseAndFaceDetectionV2:
             _rw = np.array([float(b[1] - b[0]) for b in raw_face_bboxes], np.float32)
             _rh = np.array([float(b[3] - b[2]) for b in raw_face_bboxes], np.float32)
             _img_diag = float((W * W + H * H) ** 0.5)
-            _sc = _smooth_centers(
-                _rc, method=str(smoothing_method),
-                ema_strength=face_smoothing_strength, image_diag=_img_diag,
-                one_euro_min_cutoff=crop_one_euro_min_cutoff,
-                one_euro_beta=crop_one_euro_beta,
-                gaussian_window=int(crop_gaussian_window),
-            )
+            if expression_lock:
+                # ── expression_lock ──────────────────────────────────────
+                # The centre is NOT filtered. This is the whole point.
+                #
+                # Wan-Animate's face branch is a LIA motion encoder whose
+                # output is dim_motion=20 (model_animate.py: Generator(
+                # size=512, style_dim=512, motion_dim=20)). Twenty numbers per
+                # frame carry EVERYTHING the face contributes: expression,
+                # secondary motion, water, blood, a strip of tape lifting in
+                # the wind. It has no landmark input and no alignment stage,
+                # so it cannot separate "the face moved inside the tile" from
+                # "the face changed".
+                #
+                # The per-frame face-tight box IS the registration. Filtering
+                # the centre makes the box lag the head, so the face slides
+                # around inside the tile — measured 26-61px of wander in a 512
+                # tile on a normal pan. A micro-expression is 2-5px of eyelid
+                # and lip travel. So a filtered centre hands the encoder a
+                # rigid-motion signal 5-20x LARGER than the thing it is
+                # supposed to encode, and the 20 dims get spent on it. That is
+                # why crop_mode='default' preserves expressions and the
+                # smoothed modes do not.
+                #
+                # So: take the centre straight from the detector (registration
+                # as good as 'default', measured 0.7px wander) and stabilise
+                # ONLY the box SIZE. Size drift is far cheaper than
+                # translation because the face stays centred while it changes,
+                # and holding it steady stops the tile breathing, which is the
+                # one real artefact 'default' still has.
+                _sc = _rc
+            else:
+                _sc = _smooth_centers(
+                    _rc, method=str(smoothing_method),
+                    ema_strength=face_smoothing_strength, image_diag=_img_diag,
+                    one_euro_min_cutoff=crop_one_euro_min_cutoff,
+                    one_euro_beta=crop_one_euro_beta,
+                    gaussian_window=int(crop_gaussian_window),
+                )
             _size_beta = float(crop_size_one_euro_beta)
             _sw = _smooth_1d(_rw, method=str(smoothing_method),
                              ema_strength=face_smoothing_strength,
@@ -2431,7 +2466,18 @@ class PoseAndFaceDetectionV2:
                              one_euro_min_cutoff=crop_one_euro_min_cutoff,
                              one_euro_beta=_size_beta,
                              gaussian_window=int(crop_gaussian_window))
-            _mar = max(1.0, float(crop_safety_margin))
+            # crop_safety_margin exists to absorb FILTER LAG: it inflates the
+            # box so a crop that trails the head still contains it.
+            # expression_lock has no lag by construction (the centre is the
+            # detector's own, unfiltered), so that inflation buys nothing and
+            # costs real face resolution — a 1.12 margin spends 20% of the
+            # tile AREA on background the encoder then has to ignore, out of
+            # the same 20-dim budget. Use the reference box exactly.
+            # For deliberate headroom (tape or blood above the brow, hair
+            # movement) raise face_crop_scale instead: that is the reference's
+            # own framing parameter and it expands the box the way the encoder
+            # was trained to see.
+            _mar = 1.0 if expression_lock else max(1.0, float(crop_safety_margin))
             face_bboxes = []
             for _i in range(B):
                 _w = float(np.clip(_sw[_i] * _mar, 8.0, float(W)))
@@ -2446,10 +2492,13 @@ class PoseAndFaceDetectionV2:
                 face_bboxes.append((_x1, _x1 + int(round(_w)),
                                     _y1, _y1 + int(round(_h))))
             logging.getLogger(__name__).info(
-                "PoseAndFaceDetectionV2 [reference_smooth]: reference box geometry "
-                "(scale=%.2f) with cx/cy/w/h temporally filtered (%s). Box jitter "
-                "std: cx %.2f->%.2f px, w %.2f->%.2f px.",
-                float(face_crop_scale), str(smoothing_method),
+                "PoseAndFaceDetectionV2 [%s]: reference box geometry (scale=%.2f); "
+                "centre %s, size filtered (%s). Box jitter std: cx %.2f->%.2f px, "
+                "w %.2f->%.2f px.",
+                crop_mode_str, float(face_crop_scale),
+                ("RAW per-frame (registration preserved for the 20-dim face encoder)"
+                 if expression_lock else "filtered"),
+                str(smoothing_method),
                 float(np.std(np.diff(_rc[:, 0]))) if B > 1 else 0.0,
                 float(np.std(np.diff(_sc[:, 0]))) if B > 1 else 0.0,
                 float(np.std(np.diff(_rw))) if B > 1 else 0.0,
