@@ -3155,8 +3155,37 @@ class PoseAndFaceDetectionV2:
         # accurate" complaint). _gaze_note is set at each fallback below.
         _gaze_requested = _engine
         _gaze_note = None
-        if not bool(use_blendshape_gaze):
+        # gaze_engine DECIDES the engine (fixed 2026-07-31).
+        #
+        # This used to be:
+        #     if not bool(use_blendshape_gaze):
+        #         _engine = "legacy_iris_offset"
+        # use_blendshape_gaze defaults to False, so whatever the user selected
+        # in gaze_engine — ethxgaze, l2cs_gaze360, iris_geometric — was thrown
+        # away and replaced by the hand-written pixel-darkness voter, silently.
+        # That is why every engine behaved identically and identically badly:
+        # none of them was running. The dropdown was decorative.
+        #
+        # What the real engines actually need is MEDIAPIPE (they read the iris
+        # centres from landmarks 468/473, i.e. Google's own iris model), not a
+        # legacy checkbox. So gate on that, and say so when falling back.
+        _wants_real_engine = _engine not in ("", "legacy_iris_offset")
+        if _wants_real_engine and not mp_enabled:
+            _gaze_note = (
+                f"gaze_engine={_engine!r} needs MediaPipe face landmarks (the "
+                f"iris comes from landmarks 468/473) but use_mediapipe_face is "
+                f"off or MediaPipe is unavailable, so it fell back to the "
+                f"legacy pixel-darkness pupil search. Turn use_mediapipe_face "
+                f"ON for the engine you selected to actually run."
+            )
+            logging.getLogger(__name__).warning(
+                "PoseAndFaceDetectionV2: %s", _gaze_note,
+            )
             _engine = "legacy_iris_offset"
+        elif not _wants_real_engine and bool(use_blendshape_gaze):
+            # Legacy workflows that only ticked the old checkbox still get a
+            # real engine rather than the voter.
+            _engine = "blendshape_head_corrected"
         # C0.4: ethxgaze is a *post-process* over a base engine — the
         # ResNet-50 face-level estimator only runs after iris_data has
         # been populated. We swap to blendshape_head_corrected for the
