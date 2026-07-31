@@ -22,6 +22,16 @@ const UI_KEY     = "viewer_meta";
 const PANEL_H    = 340;
 
 // Compact OpenPose-18 skeleton edges (subset that's always meaningful).
+// A joint only counts if the detector actually found it. viewer_meta now
+// carries [x, y, confidence]; undetected joints (hips/knees/ankles in a
+// head-and-shoulders shot, or anything zeroed by pose_threshold) used to be
+// drawn anyway at whatever stale coordinates they held, producing long edges
+// shooting across the frame — the "shattered skeleton". Same 0.5 gate the
+// reference drawer (draw_aapose_new) uses. Older metas have no third element,
+// so treat a missing confidence as valid and keep them working.
+const JOINT_MIN_CONF = 0.5;
+const _ok = (p) => !!p && (p.length < 3 || p[2] >= JOINT_MIN_CONF);
+
 const SKELETON_EDGES = [
     [1, 2], [1, 5], [2, 3], [3, 4], [5, 6], [6, 7],
     [1, 8], [8, 9], [9, 10],
@@ -301,7 +311,7 @@ function makePanel(node) {
                 ctx.strokeStyle = _fill(C.blue, "#89b4fa"); ctx.lineWidth = 2;
                 for (const [a, b] of SKELETON_EDGES) {
                     const pa = frame.skeleton[a], pb = frame.skeleton[b];
-                    if (!pa || !pb) continue;
+                    if (!_ok(pa) || !_ok(pb)) continue;
                     ctx.beginPath(); ctx.moveTo(px(pa[0]), py(pa[1])); ctx.lineTo(px(pb[0]), py(pb[1])); ctx.stroke();
                 }
                 if (state.edit) {
@@ -309,7 +319,7 @@ function makePanel(node) {
                     // joint highlighted; corrected joints tinted mauve.
                     for (let j = 0; j < frame.skeleton.length; j++) {
                         const p = frame.skeleton[j];
-                        if (!p) continue;
+                        if (!_ok(p)) continue;
                         const active = (j === dragJoint || j === hoverJoint);
                         const edited = _hasOverride(frameIdx, j);
                         const cx = px(p[0]), cy = py(p[1]);
