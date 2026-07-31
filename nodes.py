@@ -1561,6 +1561,33 @@ def _locked_crop_side(face_box_size_px, raw_face_bboxes, W, H, mode_label):
     return side
 
 
+def _face_pin_ring(pts, w, h, n=24, pad=1.18):
+    """A closed ring of anchor points just outside the face landmarks.
+
+    Any piecewise-affine face warp has to answer: what happens to the pixels
+    that are NOT part of the face? The 68-point iBUG contour cannot answer it,
+    because points 0-16 trace an open ARC along the jaw and there are no
+    forehead points at all — the face is unbounded at the top. Triangulate that
+    against a pinned image border and the triangles covering forehead, hair,
+    ears and background have moving vertices, so amplifying an expression drags
+    the whole picture. That is what makes a warped tile read as "the entire
+    image is warped" rather than "the mouth moved".
+
+    Emitting this ring identically in src and dst seals the face inside a
+    closed, fixed boundary: every triangle that touches anything beyond the
+    face has all three vertices pinned and therefore cannot move at all.
+    """
+    p = np.asarray(pts, dtype=np.float32).reshape(-1, 2)
+    cx, cy = float(p[:, 0].mean()), float(p[:, 1].mean())
+    rx = max(float(np.abs(p[:, 0] - cx).max()) * pad, 8.0)
+    ry = max(float(np.abs(p[:, 1] - cy).max()) * pad, 8.0)
+    a = np.linspace(0.0, 2.0 * np.pi, int(n), endpoint=False)
+    ring = np.stack([cx + rx * np.cos(a), cy + ry * np.sin(a)], axis=1)
+    ring[:, 0] = np.clip(ring[:, 0], 0, w - 1)
+    ring[:, 1] = np.clip(ring[:, 1], 0, h - 1)
+    return ring.astype(np.float32)
+
+
 def _crop_with_padding(frame, x1, x2, y1, y2):
     """Crop ``frame`` to the (possibly out-of-frame) box, edge-padding as needed.
 
@@ -4373,7 +4400,22 @@ class PoseAndFaceDetectionV2:
                         _neutral_eye_l, _neutral_eye_r, float(au_amplify),
                     )
                     _src_pts[_idx] = _cur_pts.astype(np.float32)
-                    _disp[_idx] = (_amp_pts - _cur_pts).astype(np.float32)
+                    _d = (_amp_pts - _cur_pts).astype(np.float32)
+                    # PIN THE FACE OUTLINE (fixed 2026-07-31). In the 68-point
+                    # iBUG layout, indices 0-16 are the JAW CONTOUR — the outer
+                    # boundary of the face. warp_face pins the tile border, so
+                    # the region between the jaw and that border is spanned by
+                    # triangles whose inner vertices are these contour points.
+                    # Amplifying them shears every one of those triangles, which
+                    # drags the forehead, ears, neck and background with it: the
+                    # whole image warps instead of just the expression. Holding
+                    # the outline fixed confines the warp to the interior, which
+                    # is where expression actually lives (brows, eyes, nose,
+                    # mouth). Jaw OPENING still comes through, because the mouth
+                    # and chin interior points are not pinned.
+                    if _d.shape[0] >= 17:
+                        _d[:17] = 0.0
+                    _disp[_idx] = _d
 
                 # Gaussian, not one_euro. Measured against a known ground truth
                 # (real expression + 1.5px detector noise, au_amplify=1.3),
@@ -4404,7 +4446,19 @@ class PoseAndFaceDetectionV2:
                         continue  # negligible amplification — skip the warp
                     _crop = face_images_np[_idx]
                     _crop_f = _crop.astype(np.float32) / 255.0 if not _is_float else _crop.astype(np.float32)
-                    _warped = warp_face(_crop_f, _cur_pts, _amp_pts.astype(np.float32))
+                    # CLOSED PINNED RING around the face. Pinning the jaw
+                    # (indices 0-16) is not enough on its own: the iBUG contour
+                    # is an open ARC with no forehead points, so the face is
+                    # unbounded at the top and triangles from the brow region
+                    # run straight out to the tile border — dragging forehead,
+                    # hair and background. A closed ellipse just outside the
+                    # landmarks, identical in src and dst, seals that gap, so
+                    # every triangle touching anything beyond the face has all
+                    # its vertices fixed and cannot move.
+                    _ring = _face_pin_ring(_cur_pts, 512, 512)
+                    _s_all = np.vstack([_cur_pts, _ring]).astype(np.float32)
+                    _d_all = np.vstack([_amp_pts, _ring]).astype(np.float32)
+                    _warped = warp_face(_crop_f, _s_all, _d_all)
                     face_images_np[_idx] = (
                         _warped if _is_float else np.clip(_warped * 255.0, 0, 255).astype(_crop.dtype)
                     )
