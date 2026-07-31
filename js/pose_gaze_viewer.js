@@ -341,7 +341,9 @@ function makePanel(node) {
                     ctx.beginPath(); ctx.arc(iX, iY, 3.5, 0, Math.PI * 2); ctx.fill();
                 }
                 if (state.gaze && gz && gz.length >= 3 && gz[2] > 0.01) {
-                    const len = 34 * gz[2], ex = iX + gz[0] * len, ey = iY + gz[1] * len;
+                    // dx/dy now carry the magnitude; fixed gain, no second
+                    // multiply by gz[2] or the arrow length is squared.
+                    const len = 110, ex = iX + gz[0] * len, ey = iY + gz[1] * len;
                     ctx.strokeStyle = e.color; ctx.lineWidth = 2;
                     ctx.beginPath(); ctx.moveTo(iX, iY); ctx.lineTo(ex, ey); ctx.stroke();
                     const ang = Math.atan2(ey - iY, ex - iX), ah = 6;

@@ -1149,9 +1149,9 @@ def draw_debug_overlay(frame_uint8, face_kps_norm, iris_data,
         if gaze and (abs(gaze['dx']) > 1e-4 or abs(gaze['dy']) > 1e-4):
             # Magnitude-aware arrow length: scale by gaze strength so
             # noise-level offsets shrink toward _GAZE_MIN_ARROW_LEN_PX.
-            mag = float(gaze.get('magnitude_norm', 1.0))
-            arrow_len = int(_GAZE_MIN_ARROW_LEN_PX +
-                            (_GAZE_MAX_ARROW_LEN_PX - _GAZE_MIN_ARROW_LEN_PX) * mag)
+            # dx/dy already carry the magnitude, so use a FIXED gain here -
+            # scaling by magnitude_norm again would square it.
+            arrow_len = int(_GAZE_MAX_ARROW_LEN_PX)
             ex = int(ix + gaze['dx'] * arrow_len)
             ey = int(iy + gaze['dy'] * arrow_len)
             cv2.arrowedLine(vis, (ix, iy), (ex, ey),
@@ -3615,8 +3615,18 @@ class PoseAndFaceDetectionV2:
                             e['dy'] = 0.0
                             e['magnitude_norm'] = 0.0
                         else:
-                            e['dx'] = round(_dx / _mag, 4)
-                            e['dy'] = round(_dy / _mag, 4)
+                            # dx/dy CARRY the magnitude (fixed 2026-07-31).
+                            # These used to be a bare unit vector: for a
+                            # subject looking near the camera _dx and _dy are a
+                            # fraction of a degree each, so dividing by their
+                            # own length discarded the gaze and kept a
+                            # direction made almost entirely of estimator
+                            # noise, stretched to full length. Scaling by
+                            # mag_norm makes the vector shrink to nothing as
+                            # the gaze approaches the camera axis, which is the
+                            # behaviour every consumer wants.
+                            e['dx'] = round(_dx / _mag * mag_norm, 4)
+                            e['dy'] = round(_dy / _mag * mag_norm, 4)
                             e['magnitude_norm'] = mag_norm
                         # Keep the pixel-space refs available for the
                         # diagnostic log below.
@@ -3896,8 +3906,13 @@ class PoseAndFaceDetectionV2:
                             e['dy'] = 0.0
                             e['magnitude_norm'] = 0.0
                         else:
-                            e['dx'] = round(_ldx / _lmag, 4)
-                            e['dy'] = round(_ldy / _lmag, 4)
+                            # Same magnitude-carrying convention as the
+                            # engine block above. gaze_lock_eyes defaults ON,
+                            # so this block runs LAST and its unit-normalised
+                            # dx/dy overwrote every engine's correct output -
+                            # which is why the arrow was wrong in all modes.
+                            e['dx'] = round(_ldx / _lmag * _lmag_norm, 4)
+                            e['dy'] = round(_ldy / _lmag * _lmag_norm, 4)
                             e['magnitude_norm'] = _lmag_norm
 
         # Build per-frame iris output
