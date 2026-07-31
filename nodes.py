@@ -897,6 +897,7 @@ def _find_pupil_center(eye_pts_px, img_gray, W, H):
     # undetectable, in every engine that falls back to this finder.
     # Lash/shadow rejection is the darkness-weighting's job, not the search
     # region's.
+    mask = mask_full
 
     kern = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
     mask_inner = cv2.erode(mask, kern, iterations=2)
@@ -2475,18 +2476,56 @@ class PoseAndFaceDetectionV2:
                     gaussian_window=int(crop_gaussian_window),
                 )
             _size_beta = float(crop_size_one_euro_beta)
-            _sw = _smooth_1d(_rw, method=str(smoothing_method),
-                             ema_strength=face_smoothing_strength,
-                             scale_norm=max(float(np.mean(_rw)), 1.0),
-                             one_euro_min_cutoff=crop_one_euro_min_cutoff,
-                             one_euro_beta=_size_beta,
-                             gaussian_window=int(crop_gaussian_window))
-            _sh = _smooth_1d(_rh, method=str(smoothing_method),
-                             ema_strength=face_smoothing_strength,
-                             scale_norm=max(float(np.mean(_rh)), 1.0),
-                             one_euro_min_cutoff=crop_one_euro_min_cutoff,
-                             one_euro_beta=_size_beta,
-                             gaussian_window=int(crop_gaussian_window))
+            if expression_lock:
+                # ONE scale series + a CONSTANT aspect (fixed 2026-07-31).
+                #
+                # Smoothing width and height as two independent series lets
+                # their RATIO drift: on a head turn w and h change at
+                # different rates, the two filters lag differently, and the
+                # box aspect wobbles frame to frame. Every box is then
+                # stretched to a SQUARE 512x512, so an aspect wobble becomes
+                # the face visibly squashing and stretching — warping jitter
+                # that no amount of centre stability can hide, because it is
+                # anisotropic scaling, not translation.
+                #
+                # Smooth a single SCALE (the geometric mean of w and h, which
+                # tracks the face's area faithfully) and hold the aspect at
+                # the clip median. The stretch to 512 is then IDENTICAL on
+                # every frame, so the only thing that can change inside the
+                # tile is the face itself.
+                _scale = np.sqrt(np.maximum(_rw, 1.0) * np.maximum(_rh, 1.0))
+                _ss = _smooth_1d(_scale, method=str(smoothing_method),
+                                 ema_strength=face_smoothing_strength,
+                                 scale_norm=max(float(np.mean(_scale)), 1.0),
+                                 one_euro_min_cutoff=crop_one_euro_min_cutoff,
+                                 one_euro_beta=_size_beta,
+                                 gaussian_window=int(crop_gaussian_window))
+                _asp_const = float(np.clip(
+                    np.median(np.maximum(_rh, 1.0) / np.maximum(_rw, 1.0)),
+                    0.25, 4.0))
+                _root = float(np.sqrt(_asp_const))
+                _sw = (_ss / _root).astype(np.float32)
+                _sh = (_ss * _root).astype(np.float32)
+                logging.getLogger(__name__).info(
+                    "PoseAndFaceDetectionV2 [expression_lock]: aspect held "
+                    "constant at %.3f for the whole clip (was drifting with "
+                    "independently-filtered w/h, which shows up as the face "
+                    "stretching frame to frame after the square 512 resize).",
+                    _asp_const,
+                )
+            else:
+                _sw = _smooth_1d(_rw, method=str(smoothing_method),
+                                 ema_strength=face_smoothing_strength,
+                                 scale_norm=max(float(np.mean(_rw)), 1.0),
+                                 one_euro_min_cutoff=crop_one_euro_min_cutoff,
+                                 one_euro_beta=_size_beta,
+                                 gaussian_window=int(crop_gaussian_window))
+                _sh = _smooth_1d(_rh, method=str(smoothing_method),
+                                 ema_strength=face_smoothing_strength,
+                                 scale_norm=max(float(np.mean(_rh)), 1.0),
+                                 one_euro_min_cutoff=crop_one_euro_min_cutoff,
+                                 one_euro_beta=_size_beta,
+                                 gaussian_window=int(crop_gaussian_window))
             # crop_safety_margin exists to absorb FILTER LAG: it inflates the
             # box so a crop that trails the head still contains it.
             # expression_lock has no lag by construction (the centre is the
