@@ -89,17 +89,10 @@ function applyVisibility(node) {
 
     // visible[name] = true → show; everything not listed is always shown.
     const visible = {
-        // crop_mode is gone - there is one crop behaviour and no choice to make
-        crop_mode:                  false,
-        // colour/exposure conditioning is DERIVED from each frame now
-        // (see preprocess_for_pose); these stay only as expert overrides
-        detect_gamma:               false,
-        detect_white_balance:       false,
-        detect_denoise:             false,
-        detect_sharpen:             false,
-        detect_saturation:          false,
-        clahe_clip_limit:           false,
-        clahe_grid_size:            false,
+        // CLAHE sub-options follow their toggle; the rest of the detector
+        // colour controls are always available (they are manual again).
+        clahe_clip_limit:           useClahe,
+        clahe_grid_size:            useClahe,
         blur_radius:                useBlur,
         blur_sigma:                 useBlur,
         // --- crop geometry -------------------------------------------------
@@ -113,20 +106,20 @@ function applyVisibility(node) {
         crop_size_one_euro_beta:    false,
         crop_gaussian_window:       false,
         face_smoothing_strength:    false,
-        crop_one_euro_min_cutoff:   legacyMode && method === "one_euro",
-        crop_one_euro_beta:         legacyMode && method === "one_euro",
-        crop_safety_margin:         legacyMode,
-        crop_containment_check:     legacyMode,
-        crop_containment_tolerance: legacyMode && containOn,
-        preserve_face_aspect:       legacyMode,
-        auto_smoothing_method:      legacyMode,
-        use_face_smoothing:         legacyMode,
-        use_constant_face_box:      legacyMode,
-        face_box_size_px:           legacyMode,
-        frame0_cx:                  legacyMode,
-        frame0_cy:                  legacyMode,
-        frame0_size:                legacyMode,
-        keyframes_json:             legacyMode,
+        crop_one_euro_min_cutoff:   oneEuro,
+        crop_one_euro_beta:         oneEuro,
+        crop_safety_margin:         cropActive || refSmooth,
+        crop_containment_check:     cropActive,
+        crop_containment_tolerance:  cropActive && containOn,
+        preserve_face_aspect:       cropActive,
+        auto_smoothing_method:      auto,
+        use_face_smoothing:         auto,
+        use_constant_face_box:      auto,
+        face_box_size_px:           (auto && constBox) || jitterless,
+        frame0_cx:                  jitterless,
+        frame0_cy:                  jitterless,
+        frame0_size:                jitterless,
+        keyframes_json:             jitterless,
         // --- gaze / iris ---------------------------------------------------
         // These land in pose_data. The pose conditioning image is a BODY
         // skeleton (draw_aapose_new) with five coarse head dots and no iris,
