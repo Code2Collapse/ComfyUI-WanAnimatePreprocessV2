@@ -581,32 +581,18 @@ def preprocess_for_pose(img, use_clahe=True, clahe_clip=2.0, clahe_grid=8,
     if img is None:
         return img
 
-    # AUTO (2026-07-30). The five manual knobs below were unusable in practice:
-    # nobody can be expected to guess a gamma or a saturation multiplier for a
-    # detector they cannot see the input of. They are now DERIVED from the
-    # frame, and the manual values act only as overrides when moved off their
-    # defaults. This is what makes hard footage work without being tuned —
-    # underwater and heavy-LUT shots in particular, where the whole reason the
-    # detector fails is that skin has drifted far off neutral.
-    if use_clahe:
-        _f = img if np.issubdtype(img.dtype, np.floating) else img.astype(np.float32) / 255.0
-        _f = np.clip(_f, 0.0, 1.0)
-        if _f.ndim == 3 and _f.shape[2] >= 3:
-            _means = np.array([_f[..., c].mean() for c in range(3)], np.float32)
-            _grey = float(_means.mean())
-            # Colour cast: how far the channel means are from each other,
-            # relative to overall level. Underwater is the extreme case — the
-            # red channel collapses, so this is large and WB switches itself on.
-            _cast = float(_means.std() / max(_grey, 1e-3))
-            if not white_balance and _cast > 0.08:
-                white_balance = True
-        # Exposure: a frame sitting far from mid-grey loses the detector the
-        # contrast it needs. Pull it toward 0.45 with gamma, bounded so a
-        # deliberately dark or bright look is not flattened.
-        _lum = float(_f[..., :3].mean()) if _f.ndim == 3 else float(_f.mean())
-        if abs(gamma - 1.0) < 1e-6 and 1e-3 < _lum < 0.999:
-            _g = float(np.log(max(_lum, 1e-3)) / np.log(0.45))
-            gamma = float(np.clip(_g, 0.55, 1.8))
+    # NO AUTO COLOUR (reverted 2026-07-31). A previous version derived
+    # white-balance and gamma from the frame automatically. That is wrong and
+    # it broke real footage: grey-world balance measures the spread of the
+    # channel means and calls anything lopsided a "colour cast" to neutralise
+    # — but it cannot tell a cast from a subject that is GENUINELY strongly
+    # coloured. On a gold-painted character it neutralised the actual paint,
+    # handing the detector an image nothing like the shot and moving every
+    # landmark. Exposure auto-gamma had the same problem on deliberately dark
+    # or bright grades.
+    #
+    # These are DETECTOR-side controls and they stay MANUAL, at no-op
+    # defaults. The operator can see the footage; this function cannot.
     do_wb = bool(white_balance)
     do_gamma = abs(float(gamma) - 1.0) > 1e-3
     do_clahe = bool(use_clahe)
@@ -897,12 +883,20 @@ def _find_pupil_center(eye_pts_px, img_gray, W, H):
     mask_full = np.zeros((h_roi, w_roi), dtype=np.uint8)
     cv2.fillConvexPoly(mask_full, pts_local, 255)
 
-    # --- Restrict to upper 65 % of lid opening ---
-    eye_top_l = max(0, int(min_xy[1]) - ry1)
-    eye_bot_l = min(h_roi, int(max_xy[1]) - ry1)
-    cutoff = int(eye_top_l + 0.65 * (eye_bot_l - eye_top_l))
-    mask = mask_full.copy()
-    mask[cutoff:, :] = 0
+    # --- Search the WHOLE lid opening (fixed 2026-07-31) ---
+    # This used to erase the bottom 35 % of the aperture before looking for
+    # the pupil:
+    #     cutoff = int(eye_top_l + 0.65 * (eye_bot_l - eye_top_l))
+    #     mask[cutoff:, :] = 0
+    # The stated reason was eyelash/lid-shadow contamination, but the effect is
+    # that a pupil in the lower third of the eye — i.e. ANY downward gaze —
+    # sits in the deleted region and cannot be found. The search then returns
+    # the darkest point still inside the upper 65 %, which is ABOVE the true
+    # pupil, so dy = iris_y - eye_centre_y came out NEGATIVE and the arrow
+    # pointed UP on a subject looking DOWN. Downward gaze was structurally
+    # undetectable, in every engine that falls back to this finder.
+    # Lash/shadow rejection is the darkness-weighting's job, not the search
+    # region's.
 
     kern = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
     mask_inner = cv2.erode(mask, kern, iterations=2)
@@ -1888,7 +1882,7 @@ class PoseAndFaceDetectionV2:
                 "gaze_max_yaw_deg": ("FLOAT", {"default": 30.0, "min": 5.0, "max": 60.0, "step": 1.0, "tooltip": "Saturation yaw angle in degrees that corresponds to blend shape value 1.0. 30\u00b0 covers the comfortable physiological range; raise for more dramatic eye motion."}),
                 "gaze_max_pitch_deg": ("FLOAT", {"default": 25.0, "min": 5.0, "max": 60.0, "step": 1.0, "tooltip": "Saturation pitch angle in degrees that corresponds to blend shape value 1.0. 25\u00b0 covers the comfortable physiological range."}),
                 # ---- Jitterless face crop (manual frame-0 anchor + keyframes) ----
-                "crop_mode": (["expression_lock", "default"], {"default": "expression_lock", "tooltip": "How the face crop box is built.\n\nexpression_lock (default) = the reference face-tight box, with the centre taken RAW from each frame's detection and only the box SIZE stabilised. Use this.\n\ndefault = the reference behaviour exactly, byte for byte with Wan2.2's process_pipepline.py: per-frame box, no smoothing of anything. Use it to A/B against the official pipeline.\n\nWhy there is nothing else to choose: Wan-Animate compresses the whole 512x512 face tile to 20 numbers per frame (motion_dim=20, model_animate.py) with no landmark input and no alignment stage, so it cannot tell the face MOVING inside the tile from the face CHANGING. Smoothing the crop centre makes the box lag the head, the face then wanders 26-61px inside the tile on a normal pan, and since a micro-expression is only 2-5px of eyelid and lip travel those 20 numbers get spent on rigid motion instead of expression. Both modes here keep within-tile wander under 1px. The old reference_smooth / auto / jitterless modes still run if a saved workflow selects them, but they are no longer offered because they measurably destroy the thing this node exists to preserve."}),
+                "crop_mode": (["expression_lock", "default", "auto", "jitterless", "reference_smooth"], {"default": "expression_lock", "tooltip": "How the face crop box is built. All modes are available - pick what your shot needs.\n\nexpression_lock = reference face-tight box, RAW per-frame centre, only the box SIZE stabilised. Best measured registration (face wanders under 1px inside the tile) so the most of Wan-Animate's 20-number face code goes to expression rather than rigid motion.\n\ndefault = the reference behaviour exactly: per-frame box, no smoothing at all.\n\nauto = legacy motion-adaptive smoothing, optional constant-size box.\n\njitterless = locked constant-size crop, Mocha-style planar hold.\n\nreference_smooth = reference geometry with cx/cy/w/h temporally filtered.\n\nThe smoothed modes filter the crop CENTRE, which lets the face drift inside the tile (measured 26-61px on a pan vs under 1px for expression_lock/default). That costs subtle facial detail, but they are steadier on jittery footage - your call, not mine."}),
                 "frame0_cx": ("INT", {"default": -1, "min": -1, "max": 8192, "tooltip": "Frame 0 anchor center X in pixels. -1 = use detected face center on frame 0. Used only when crop_mode=jitterless."}),
                 "frame0_cy": ("INT", {"default": -1, "min": -1, "max": 8192, "tooltip": "Frame 0 anchor center Y in pixels. -1 = use detected face center on frame 0."}),
                 "frame0_size": ("INT", {"default": 0, "min": 0, "max": 4096, "step": 16, "tooltip": "Locked square crop size in pixels (used for the entire clip). 0 = fall back to face_box_size_px."}),
@@ -1917,7 +1911,7 @@ class PoseAndFaceDetectionV2:
                 "gaze_fps": ("FLOAT", {"default": 30.0, "min": 1.0, "max": 240.0, "step": 1.0, "tooltip": "Video fps used by the Kalman dt. Set to match your source clip; affects velocity coupling, not absolute angles."}),
                 "gaze_calibration_frame": ("INT", {"default": -1, "min": -1, "max": 999999, "tooltip": "W7-G2 per-shot gaze calibration (iris_geometric engine only). Set this to a frame index where the subject looks STRAIGHT AT THE CAMERA; the measured eye-in-head angles on that frame become the zero reference for the whole shot, removing per-person eye-shape bias (the last few degrees of error no model can fix). -1 = off."}),
                 # C0.1 — per-frame iris repaint at gaze-corrected position.
-                "apply_gaze_to_face_image": (["warp", "off", "overlay", "replace"], {"default": "warp", "tooltip": "Deliver the computed gaze into the 512x512 face crop by moving REAL iris pixels.\n\n'warp' (DEFAULT) = a Delaunay piecewise-affine warp shifts the actual iris pixels to the gaze-corrected position. Displacement is clamped to the eye aperture, frames markedly blurrier than the clip's own median are skipped, and any failure is non-fatal.\n\nWhy this must be on for a gaze estimate to do anything at all: Wan-Animate's pose conditioning image is a 20-point BODY skeleton plus five coarse head dots - nose, two eyes, two ears - and nothing else (draw_aapose_new). No face mesh, no iris. So every gaze engine, the iris smoother and the gaze lock write numbers the model never sees. The ONLY route from a gaze estimate to the render is the PIXELS of face_images, which is what this edits.\n\nIf the estimate already agrees with the performer's real iris position this correctly changes nothing - the eyes are already right in the pixels. The node logs how many frames it actually touched, so it can never look broken when it is simply idle.\n\n'off' = never touch the crop. 'overlay'/'replace' = legacy; they stamp a synthetic iris disk, which is out-of-distribution for an encoder trained with scale/colour/noise augmentation only."}),
+                "apply_gaze_to_face_image": (["off", "warp", "overlay", "replace"], {"default": "off", "tooltip": "Move real iris pixels in the face crop to match the computed gaze.\n\nDEFAULT IS OFF, deliberately. This is a Delaunay warp of the actual OUTPUT pixels and it is only as good as the gaze estimate driving it. If the estimate is wrong it DAMAGES face_images rather than helping. Turn it on only after checking the gaze arrows are correct on your footage AND you actually want to override the performer's own eyes.\n\nNote gaze reaches Wan-Animate ONLY through these pixels - the pose conditioning image is a body skeleton with five coarse head dots and no iris. With this off, the gaze in face_images is whatever the camera saw, which is normally what you want."}),
                 "au_amplify": ("FLOAT", {"default": 1.0, "min": 1.0, "max": 1.5, "step": 0.01, "tooltip": "Wan-Animate spec 2.3: the face encoder compresses to a small fixed-capacity motion-basis vector, so a genuinely subtle real microexpression can sit near the compression noise floor. This pushes each frame's detected face landmarks a bit FURTHER along the direction they already moved from the neutral reference frame (au_amplify_neutral_frame) — amplifying REAL, DETECTED motion so more of it survives compression; it never synthesizes anything that wasn't already measured. 1.0 = off (default). 1.15-1.3 is the range the paper's own architecture analysis suggests; values are capped at 1.5 since the correction is only a 2D (eye-line roll+scale) head-pose approximation, not a full 3D one — the discrepancy grows with head yaw/pitch, so keep this modest for non-frontal shots. Delivered via the same Delaunay real-pixel warp as 'warp' gaze mode; gated by the same blur/quality check; on any per-frame failure that frame is left unamplified."}),
                 "au_amplify_neutral_frame": ("INT", {"default": 0, "min": 0, "max": 999999, "tooltip": "Frame index to use as the NEUTRAL reference for au_amplify — pick a frame where the subject's expression is relaxed/neutral (Wan-Animate spec 2.4: an already-tense or asymmetric reference eats into the same motion-basis budget the target microexpression needs). Ignored when au_amplify=1.0."}),
                 "export_expression_coeffs": ("BOOLEAN", {"default": False, "tooltip": "Wan-Animate spec 3.1 (closed-loop critic, foundation): export the 'expression_coeffs_json' output — per-frame ARKit-52 blendshapes measured from this run's iris_data. Off by default (no extra cost when unused). Run this node once on the source driving video and once on the Wan-Animate generated output, then wire the source run's expression_coeffs_json into DrawViTPoseV2.reference_expression_coeffs_json for a per-AU fidelity report."}),
@@ -2404,20 +2398,7 @@ class PoseAndFaceDetectionV2:
             _bw, _bh = float(x2 - x1), float(y2 - y1)
             raw_face_aspects.append(_bh / max(_bw, 1.0))
 
-        # ONE crop behaviour. There is no menu any more: every mode that
-        # filtered the crop CENTRE de-registered the face inside the tile,
-        # and Wan-Animate compresses that tile to 20 numbers per frame
-        # (Generator motion_dim=20), so the budget went to rigid motion
-        # instead of expression. Measured within-tile wander: this path
-        # 0.9px, the retired modes 26-61px. Keeping a choice there only
-        # offered ways to get a worse result.
         crop_mode_str = str(crop_mode)
-        if crop_mode_str not in ('expression_lock', 'default'):
-            logging.getLogger(__name__).info(
-                "PoseAndFaceDetectionV2: crop_mode=%r no longer exists; using the "
-                "single supported crop (reference face-tight box, raw per-frame "
-                "centre, stabilised size).", crop_mode_str)
-        crop_mode_str = 'expression_lock'
         # expression_lock shares reference_smooth's code path but keeps the
         # RAW per-frame centre. See the branch below for why that is the whole
         # ballgame for micro-expressions.
