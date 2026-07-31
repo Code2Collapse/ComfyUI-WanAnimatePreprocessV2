@@ -1864,7 +1864,7 @@ class PoseAndFaceDetectionV2:
                 # Constant-size face box
                 "use_constant_face_box": ("BOOLEAN", {"default": True, "tooltip": "Keep a constant pixel size face crop; position adapts."}),
                 "face_crop_scale": ("FLOAT", {"default": 1.3, "min": 1.0, "max": 3.0, "step": 0.05, "tooltip": "AREA expansion of the face box, passed straight to get_face_bboxes. 1.3 is the value Wan2.2's own process_pipepline.py uses at both call sites, so 1.3 = reference-exact. LOWER (1.1-1.2) crops tighter, which puts MORE pixels on the face after the 512 resize and is the single most effective knob for micro-expression detail; too low and a head turn can clip the jaw/ear. HIGHER gives more headroom and safety at the cost of face resolution. Applies to every crop_mode."}),
-                "face_box_size_px": ("INT", {"default": 0, "min": 0, "max": 1024, "step": 16, "tooltip": "Side of the constant-size face crop, in SOURCE pixels, for crop_mode=auto (with use_constant_face_box) and jitterless.\n\n0 = AUTO (recommended): the side is derived from the median DETECTED face box across the clip, then held constant for every frame. You get the reference pipeline's face-tight framing - the face FILLS the tile - while the size still never breathes, which is the whole point of these modes.\n\nA fixed value is an ABSOLUTE pixel size and is almost always wrong unless you know your footage: the old 512 default clamps to min(width,height), so on an 832x480 clip it cut a 480px window around a ~125px face. The face then filled about a quarter of the tile and the rest was background, throwing away roughly 3/4 of the resolution a micro-expression needs and making the subject look off to one side. Set a fixed value only to lock a specific framing across separate renders."}),
+                "face_box_size_px": ("INT", {"default": 0, "min": 0, "max": 1024, "step": 4, "tooltip": "Side of the constant-size face crop, in SOURCE pixels, for crop_mode=auto (with use_constant_face_box) and jitterless.\n\n0 = AUTO (recommended): the side is derived from the median DETECTED face box across the clip, then held constant for every frame. You get the reference pipeline's face-tight framing - the face FILLS the tile - while the size still never breathes, which is the whole point of these modes.\n\nA fixed value is an ABSOLUTE pixel size and is almost always wrong unless you know your footage: the old 512 default clamps to min(width,height), so on an 832x480 clip it cut a 480px window around a ~125px face. The face then filled about a quarter of the tile and the rest was background, throwing away roughly 3/4 of the resolution a micro-expression needs and making the subject look off to one side. Set a fixed value only to lock a specific framing across separate renders."}),
                 # Iris estimation
                 "use_iris_smoothing": ("BOOLEAN", {"default": True, "tooltip": "Temporally smooth iris pixel positions across frames. Reduces per-frame jitter that Wan 2.2 Animate's face encoder picks up and reproduces as wobbly gaze."}),
                 "iris_smoothing_strength": ("FLOAT", {"default": 0.4, "min": 0.0, "max": 1.0, "step": 0.05, "tooltip": "EMA mix weight when iris_smoothing_method='ema'. Higher = more smoothing, more lag. Ignored for one_euro / none."}),
@@ -1886,7 +1886,7 @@ class PoseAndFaceDetectionV2:
                 "crop_mode": (["expression_lock", "default", "auto", "jitterless", "reference_smooth"], {"default": "expression_lock", "tooltip": "How the face crop box is built. All modes are available - pick what your shot needs.\n\nexpression_lock = reference face-tight box, RAW per-frame centre, only the box SIZE stabilised. Best measured registration (face wanders under 1px inside the tile) so the most of Wan-Animate's 20-number face code goes to expression rather than rigid motion.\n\ndefault = the reference behaviour exactly: per-frame box, no smoothing at all.\n\nauto = legacy motion-adaptive smoothing, optional constant-size box.\n\njitterless = locked constant-size crop, Mocha-style planar hold.\n\nreference_smooth = reference geometry with cx/cy/w/h temporally filtered.\n\nThe smoothed modes filter the crop CENTRE, which lets the face drift inside the tile (measured 26-61px on a pan vs under 1px for expression_lock/default). That costs subtle facial detail, but they are steadier on jittery footage - your call, not mine."}),
                 "frame0_cx": ("INT", {"default": -1, "min": -1, "max": 8192, "tooltip": "Frame 0 anchor center X in pixels. -1 = use detected face center on frame 0. Used only when crop_mode=jitterless."}),
                 "frame0_cy": ("INT", {"default": -1, "min": -1, "max": 8192, "tooltip": "Frame 0 anchor center Y in pixels. -1 = use detected face center on frame 0."}),
-                "frame0_size": ("INT", {"default": 0, "min": 0, "max": 4096, "step": 16, "tooltip": "Locked square crop size in pixels (used for the entire clip). 0 = fall back to face_box_size_px."}),
+                "frame0_size": ("INT", {"default": 0, "min": 0, "max": 4096, "step": 4, "tooltip": "Locked square crop size in pixels (used for the entire clip). 0 = fall back to face_box_size_px."}),
                 "keyframes_json": ("STRING", {"default": "[]", "multiline": True, "tooltip": "JSON list of per-frame overrides: [{\"frame\":N, \"cx\":X, \"cy\":Y, \"size\":S?}, ...]. Frames between key-frames are linearly interpolated. size is optional; if omitted the locked size is kept."}),
                 "smoothing_method": (["one_euro", "ema", "gaussian", "none"], {"default": "one_euro", "tooltip": "Center-trajectory filter. one_euro = jitterless adaptive low-pass (recommended). ema = legacy motion-adaptive EMA. gaussian = fixed-window 1D blur. none = raw."}),
                 "crop_one_euro_min_cutoff": ("FLOAT", {"default": 1.0, "min": 0.05, "max": 10.0, "step": 0.05, "tooltip": "One-euro min cutoff (Hz) for crop center. Lower = stronger jitter rejection."}),
@@ -4476,8 +4476,21 @@ class PoseAndFaceDetectionV2:
                         if _kp is None:
                             _skel.append(None)
                         else:
+                            # Carry the CONFIDENCE (fixed 2026-07-31). This
+                            # used to pack x/y only and drop _kp[2], so joints
+                            # the detector never found — hips, knees and ankles
+                            # in a head-and-shoulders shot, or anything zeroed
+                            # by pose_threshold — were still emitted with
+                            # whatever coordinates they happened to carry, and
+                            # the viewer drew edges to them. That is the fan of
+                            # lines shooting off across the frame that made the
+                            # skeleton look shattered. The reference drawer
+                            # (draw_aapose_new) gates every joint on
+                            # threshold=0.5; the viewer never got that gate.
+                            _c = float(_kp[2]) if len(_kp) > 2 else 1.0
                             _skel.append([round(float(_kp[0]) * float(W), 1),
-                                          round(float(_kp[1]) * float(H), 1)])
+                                          round(float(_kp[1]) * float(H), 1),
+                                          round(_c, 3)])
                 _viewer_frames.append({
                     "frame": _fi,
                     "skeleton": _skel,
