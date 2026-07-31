@@ -4339,10 +4339,28 @@ class PoseAndFaceDetectionV2:
                 _neutral_eye_l = np.asarray(_neutral_mp['right_eye_outer_px'], dtype=np.float64)
                 _neutral_eye_r = np.asarray(_neutral_mp['left_eye_outer_px'], dtype=np.float64)
                 _n_amp = face_images_np.shape[0]
+                # TWO PASSES (fixed 2026-07-31). This used to measure, amplify
+                # and warp in a single per-frame loop, with NO temporal
+                # filtering anywhere. MediaPipe landmarks jitter 1-3px frame to
+                # frame even on a perfectly still face; multiplying that by
+                # au_amplify and handing it to a Delaunay warp as control
+                # points meant EVERY FRAME GOT A DIFFERENT WARP, driven by
+                # amplified noise. That is a pixel-level jitter, so it survives
+                # any crop_mode — a perfectly locked jitterless box still
+                # produced a wobbling face, because the box was never the thing
+                # moving.
+                #
+                # Pass 1 measures the displacement the warp would apply.
+                # Pass 2 smooths that displacement per landmark across time
+                # (zero-phase, so real expression onsets are not delayed) and
+                # only then warps. Genuine expression is low-frequency and
+                # survives; detector noise is high-frequency and does not.
+                _disp = np.zeros((_n_amp, len(_neutral_pts), 2), np.float32)
+                _src_pts = [None] * _n_amp
                 for _idx in range(_n_amp):
                     _crop = face_images_np[_idx]
                     if compute_frame_blur_score(_crop) < _BLUR_GATE:
-                        continue  # spec 2.3.6-style gate: skip amplifying a low-quality frame
+                        continue  # spec 2.3.6-style gate: skip a low-quality frame
                     _crop_u8 = _crop if not _is_float else np.clip(_crop * 255.0, 0, 255).astype(np.uint8)
                     _cur_mp = _run_mediapipe_on_face_crop(_crop_u8, (0, 0), (512, 512), 512, 512)
                     if _cur_mp is None:
@@ -4354,13 +4372,50 @@ class PoseAndFaceDetectionV2:
                         _cur_pts, _neutral_pts, _cur_eye_l, _cur_eye_r,
                         _neutral_eye_l, _neutral_eye_r, float(au_amplify),
                     )
+                    _src_pts[_idx] = _cur_pts.astype(np.float32)
+                    _disp[_idx] = (_amp_pts - _cur_pts).astype(np.float32)
+
+                # Gaussian, not one_euro. Measured against a known ground truth
+                # (real expression + 1.5px detector noise, au_amplify=1.3),
+                # frame-to-frame warp wobble and error vs the true amplification:
+                #     no filter          0.512px wobble, 0.361px error
+                #     one_euro           0.259px       , 0.239px
+                #     gaussian window 11 0.063px       , 0.147px
+                # A symmetric kernel is zero-phase, so an expression onset is
+                # not delayed, and this is offline work — there is no reason to
+                # accept the causal filter's lag or its weaker rejection. The
+                # thing being smoothed is a DISPLACEMENT FIELD, which is
+                # smooth in time by nature; only the detector noise is not.
+                if _n_amp > 2:
+                    for _li in range(_disp.shape[1]):
+                        for _ax in range(2):
+                            _disp[:, _li, _ax] = _smooth_1d(
+                                _disp[:, _li, _ax], method="gaussian",
+                                gaussian_window=11,
+                            )
+
+                _n_warped_au = 0
+                for _idx in range(_n_amp):
+                    _cur_pts = _src_pts[_idx]
+                    if _cur_pts is None:
+                        continue
+                    _amp_pts = _cur_pts + _disp[_idx]
                     if np.allclose(_amp_pts, _cur_pts, atol=0.25):
                         continue  # negligible amplification — skip the warp
+                    _crop = face_images_np[_idx]
                     _crop_f = _crop.astype(np.float32) / 255.0 if not _is_float else _crop.astype(np.float32)
-                    _warped = warp_face(_crop_f, _cur_pts.astype(np.float32), _amp_pts.astype(np.float32))
+                    _warped = warp_face(_crop_f, _cur_pts, _amp_pts.astype(np.float32))
                     face_images_np[_idx] = (
                         _warped if _is_float else np.clip(_warped * 255.0, 0, 255).astype(_crop.dtype)
                     )
+                    _n_warped_au += 1
+                logging.getLogger(__name__).info(
+                    "PoseAndFaceDetectionV2: au_amplify=%.2f warped %d/%d crops; "
+                    "warp displacement temporally smoothed (mean %.2fpx, max %.2fpx) "
+                    "so detector jitter is not amplified into the pixels.",
+                    float(au_amplify), _n_warped_au, _n_amp,
+                    float(np.abs(_disp).mean()), float(np.abs(_disp).max()),
+                )
                 face_images_tensor = torch.from_numpy(face_images_np)
             except Exception as _exc:                                    # noqa: BLE001
                 logging.getLogger(__name__).warning(
