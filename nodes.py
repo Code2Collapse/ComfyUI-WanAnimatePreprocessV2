@@ -1561,6 +1561,14 @@ def _locked_crop_side(face_box_size_px, raw_face_bboxes, W, H, mode_label):
     return side
 
 
+# Minimum ViTPose confidence for a face landmark to be trusted when MEASURING
+# the face box. Deliberately低 — 0.20 — because we only need to exclude the
+# genuinely wild points, not the merely soft ones: over-filtering shrinks the
+# box and crops the jaw. pose_threshold (a user widget) zeroes confidence but
+# NOT the coordinate, so without this the zeroed points still vote in min/max.
+_FACE_KP_MIN_CONF = 0.20
+
+
 def _face_pin_ring(pts, w, h, n=24, pad=1.18):
     """A closed ring of anchor points just outside the face landmarks.
 
@@ -2360,7 +2368,27 @@ class PoseAndFaceDetectionV2:
         # off the face for a long run of frames.
         raw_face_missing = []
         for meta in pose_metas:
-            bbox_face = get_face_bboxes(meta['keypoints_face'][:, :2],
+            # Neutralise UNCONFIDENT landmarks before the box is measured
+            # (fixed 2026-08-01). pose_threshold zeroes the CONFIDENCE column
+            # (kp2ds[..., 2]) but leaves the COORDINATE untouched, so a
+            # landmark the detector had no idea about keeps whatever wild
+            # position ViTPose emitted. get_face_bboxes then takes min/max over
+            # ALL 68 face points with no regard for confidence, so a single
+            # stray point drags the entire face box off the face — the
+            # "points going off-scale" and the bad crop that follows it.
+            # Replacing the doubtful points with the MEDIAN of the confident
+            # ones keeps the array shape (get_face_bboxes slices [1:], so the
+            # count must not change) while making them invisible to min/max.
+            _kf = np.asarray(meta['keypoints_face'], dtype=np.float32).copy()
+            if _kf.shape[1] > 2:
+                _good = _kf[:, 2] >= _FACE_KP_MIN_CONF
+                # slot 0 is a body anchor, not a face point; never trust it here
+                _good[0] = False
+                if _good.sum() >= 3:
+                    _med = np.median(_kf[_good, :2], axis=0)
+                    _kf[~_good, :2] = _med
+                    _kf[0, :2] = _med
+            bbox_face = get_face_bboxes(_kf[:, :2],
                                         scale=float(face_crop_scale), image_shape=(H, W))
             # Ensure ints and within bounds
             x1, x2, y1, y2 = map(int, bbox_face)
