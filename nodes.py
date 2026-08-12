@@ -2292,6 +2292,28 @@ class PoseAndFaceDetectionV2:
             images_blurred, B, "WanAnimateV2: YOLO bbox detect",
         ):
             detections = detector(cv2.resize(img, (640, 640)).transpose(2, 0, 1)[None], shape)[0]
+            # IDENTITY TRACKING (fixed 2026-08-01). This used to take
+            # detections[0] unconditionally. YOLO does not guarantee a stable
+            # order between frames, so with more than one person — or even one
+            # person plus a false positive that flickers in and out — the crop
+            # could swap subject mid-clip, taking all 133 keypoints with it.
+            # Prefer the detection closest to the LAST ACCEPTED box instead, so
+            # the same person is followed once chosen.
+            if (isinstance(detections, list) and len(detections) > 1
+                    and isinstance(detections[0], dict) and bboxes):
+                _prev = next((b for b in reversed(bboxes) if b is not None), None)
+                if _prev is not None:
+                    _pcx = 0.5 * (float(_prev[0]) + float(_prev[2]))
+                    _pcy = 0.5 * (float(_prev[1]) + float(_prev[3]))
+
+                    def _near(_d):
+                        _b = _d.get("bbox")
+                        if _b is None or len(_b) < 4:
+                            return 1e9
+                        return math.hypot(0.5 * (float(_b[0]) + float(_b[2])) - _pcx,
+                                          0.5 * (float(_b[1]) + float(_b[3])) - _pcy)
+
+                    detections = sorted(detections, key=_near)
             if isinstance(detections, list) and len(detections) > 0 and isinstance(detections[0], dict):
                 bboxes.append(detections[0]["bbox"])
             else:
@@ -2301,6 +2323,48 @@ class PoseAndFaceDetectionV2:
                 comfy_pbar.update_absolute(progress)
 
         detector.cleanup()
+
+        # --- Stabilise the person box before it drives the pose crop ---------
+        # (fixed 2026-08-01) This box is re-detected from scratch on every
+        # frame and it defines the crop ViTPose sees. ViTPose predicts in CROP
+        # space and the result is mapped back, so a few pixels of box jitter
+        # moves ALL 133 keypoints together, every frame — the "all points are
+        # jumpy as hell" report. The subject's actual motion is low-frequency;
+        # the detector's frame-to-frame disagreement is not.
+        #
+        # Smoothed as centre + size rather than as four independent edges:
+        # filtering x1/x2/y1/y2 separately lets the box breathe asymmetrically,
+        # which changes the crop's aspect and shears the pose. Zero-phase
+        # (forward+backward) so a real move is not delayed — this is offline
+        # work, there is no reason to accept a causal filter's lag.
+        _bb_idx = [i for i, b in enumerate(bboxes) if b is not None and len(b) >= 4]
+        if len(_bb_idx) > 2:
+            _cx = np.array([0.5 * (float(bboxes[i][0]) + float(bboxes[i][2])) for i in _bb_idx], np.float32)
+            _cy = np.array([0.5 * (float(bboxes[i][1]) + float(bboxes[i][3])) for i in _bb_idx], np.float32)
+            _bw = np.array([abs(float(bboxes[i][2]) - float(bboxes[i][0])) for i in _bb_idx], np.float32)
+            _bh = np.array([abs(float(bboxes[i][3]) - float(bboxes[i][1])) for i in _bb_idx], np.float32)
+            _raw_jit = float(np.abs(np.diff(_cx)).mean() + np.abs(np.diff(_cy)).mean()) if len(_cx) > 1 else 0.0
+            _kw = dict(method="one_euro", one_euro_min_cutoff=0.9,
+                       one_euro_beta=0.03, gaussian_window=7)
+            _sx = _smooth_1d(_cx, scale_norm=max(float(W), 1.0), **_kw)
+            _sy = _smooth_1d(_cy, scale_norm=max(float(H), 1.0), **_kw)
+            _sw = _smooth_1d(_bw, scale_norm=max(float(_bw.mean()), 1.0), **_kw)
+            _sh = _smooth_1d(_bh, scale_norm=max(float(_bh.mean()), 1.0), **_kw)
+            for _k, _i in enumerate(_bb_idx):
+                _o = list(bboxes[_i])
+                _o[0] = float(_sx[_k] - _sw[_k] * 0.5)
+                _o[1] = float(_sy[_k] - _sh[_k] * 0.5)
+                _o[2] = float(_sx[_k] + _sw[_k] * 0.5)
+                _o[3] = float(_sy[_k] + _sh[_k] * 0.5)
+                bboxes[_i] = _o
+            _sm_jit = (float(np.abs(np.diff(_sx)).mean() + np.abs(np.diff(_sy)).mean())
+                       if len(_sx) > 1 else 0.0)
+            logging.getLogger(__name__).info(
+                "PoseAndFaceDetectionV2: person-box jitter %.2f -> %.2f px/frame "
+                "(%.0f%% removed) before it drives the pose crop; %d/%d frames had "
+                "a detection.", _raw_jit, _sm_jit,
+                100.0 * (1.0 - _sm_jit / max(_raw_jit, 1e-6)), len(_bb_idx), B,
+            )
 
         # --- Pose detection (on blurred) ---
         kp2ds = []
