@@ -322,6 +322,14 @@ def get_face_bboxes(kp2ds, scale, image_shape):
     initial_width = max_x - min_x
     initial_height = max_y - min_y
 
+    if initial_width < 2 or initial_height < 2:
+        # Degenerate detection (all landmarks collapsed). Dividing by a
+        # zero-width face used to NaN and crash the node. Frame-centred
+        # placeholder; the caller already replaces x2<=x1 / y2<=y1 boxes.
+        side = min(h, w, 128)
+        return [int((w - side) // 2), int((w + side) // 2),
+                int((h - side) // 2), int((h + side) // 2)]
+
     initial_area = initial_width * initial_height
 
     expanded_area = initial_area * scale
@@ -348,75 +356,24 @@ def get_face_bboxes(kp2ds, scale, image_shape):
     return [int(expanded_min_x), int(expanded_max_x), int(expanded_min_y), int(expanded_max_y)]
 
 
+# Source-pixel floor used by the Tile log in nodes.py. Below this, Lanczos
+# to 512 invents most of the pixels the encoder reads (96px → 5.3x;
+# 46px → 11x). Never used to PAD a genuinely tiny face with background —
+# that would shrink the face inside the 512 tile, which is worse.
+_SOURCE_FACE_MIN_PX = 96
+
+
 def get_face_bboxes_central(kp2ds, scale, image_shape):
-    """Central-face crop (HunyuanPortrait, CVPR 2025 / arXiv:2503.18860).
+    """Retired ``central_face`` crop — now the same box as ``get_face_bboxes``.
 
-    WHY: HunyuanPortrait found that cropping the CENTRAL face — "the area
-    between the eyebrows and the bottom of the mouth" — measurably raises
-    the expression signal-to-noise ratio versus a full-head 512x512 crop.
-    The full iBUG 68-point box includes jaw contour (0-16), forehead, hair,
-    ears and background; those carry NO expression information but the
-    encoder still has to encode them, spending some of its 20-number budget
-    on non-expression pixels. Cropping to eyebrow..mouth-bottom focuses
-    the tile on the regions most indicative of motion dynamics (brows,
-    eyes, cheeks, nose, lips) — the micro-expression carriers.
-
-    iBUG indices within ``kp2ds[1:]`` (so 0-67 after the body-anchor strip):
-      17-26  eyebrows   (top boundary)
-      36-47  eyes        (included for width)
-      48-59  outer mouth (bottom boundary)
-    The jaw contour (0-16) and nose bridge (27-35) are deliberately
-    excluded: the jaw carries rigid head motion (already in pose_latents),
-    and the nose bridge is static under expression.
-
-    ``scale`` is the same AREA factor as ``get_face_bboxes`` so
-    ``face_crop_scale`` stays meaningful. The vertical split is even
-    (1:1 up:down), not the 3:1 forehead bias of the full-face variant,
-    because there is no forehead in this crop to bias toward.
+    The HunyuanPortrait eyebrow-to-mouth crop was the 46×46 failure: on a
+    wide 832×480 plate it halved the already-small face, then Lanczos to
+    512 invented 99% of the pixels (eyeballs ~4px). Wan-Animate was trained
+    on the FULL 68-point box (``process_pipepline.py``, scale=1.3). Saved
+    workflows that still say ``central_face`` must not keep shipping that
+    undersampled tile, so this is a straight alias.
     """
-    h, w = image_shape
-    pts = kp2ds.copy()[1:] * (w, h)            # 68 face points, iBUG order
-
-    # Eyebrows (17-26) + eyes (36-47) + outer mouth (48-59).
-    # Excludes jaw (0-16), nose bridge (27-35), inner mouth (60-67).
-    central = pts[np.r_[17:27, 36:48, 48:60]]
-    min_x, min_y = np.min(central, axis=0)
-    max_x, max_y = np.max(central, axis=0)
-
-    initial_width = max_x - min_x
-    initial_height = max_y - min_y
-    # Degenerate central region (face turned away, all central points
-    # collapsed) -> fall back to the FULL 68-point face box, which uses
-    # the jaw contour and is far more likely to still be valid. If even
-    # that is degenerate, return a frame-centred placeholder; nodes.py
-    # already replaces boxes with x2<=x1 or y2<=y1 with a proper
-    # frame-centred marker, so a degenerate return here is handled
-    # gracefully downstream rather than crashing on NaN.
-    if initial_width < 2 or initial_height < 2:
-        # Fall back to the FULL 68-point face box, which uses the jaw
-        # contour and is far more likely to still be valid. But check the
-        # full face's extent FIRST: get_face_bboxes divides by the face
-        # width and crashes (NaN->int) on a zero-width face, so we must
-        # not call it on a fully-collapsed detection.
-        full_pts = pts
-        fmin_x, fmin_y = np.min(full_pts, axis=0)
-        fmax_x, fmax_y = np.max(full_pts, axis=0)
-        if (fmax_x - fmin_x) >= 2 and (fmax_y - fmin_y) >= 2:
-            return get_face_bboxes(kp2ds, scale, image_shape)
-        side = min(w, h, 128)
-        return [int((w - side) // 2), int((w + side) // 2),
-                   int((h - side) // 2), int((h + side) // 2)]
-
-    initial_area = initial_width * initial_height
-    expanded_area = initial_area * scale
-    new_width = np.sqrt(expanded_area * (initial_width / initial_height))
-    new_height = np.sqrt(expanded_area * (initial_height / initial_width))
-    dx = (new_width - initial_width) / 2.0
-    dy = (new_height - initial_height) / 2.0
-    return [int(max(min_x - dx, 0)),
-            int(min(max_x + dx, w)),
-            int(max(min_y - dy, 0)),
-            int(min(max_y + dy, h))]
+    return get_face_bboxes(kp2ds, scale, image_shape)
 
 
 # ============================================================
