@@ -5142,7 +5142,18 @@ class PoseAndFaceDetectionV2:
                 face_images_tensor,
                 json.dumps(points_dict_list),
                 [bbox_ints],
-                face_bboxes,
+                # BBOX CONTRACT (fixed 2026-08-13). Internally the face box is
+                # carried as (x1, x2, y1, y2) — a historical ordering this file
+                # uses everywhere, and the source of an earlier sentinel bug.
+                # ComfyUI's BBOX type, and every consumer of it (SAM2/SAM
+                # segmentation, crop nodes, the mask stack), expects
+                # (x1, y1, x2, y2). Emitting the internal order through a BBOX
+                # output handed SAM2 a box whose "y1" was actually x2, i.e. a
+                # garbage region. `bboxes` above was already correct because it
+                # comes straight from YOLO in xyxy.
+                # Converted HERE, at the boundary only, so no internal maths
+                # changes and nothing else has to be touched.
+                [(int(_b[0]), int(_b[2]), int(_b[1]), int(_b[3])) for _b in face_bboxes],
                 json.dumps(iris_output),
                 debug_tensor,
                 json.dumps(right_pupil_seq),
