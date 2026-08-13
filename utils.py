@@ -356,11 +356,13 @@ def get_face_bboxes(kp2ds, scale, image_shape):
     return [int(expanded_min_x), int(expanded_max_x), int(expanded_min_y), int(expanded_max_y)]
 
 
-# Source-pixel floor used by the Tile log in nodes.py. Below this, Lanczos
-# to 512 invents most of the pixels the encoder reads (96px → 5.3x;
-# 46px → 11x). Never used to PAD a genuinely tiny face with background —
-# that would shrink the face inside the 512 tile, which is worse.
-_SOURCE_FACE_MIN_PX = 96
+# Source-pixel floor for face_images. Below this, Lanczos to 512 invents
+# most of the pixels (128px → 4.0x; 46px → 11x). On a WIDE shot the
+# detected face can be 46px; expanding the crop to 128px around the same
+# centre is the paper's own scale-augmentation (in-distribution) and
+# matches Kijai's wide-shot table (128–192). Close-ups already sit well
+# above this and are left face-tight.
+_SOURCE_FACE_MIN_PX = 128
 
 
 def get_face_bboxes_central(kp2ds, scale, image_shape):

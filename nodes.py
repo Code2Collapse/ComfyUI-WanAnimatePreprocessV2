@@ -1637,6 +1637,41 @@ def _crop_with_padding(frame, x1, x2, y1, y2):
     return np.pad(inner, pads, mode="edge")
 
 
+def _floor_face_boxes(bboxes, min_side: int, W: int, H: int):
+    """Expand any crop whose longer side is under ``min_side`` source pixels.
+
+    WHY: a 46px face Lanczos'd to 512 invents 99% of the encoder input
+    (eyeballs ~4px). Wan-Animate trained the Face Adapter with *scale*
+    augmentation, so a slightly looser crop is in-distribution; an 11×
+    upsample of 46px is not. Expand around the same centre, keep aspect,
+    do not clamp into the frame (``_crop_with_padding`` edge-pads). Close-ups
+    already larger than ``min_side`` are unchanged (face still fills the tile).
+    ``min_side`` is clamped to the shorter frame axis so a 480-tall plate
+    cannot request a 512 crop.
+    """
+    cap = float(min(int(min_side), int(min(W, H))))
+    if cap < 8 or not bboxes:
+        return list(bboxes), 0
+    out = []
+    raised = 0
+    for x1, x2, y1, y2 in bboxes:
+        w = float(x2 - x1)
+        h = float(y2 - y1)
+        side = max(w, h, 1.0)
+        if side >= cap:
+            out.append((int(x1), int(x2), int(y1), int(y2)))
+            continue
+        raised += 1
+        s = cap / side
+        cx = 0.5 * (x1 + x2)
+        cy = 0.5 * (y1 + y2)
+        nw, nh = w * s, h * s
+        nx1 = int(round(cx - nw / 2.0))
+        ny1 = int(round(cy - nh / 2.0))
+        out.append((nx1, nx1 + int(round(nw)), ny1, ny1 + int(round(nh))))
+    return out, raised
+
+
 def build_jitterless_boxes(
     *,
     target_centers,
@@ -1922,7 +1957,7 @@ class PoseAndFaceDetectionV2:
                 "gaze_max_yaw_deg": ("FLOAT", {"default": 30.0, "min": 5.0, "max": 60.0, "step": 1.0, "tooltip": "Saturation yaw angle in degrees that corresponds to blend shape value 1.0. 30\u00b0 covers the comfortable physiological range; raise for more dramatic eye motion."}),
                 "gaze_max_pitch_deg": ("FLOAT", {"default": 25.0, "min": 5.0, "max": 60.0, "step": 1.0, "tooltip": "Saturation pitch angle in degrees that corresponds to blend shape value 1.0. 25\u00b0 covers the comfortable physiological range."}),
                 # ---- Jitterless face crop (manual frame-0 anchor + keyframes) ----
-                "crop_mode": (["expression_lock", "default"], {"default": "expression_lock", "tooltip": "How the face crop box is built. TWO modes — the extras (central_face / jitterless / auto / reference_smooth) were slicing the SAME detected face and central_face was HALVING it (eyebrow-to-mouth), which on a wide 832x480 plate produced a 46x46 tile, 11x upscaled to 512, with ~4px eyeballs. Saved graphs that still name a retired mode are remapped to expression_lock.\n\nexpression_lock = Wan-Animate's own full 68-point face-tight box (scale 1.3), RAW per-frame centre, only the box SIZE held steady. Face wanders under 1px inside the tile.\n\ndefault = the paper exactly: per-frame box, no size hold.\n\nNeither mode can invent iris pixels that are not in the plate. If the log says Tile 46x46, the face is 46 source pixels — feed a tighter shot or a higher-res plate."}),
+                "crop_mode": (["expression_lock", "default"], {"default": "expression_lock", "tooltip": "How the face crop box is built. TWO modes — the extras (central_face / jitterless / auto / reference_smooth) were slicing the SAME detected face and central_face was HALVING it (eyebrow-to-mouth), which on a wide 832x480 plate produced a 46x46 tile, 11x upscaled to 512, with ~4px eyeballs. Saved graphs that still name a retired mode are remapped to expression_lock.\n\nexpression_lock = Wan-Animate's own full 68-point face-tight box (scale 1.3), RAW per-frame centre, only the box SIZE held steady. Face wanders under 1px inside the tile.\n\ndefault = the paper exactly: per-frame box, no size hold.\n\nNeither mode can invent iris pixels that are not in the plate. Source crops under 128px are expanded around the same centre (paper scale-aug / Kijai wide-shot floor) so Lanczos to 512 is ~4x, not 11x. Close-ups above 128px stay face-tight. If the log still says the source face is tiny, the plate itself is smaller than 128px — feed a tighter shot or a higher-res plate."}),
                 "frame0_cx": ("INT", {"default": -1, "min": -1, "max": 8192, "tooltip": "Frame 0 anchor center X in pixels. -1 = use detected face center on frame 0. Used only when crop_mode=jitterless."}),
                 "frame0_cy": ("INT", {"default": -1, "min": -1, "max": 8192, "tooltip": "Frame 0 anchor center Y in pixels. -1 = use detected face center on frame 0."}),
                 "frame0_size": ("INT", {"default": 0, "min": 0, "max": 4096, "step": 4, "tooltip": "Locked square crop size in pixels (used for the entire clip). 0 = fall back to face_box_size_px."}),
@@ -3061,6 +3096,28 @@ class PoseAndFaceDetectionV2:
                     if nx2 <= nx1 or ny2 <= ny1:
                         nx1, ny1, nx2, ny2 = x1, y1, x2, y2  # fallback to raw
                     face_bboxes.append((nx1, nx2, ny1, ny2))
+
+        # Wide-shot source-pixel floor (Kijai 128–192 / paper scale-aug).
+        # A 46px full-face box Lanczos'd to 512 invents 99% of the encoder
+        # input. Expand around the same centre so max(w,h) >= 128 (capped
+        # to the shorter frame axis). Close-ups already above the floor
+        # are unchanged — face still fills the tile.
+        _floor_raised = 0
+        if face_bboxes:
+            face_bboxes, _floor_raised = _floor_face_boxes(
+                face_bboxes, int(_SOURCE_FACE_MIN_PX), W, H,
+            )
+            if _floor_raised:
+                _fw = face_bboxes[0][1] - face_bboxes[0][0]
+                _fh = face_bboxes[0][3] - face_bboxes[0][2]
+                _side = max(_fw, _fh, 1)
+                logging.getLogger(__name__).info(
+                    "PoseAndFaceDetectionV2 [%s]: source-crop floor raised "
+                    "%d/%d boxes to %dpx (paper scale-aug / Kijai wide-shot). "
+                    "Lanczos to 512 is now %.1fx, not 11x.",
+                    crop_mode_str, _floor_raised, len(face_bboxes),
+                    int(_SOURCE_FACE_MIN_PX), 512.0 / _side,
+                )
 
         # Wan-Animate paper recommendation #1 (eye-centred crop) is now
         # applied EARLIER, inside each pipeline branch above, folded into the
@@ -4239,6 +4296,26 @@ class PoseAndFaceDetectionV2:
                             e['dy'] = round(_ldy / _lmag * _lmag_norm, 4)
                             e['magnitude_norm'] = _lmag_norm
 
+        _src_sides = [
+            max(x2 - x1, y2 - y1) for x1, x2, y1, y2 in face_bboxes
+        ] if face_bboxes else []
+        _median_src = float(np.median(_src_sides)) if _src_sides else 0.0
+        _face_q = {
+            "tile_px": (
+                [int(face_bboxes[0][1] - face_bboxes[0][0]),
+                 int(face_bboxes[0][3] - face_bboxes[0][2])]
+                if face_bboxes else [0, 0]
+            ),
+            "median_src_side": int(round(_median_src)),
+            "upscale_to_512": round(512.0 / max(1.0, _median_src), 2),
+            "floor_applied": int(_floor_raised),
+            "floor_min_px": int(_SOURCE_FACE_MIN_PX),
+            "pixels_unmodified": (
+                str(apply_gaze_to_face_image or "off").strip().lower() == "off"
+                and float(au_amplify) <= 1.001
+            ),
+        }
+
         # Build per-frame iris output
         iris_output = []
         for idx, iris in enumerate(all_iris):
@@ -4280,6 +4357,11 @@ class PoseAndFaceDetectionV2:
             # face encoder sees — without this, landmark edits only move the
             # skeleton dots and the model keeps following the unedited crop.
             "face_crop_boxes": [list(map(int, bb)) for bb in face_bboxes],
+            # Preprocessor quality for the 512 tile Wan 2.2 Animate 14B
+            # actually encodes. Not a texture-copy guarantee — the Face
+            # Adapter still compresses to motion_dim=20 — but this is the
+            # honest report of what we fed it.
+            "face_images_quality": _face_q,
         }
 
         # C0.4: ETH-XGaze post-process override.
@@ -4786,6 +4868,7 @@ class PoseAndFaceDetectionV2:
                 }
                 for i, (x1, x2, y1, y2) in enumerate(face_bboxes)
             ],
+            "face_images_quality": _face_q,
         }
 
         # ── face_images_512: force-resized to 512x512 for the Wan 2.2 ──
