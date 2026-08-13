@@ -553,6 +553,9 @@ from .utils import (
 )
 from .pose_utils.human_visualization import AAPoseMeta, draw_aapose_by_meta_new
 from .retarget_pose import get_retarget_pose
+from .flux_retarget import (
+    edit_with_flux, get_editing_prompts, load_flux_kontext,
+)
 
 
 # ---------------------------------------------------
@@ -1957,6 +1960,8 @@ class PoseAndFaceDetectionV2:
                 "bbox_override": ("BBOX", {"tooltip": "Optional external BBOX for the frame-0 anchor. Highest priority; overrides frame0_cx/cy/size widgets."}),
                 "landmark_overrides_json": ("STRING", {"default": "{}", "multiline": True, "tooltip": "Manual body-keypoint corrections from the Pose editor. Shape: {\"<frame>\": {\"<jointIdx>\": [x_px, y_px], ...}, ...} in SOURCE pixels. Written by the viewer's Edit mode — drag a joint to fix a mis-detection and the correction flows through retargeting into pose_data AND the rendered pose images (not just the preview). Leave as {} for pure detection."}),
                 "retarget_image": ("IMAGE", {"tooltip": "Optional reference image of the TARGET character. When connected, the detected driver pose is RETARGETED onto this reference's body proportions and position (the same retarget V1 had): the reference's pose is detected, then get_retarget_pose maps the driver's motion onto it. Leave unconnected for straight detection (no retarget)."}),
+                "use_flux": ("BOOLEAN", {"default": False, "tooltip": "Enhanced retargeting via FLUX.1-Kontext-dev (Wan 2.2 Animate's third retarget mode). When ON with retarget_image connected, FLUX normalizes the reference AND the first template frame to a standard front-facing pose BEFORE retargeting, so retargeting starts from a neutral instead of carrying a 3/4-profile or head-tilt into the output. Recommended ONLY when the reference character is NOT front-facing; for a front-facing reference, basic retarget (use_flux off) is enough. Needs the FLUX.1-Kontext-dev model — set flux_kontext_path. The authors' caveat: FLUX.1-Kontext-dev has limited capability, consistency is not guaranteed; check the intermediate edited frames."}),
+                "flux_kontext_path": ("STRING", {"default": "", "tooltip": "Path to the FLUX.1-Kontext-dev diffusers checkpoint FOLDER. Download from https://huggingface.co/black-forest-labs/FLUX.1-Kontext-dev. Empty = look the model up via ComfyUI's folder_paths ('flux' / 'checkpoints' / 'unet' keys, in that order). Raises a clear error naming what was searched if nothing is found — never silently disables use_flux."}),
             },
         }
 
@@ -2058,6 +2063,8 @@ class PoseAndFaceDetectionV2:
         detect_denoise=0.0,
         detect_sharpen=0.0,
         detect_saturation=1.0,
+        use_flux=False,
+        flux_kontext_path="",
     ):
         if not isinstance(images, torch.Tensor) or images.ndim != 4 or images.shape[-1] != 3:
             raise ValueError(
@@ -2208,6 +2215,8 @@ class PoseAndFaceDetectionV2:
         detect_denoise=0.0,
         detect_sharpen=0.0,
         detect_saturation=1.0,
+        use_flux=False,
+        flux_kontext_path="",
     ):
         detector = model["yolo"]
         pose_model = model["vitpose"]
@@ -3234,8 +3243,93 @@ class PoseAndFaceDetectionV2:
                 # passes that run after this.
                 import copy as _copy  # noqa: PLC0415
                 _pm_for_rt = _copy.deepcopy(pose_metas)
+
+                # ── use_flux: enhanced retargeting (Wan 2.2 Animate's 3rd mode) ─
+                # FLUX.1-Kontext-dev normalizes the reference AND the first
+                # template frame to a standard front-facing pose BEFORE
+                # retargeting, so retargeting starts from a neutral instead of
+                # carrying a 3/4-profile / head-tilt into the output. The
+                # edited poses are re-detected and passed to get_retarget_pose
+                # (whose 5-arg signature already accepts them). Ported from
+                # wan/modules/animate/preprocess/process_pipepline.py.
+                _tpl_edit_meta0 = None
+                _refer_edit_meta = None
+                if use_flux:
+                    def _pose_of(img_np):
+                        """Detect body pose on a single HxWx3 uint8 image, mirroring
+                        the reference-detection block above. Returns an
+                        AAPoseMeta-style dict or None on failure."""
+                        _h, _w = img_np.shape[:2]
+                        _shp = np.array([_h, _w])[None]
+                        _dets = detector(
+                            cv2.resize(img_np, (640, 640)).transpose(2, 0, 1)[None], _shp
+                        )[0]
+                        if isinstance(_dets, list) and len(_dets) > 0 and isinstance(_dets[0], dict):
+                            _bb = _dets[0]["bbox"]
+                        else:
+                            _bb = None
+                        if (_bb is None or len(_bb) < 5 or _bb[4] <= 0
+                                or (_bb[2] - _bb[0]) < 10 or (_bb[3] - _bb[1]) < 10):
+                            _bb = np.array([0, 0, _w, _h, 1.0], dtype=np.float32)
+                        _rc, _rs = bbox_from_detector(_bb, input_resolution, rescale=rescale)
+                        _cr = crop(img_np, _rc, _rs, (input_resolution[0], input_resolution[1]))[0]
+                        _cr = preprocess_for_pose(
+                            _cr, use_clahe, clahe_clip=clahe_clip_limit,
+                            clahe_grid=clahe_grid_size, gamma=detect_gamma,
+                            white_balance=detect_white_balance, denoise=detect_denoise,
+                            sharpen=detect_sharpen, saturation=detect_saturation)
+                        _nm = ((_cr - IMG_NORM_MEAN) / IMG_NORM_STD).transpose(2, 0, 1).astype(np.float32)
+                        _kp = pose_model(_nm[None], np.array(_rc)[None], np.array(_rs)[None])
+                        return load_pose_metas_from_kp2ds_seq(
+                            _kp, width=_w, height=_h)[0]
+
+                    # Resolve the FLUX model path: explicit widget value, or a
+                    # ComfyUI folder lookup when left blank. Never silently
+                    # disable use_flux — raise naming what was searched.
+                    _flux_path = (flux_kontext_path or "").strip()
+                    if not _flux_path:
+                        try:
+                            import folder_paths  # type: ignore[import-not-found]
+                            for _key in ("flux", "checkpoints", "unet"):
+                                for _d in folder_paths.get_folder_paths(_key) or []:
+                                    if os.path.isdir(os.path.join(_d, "FLUX.1-Kontext-dev")):
+                                        _flux_path = os.path.join(_d, "FLUX.1-Kontext-dev")
+                                        break
+                                    if os.path.basename(_d) == "FLUX.1-Kontext-dev":
+                                        _flux_path = _d
+                                        break
+                                if _flux_path:
+                                    break
+                        except Exception:
+                            pass
+                    if not _flux_path:
+                        raise FileNotFoundError(
+                            "use_flux is on but FLUX.1-Kontext-dev was not found. "
+                            "Set flux_kontext_path to the model folder, or drop "
+                            "FLUX.1-Kontext-dev into ComfyUI/models/flux/. Download "
+                            "from https://huggingface.co/black-forest-labs/FLUX.1-Kontext-dev")
+                    _flux_pipe = load_flux_kontext(_flux_path)
+                    _tpl_prompt, _refer_prompt = get_editing_prompts(
+                        pose_metas, refer_pose_meta)
+                    # Edit the reference to a standard front-facing pose.
+                    _refer_edit = edit_with_flux(
+                        _flux_pipe, refer_img_proc, _refer_prompt)
+                    # Edit the first template frame (frames[1] in the reference;
+                    # fall back to frames[0] for a single-frame clip).
+                    _tpl_idx = 1 if B >= 2 else 0
+                    _tpl_frame = (images[_tpl_idx].detach().cpu().numpy()
+                                   * 255.0).clip(0, 255).astype(np.uint8)
+                    _tpl_edit = edit_with_flux(_flux_pipe, _tpl_frame, _tpl_prompt)
+                    # Re-detect pose on the edited images.
+                    _refer_edit_meta = _pose_of(_refer_edit)
+                    _tpl_edit_meta0 = _pose_of(_tpl_edit)
+                    logging.getLogger(__name__).info(
+                        "PoseAndFaceDetectionV2 [use_flux]: normalized reference "
+                        "and template frame to a front-facing pose via "
+                        "FLUX.1-Kontext-dev before retargeting.")
                 retarget_pose_metas = get_retarget_pose(
-                    _pm_for_rt[0], refer_pose_meta, _pm_for_rt, None, None
+                    _pm_for_rt[0], refer_pose_meta, _pm_for_rt,
+                    _tpl_edit_meta0, _refer_edit_meta
                 )
             except Exception as _rt_exc:  # noqa: BLE001 — fall back to non-retargeted
                 logging.getLogger(__name__).warning(
@@ -3244,6 +3338,13 @@ class PoseAndFaceDetectionV2:
                 )
                 retarget_pose_metas = [AAPoseMeta.from_humanapi_meta(meta) for meta in pose_metas]
         else:
+            if use_flux:
+                raise ValueError(
+                    "use_flux=True requires retarget_image to be connected. FLUX "
+                    "normalizes the REFERENCE pose before retargeting, so a "
+                    "reference is mandatory. (Mirrors the Wan 2.2 Animate "
+                    "preprocessor's own assertion: 'Image editing with FLUX "
+                    "can only be used when pose retargeting is enabled'.)")
             retarget_pose_metas = [AAPoseMeta.from_humanapi_meta(meta) for meta in pose_metas]
 
         # ---- force_eyes_open ------------------------------------------------
@@ -4116,6 +4217,11 @@ class PoseAndFaceDetectionV2:
             # connected; lets the draw node pad/resize onto the reference.
             "refer_pose_meta": refer_pose_meta if retarget_image is not None else None,
             "retarget_image": refer_img_proc if retarget_image is not None else None,
+            # use_flux (enhanced retargeting) — True when FLUX.1-Kontext-dev
+            # normalized the reference + first template frame before retargeting.
+            # Downstream nodes can read this to know the retarget started from
+            # a FLUX-normalized neutral pose rather than the raw reference.
+            "use_flux": bool(use_flux) and retarget_image is not None,
             "iris_data": all_iris,
             "lip_openness_ratios": all_lip_ratios,
             # MANUAL bug-fix (Apr 2026): expose source frame dims + target

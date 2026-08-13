@@ -86,6 +86,13 @@ function applyVisibility(node) {
     const kalmanEngine = ["blendshape_head_corrected", "blendshape_only",
                           "l2cs_gaze360", "l2cs_mpiigaze",
                           "pose_normalized_resnet50", "ethxgaze"].includes(gazeEngine);
+    // use_flux only makes sense when a retarget_image is connected (it
+    // normalizes the reference pose before retargeting). Hide both flux
+    // widgets until one is wired, so the node stays ~12 widgets for the
+    // common no-retarget case.
+    const hasRetarget = Array.isArray(node.inputs) && node.inputs.some(
+        (s) => s && s.name === "retarget_image" && s.link != null);
+    const useFlux     = !!get("use_flux")?.value;
 
     // visible[name] = true → show; everything not listed is always shown.
     const visible = {
@@ -157,6 +164,13 @@ function applyVisibility(node) {
         eye_open_blink_ear:         eyesOpen && String(get("eye_open_mode")?.value) === "blinks_only",
         eye_y_fraction:             eyeAlign === "eye_upper_third",
         au_amplify_neutral_frame:   auAmp > 1.0,
+        // --- use_flux (enhanced retargeting) --------------------------------
+        // Shown only when retarget_image is connected. use_flux normalizes the
+        // reference + first template frame to a front-facing pose via
+        // FLUX.1-Kontext-dev before retargeting — only useful for a non-front
+        // reference. flux_kontext_path follows the toggle.
+        use_flux:                   hasRetarget,
+        flux_kontext_path:          hasRetarget && useFlux,
     };
     for (const w of node.widgets) {
         setHidden(w, (w.name in visible) ? !visible[w.name] : false);
@@ -196,9 +210,18 @@ app.registerExtension({
                 "crop_containment_check", "auto_smoothing_method",
                 "force_eyes_open", "eye_open_mode",
                 "gaze_engine", "eye_align_mode", "au_amplify",
+                "use_flux",
             ]) {
                 hookWidget(this, n);
             }
+            setTimeout(() => applyVisibility(this), 0);
+            return r;
+        };
+        // Re-evaluate visibility when retarget_image is wired/unwired, so
+        // the flux widgets appear/disappear with the connection.
+        const onConnectionsChange = nodeType.prototype.onConnectionsChange;
+        nodeType.prototype.onConnectionsChange = function () {
+            const r = onConnectionsChange?.apply(this, arguments);
             setTimeout(() => applyVisibility(this), 0);
             return r;
         };
