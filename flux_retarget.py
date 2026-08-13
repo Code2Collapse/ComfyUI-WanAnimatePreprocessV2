@@ -100,21 +100,63 @@ def load_flux_kontext(path: str, dtype: str = "bfloat16"):
             "FLUX.1-Kontext-dev (safetensors or bin)."
         ) from exc
 
+    # VRAM STRATEGY (2026-08-13): FLUX.1-Kontext-dev is ~12B params —
+    # ~24GB in bf16. Previously this called enable_sequential_offload()
+    # AND THEN pipe.to("cuda"), which moved the WHOLE model to VRAM and
+    # defeated the offload — that is the "eating a lot of VRAM" the user
+    # saw, and it stayed resident because the pipeline is cached for the
+    # session. Now pick ONE low-VRAM strategy and do NOT .to("cuda"):
+    #   1. enable_model_cpu_offload() — diffusers' recommended low-VRAM
+    #      mode (keeps weights on CPU, moves one module to GPU per forward,
+    #      ~3-5GB VRAM, reasonable speed). Preferred.
+    #   2. enable_sequential_offload() — lowest VRAM (~1-2GB), slowest.
+    #   3. .to("cuda") — only if both offloads failed (whole model in VRAM).
+    _offloaded = False
     try:
-        pipe.enable_sequential_offload()
-    except Exception:
-        pass
-    try:
-        if torch.cuda.is_available():
-            pipe = pipe.to("cuda")
+        pipe.enable_model_cpu_offload()
+        _offloaded = True
     except Exception as exc:  # noqa: BLE001
-        log.warning("PoseAndFaceDetectionV2 [use_flux]: could not move "
-                     "FLUX pipeline to CUDA (%s); staying on CPU.", exc)
+        log.warning("PoseAndFaceDetectionV2 [use_flux]: enable_model_cpu_offload "
+                     "failed (%s); trying sequential offload.", exc)
+        try:
+            pipe.enable_sequential_offload()
+            _offloaded = True
+        except Exception as exc2:  # noqa: BLE001
+            log.warning("PoseAndFaceDetectionV2 [use_flux]: sequential offload "
+                         "also failed (%s); loading whole model to CUDA.", exc2)
+    if not _offloaded and torch.cuda.is_available():
+        try:
+            pipe = pipe.to("cuda")
+        except Exception as exc:  # noqa: BLE001
+            log.warning("PoseAndFaceDetectionV2 [use_flux]: could not move "
+                         "FLUX pipeline to CUDA (%s); staying on CPU.", exc)
 
     if len(_FLUX_CACHE) > 2:
         _FLUX_CACHE.clear()
     _FLUX_CACHE[key] = pipe
     return pipe
+
+
+def free_flux_cache() -> int:
+    """Release every cached FLUX pipeline and return VRAM to the session.
+
+    FLUX.1-Kontext-dev is only invoked ONCE per execute (two edits: the
+    reference and the first template frame) — it is not per-frame — so
+    keeping the 12B model resident for the whole ComfyUI session wastes
+    ~24GB for no benefit. Call this after the edits are done. Safe to call
+    when nothing is cached. Returns the number of pipelines freed.
+    """
+    import torch
+    n = len(_FLUX_CACHE)
+    _FLUX_CACHE.clear()
+    try:
+        import gc
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:  # noqa: BLE001
+        pass
+    return n
 
 
 def edit_with_flux(pipe, image_np: np.ndarray, prompt: str,
@@ -124,14 +166,20 @@ def edit_with_flux(pipe, image_np: np.ndarray, prompt: str,
 
     The reference pads-resizes the result back to the input H/W
     (``padding_resize``), so the caller gets a same-shape edited frame.
+
+    Wrapped in ``torch.no_grad()`` so the autograd graph for a 12B-model
+    inference is not built and held — that graph alone can double the
+    VRAM of a forward pass for no benefit (we never train here).
     """
     from PIL import Image
+    import torch
     h, w = image_np.shape[:2]
     pil_in = Image.fromarray(image_np.astype(np.uint8))
-    out = pipe(
-        image=pil_in, height=h, width=w, prompt=prompt,
-        guidance_scale=guidance_scale, num_inference_steps=num_inference_steps,
-    ).images[0]
+    with torch.no_grad():
+        out = pipe(
+            image=pil_in, height=h, width=w, prompt=prompt,
+            guidance_scale=guidance_scale, num_inference_steps=num_inference_steps,
+        ).images[0]
     return np.array(out)
 
 
