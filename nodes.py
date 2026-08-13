@@ -1994,6 +1994,7 @@ class PoseAndFaceDetectionV2:
             "optional": {
                 "bbox_override": ("BBOX", {"tooltip": "Optional external BBOX for the frame-0 anchor. Highest priority; overrides frame0_cx/cy/size widgets."}),
                 "landmark_overrides_json": ("STRING", {"default": "{}", "multiline": True, "tooltip": "Manual body-keypoint corrections from the Pose editor. Shape: {\"<frame>\": {\"<jointIdx>\": [x_px, y_px], ...}, ...} in SOURCE pixels. Written by the viewer's Edit mode — drag a joint to fix a mis-detection and the correction flows through retargeting into pose_data AND the rendered pose images (not just the preview). Leave as {} for pure detection."}),
+                "hires_images": ("IMAGE", {"tooltip": "OPTIONAL, and the single biggest quality lever in this node.\n\nWire your FULL-RESOLUTION plate here (the EXR/source sequence). Detection still runs at the working resolution because that is what ViTPose wants and it is fast, but the face TILE is cut from this hi-res source instead.\n\nWhy it matters more than any crop_mode: on an 832x480 plate a face box measures about 46px, and that tile is upscaled ELEVEN times to reach the 512x512 the encoder needs - 99.2% of what the model reads is invented, and an eyeball at that scale is roughly 4 pixels across. There is no iris in 4 pixels. Every crop_mode was cropping the same starved image, which is why none of them fixed eye direction or micro-expression detail.\n\nSame framing, real pixels: 46px becomes 106px from a 1080p plate, 212px from 4K.\n\nIgnored (with a warning) if it is not larger than the working plate."}),
                 "retarget_image": ("IMAGE", {"tooltip": "Optional reference image of the TARGET character. When connected, the detected driver pose is RETARGETED onto this reference's body proportions and position (the same retarget V1 had): the reference's pose is detected, then get_retarget_pose maps the driver's motion onto it. Leave unconnected for straight detection (no retarget)."}),
                 "use_flux": ("BOOLEAN", {"default": False, "tooltip": "Enhanced retargeting via FLUX.1-Kontext-dev (Wan 2.2 Animate's third retarget mode). When ON with retarget_image connected, FLUX normalizes the reference AND the first template frame to a standard front-facing pose BEFORE retargeting, so retargeting starts from a neutral instead of carrying a 3/4-profile or head-tilt into the output. Recommended ONLY when the reference character is NOT front-facing; for a front-facing reference, basic retarget (use_flux off) is enough. Needs the FLUX.1-Kontext-dev model — set flux_kontext_path. The authors' caveat: FLUX.1-Kontext-dev has limited capability, consistency is not guaranteed; check the intermediate edited frames."}),
                 "flux_kontext_path": ("STRING", {"default": "", "tooltip": "Path to the FLUX.1-Kontext-dev diffusers checkpoint FOLDER. Download from https://huggingface.co/black-forest-labs/FLUX.1-Kontext-dev. Empty = look the model up via ComfyUI's folder_paths ('flux' / 'checkpoints' / 'unet' keys, in that order). Raises a clear error naming what was searched if nothing is found — never silently disables use_flux."}),
@@ -2175,6 +2176,7 @@ class PoseAndFaceDetectionV2:
                 detect_denoise,
                 detect_sharpen,
                 detect_saturation,
+                hires_images=hires_images,
             )
 
     def _process_impl(
@@ -2252,6 +2254,11 @@ class PoseAndFaceDetectionV2:
         detect_saturation=1.0,
         use_flux=False,
         flux_kontext_path="",
+        # APPENDED AT THE END, never mid-signature: process() calls this
+        # POSITIONALLY, so a parameter inserted anywhere above shifts every
+        # later argument. Verified by an AST check that each positional arg
+        # lands on the identically-named parameter.
+        hires_images=None,
     ):
         detector = model["yolo"]
         pose_model = model["vitpose"]
@@ -3227,9 +3234,58 @@ class PoseAndFaceDetectionV2:
         # that encoder. Edge-replicate padding keeps the face dead-centre and
         # introduces no hard synthetic border (the encoder was trained with
         # scale/colour/noise augmentation, not with black bars).
+        # ── Take the face crop from the HIGHEST-RESOLUTION source available ──
+        # (added 2026-08-13) This is the single biggest quality lever in the
+        # whole node, and it is not a crop-mode choice.
+        #
+        # Detection runs at the working resolution because that is what ViTPose
+        # wants and it is fast. But the face TILE was then cut from that same
+        # small image and upscaled to 512 for the encoder. On a 832x480 plate a
+        # face box measures ~46px, so the tile is an ELEVEN-times upscale —
+        # 99.2% of the pixels the encoder reads are invented, and an eyeball at
+        # that scale is about 4 pixels across. There is no iris in 4 pixels,
+        # which is why no crop_mode ever fixed eye direction or micro-detail:
+        # every mode was cropping the same starved image.
+        #
+        # If a hi-res plate is wired to `hires_images`, the box is scaled into
+        # its coordinate space and the tile is cut from THERE. Same framing,
+        # real pixels: 46px -> 106px from 1080p, 212px from 4K.
+        _hi = None
+        _hi_sx = _hi_sy = 1.0
+        if hires_images is not None:
+            _hi_np = (hires_images.detach().cpu().numpy()
+                      if hasattr(hires_images, "detach") else np.asarray(hires_images))
+            if _hi_np.ndim == 4 and _hi_np.shape[0] >= 1:
+                _hH, _hW = int(_hi_np.shape[1]), int(_hi_np.shape[2])
+                if _hW >= W and _hH >= H and (_hW > W or _hH > H):
+                    _hi = _hi_np
+                    _hi_sx, _hi_sy = float(_hW) / float(W), float(_hH) / float(H)
+                    logging.getLogger(__name__).info(
+                        "PoseAndFaceDetectionV2: face crop taken from hires_images "
+                        "%dx%d instead of the %dx%d working plate (%.2fx linear). "
+                        "The face tile gains that factor in REAL pixels — this is "
+                        "the lever that actually raises eye/micro-expression "
+                        "detail, not the crop_mode.", _hW, _hH, W, H, _hi_sx,
+                    )
+                else:
+                    logging.getLogger(__name__).warning(
+                        "PoseAndFaceDetectionV2: hires_images is %dx%d, which is not "
+                        "larger than the %dx%d working plate — ignoring it. Wire the "
+                        "FULL-RESOLUTION plate here (the EXR/source sequence), not a "
+                        "copy of the resized video.", _hW, _hH, W, H,
+                    )
+
         face_images = []
         for idx, (x1, x2, y1, y2) in enumerate(face_bboxes):
-            face_image = _crop_with_padding(images_np[idx], x1, x2, y1, y2)
+            if _hi is not None:
+                _src = _hi[min(idx, _hi.shape[0] - 1)]
+                face_image = _crop_with_padding(
+                    _src,
+                    int(round(x1 * _hi_sx)), int(round(x2 * _hi_sx)),
+                    int(round(y1 * _hi_sy)), int(round(y2 * _hi_sy)),
+                )
+            else:
+                face_image = _crop_with_padding(images_np[idx], x1, x2, y1, y2)
             if face_image.size == 0:
                 fallback_size = int(min(H, W) * 0.3)
                 fx1 = (W - fallback_size) // 2
