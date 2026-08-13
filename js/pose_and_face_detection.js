@@ -124,20 +124,34 @@ function applyVisibility(node) {
         // These land in pose_data. The pose conditioning image is a BODY
         // skeleton (draw_aapose_new) with five coarse head dots and no iris,
         // so none of it reaches the model as conditioning — it only populates
-        // this node's iris/pupil/debug OUTPUTS. Gated behind their own toggles
-        // so they stop crowding the node when unused.
-        iris_smoothing_strength:    irisSmooth,
-        iris_smoothing_method:      irisSmooth,
-        iris_one_euro_min_cutoff:   irisSmooth && irisMethod === "one_euro",
-        iris_one_euro_beta:         irisSmooth && irisMethod === "one_euro",
-        gaze_lock_strength:         gazeLock,
-        gaze_one_euro_min_cutoff:   blendGaze,
-        gaze_one_euro_beta:         blendGaze,
-        gaze_max_yaw_deg:           blendGaze,
-        gaze_max_pitch_deg:         blendGaze,
-        gaze_kalman_meas_std_deg:   kalmanEngine,
-        gaze_kalman_process_std:    kalmanEngine,
-        gaze_calibration_frame:     gazeEngine === "iris_geometric",
+        // this node's iris/pupil/debug OUTPUTS.
+        //
+        // USER CUT (2026-08-13): the gaze stack is HIDDEN entirely now.
+        // motion_dim=20 has no gaze channel and the pose image has no iris,
+        // so NONE of these widgets can move the rendered eyes — they only
+        // feed the iris_data/debug outputs (which the user does not
+        // consume) and the pupil-xy outputs (which run on the detector
+        // result regardless of these knobs). Hiding them removes the
+        // "eye direction going off / yapping" surface area without losing
+        // any reachable effect. They stay in INPUT_TYPES so saved workflows
+        // keep loading (widgets match by position). To re-expose a knob
+        // for experimentation, flip its `false` to a condition here.
+        use_iris_smoothing:         false,
+        iris_smoothing_strength:    false,
+        iris_smoothing_method:      false,
+        iris_one_euro_min_cutoff:   false,
+        iris_one_euro_beta:         false,
+        gaze_lock_eyes:              false,
+        gaze_lock_strength:         false,
+        use_blendshape_gaze:         false,
+        gaze_one_euro_min_cutoff:   false,
+        gaze_one_euro_beta:         false,
+        gaze_max_yaw_deg:           false,
+        gaze_max_pitch_deg:         false,
+        gaze_kalman_meas_std_deg:   false,
+        gaze_kalman_process_std:    false,
+        gaze_calibration_frame:     false,
+        gaze_engine:                false,
         // --- pixel edits to face_images (these DO reach the model) ---------
         eye_open_mode:              eyesOpen,
         eye_open_blink_ear:         eyesOpen && String(get("eye_open_mode")?.value) === "blinks_only",
