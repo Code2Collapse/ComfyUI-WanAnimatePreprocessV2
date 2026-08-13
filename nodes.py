@@ -4953,7 +4953,15 @@ class PoseAndFaceDetectionV2:
         try:
             import gc
             gc.collect()
-            import torch
+            # NO `import torch` HERE (fixed 2026-08-13). torch is already
+            # imported at module scope. A bare `import torch` inside this
+            # function makes `torch` a LOCAL for the ENTIRE function body —
+            # Python decides that at compile time, not at execution — so every
+            # earlier use in the same function raises
+            #     UnboundLocalError: cannot access local variable 'torch'
+            # even though the module-level import is right there. It crashed at
+            # line ~3165 (`torch.from_numpy(face_images_np)`), roughly 1800
+            # lines BEFORE this cleanup block ever ran.
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
         except Exception:  # noqa: BLE001
