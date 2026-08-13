@@ -554,7 +554,7 @@ from .utils import (
 from .pose_utils.human_visualization import AAPoseMeta, draw_aapose_by_meta_new
 from .retarget_pose import get_retarget_pose
 from .flux_retarget import (
-    edit_with_flux, get_editing_prompts, load_flux_kontext,
+    edit_with_flux, free_flux_cache, get_editing_prompts, load_flux_kontext,
 )
 
 
@@ -3163,6 +3163,12 @@ class PoseAndFaceDetectionV2:
 
         face_images_np = np.stack(face_images, 0)
         face_images_tensor = torch.from_numpy(face_images_np)
+        # RAM (2026-08-13): the face_images list holds N per-frame 512x512x3
+        # float32 arrays (~3MB each) alongside the np.stack copy. The tensor
+        # shares the stack's memory, so the list is now redundant — drop it
+        # and the per-frame arrays so a long clip doesn't hold 2x its face
+        # data in RAM. For a 1000-frame clip this frees ~3GB.
+        del face_images
 
         # ---- Manual landmark corrections (Pose editor, stage 2) ----
         # The pose_gaze_viewer's Edit mode writes per-frame, per-joint body
@@ -3327,6 +3333,17 @@ class PoseAndFaceDetectionV2:
                         "PoseAndFaceDetectionV2 [use_flux]: normalized reference "
                         "and template frame to a front-facing pose via "
                         "FLUX.1-Kontext-dev before retargeting.")
+                    # VRAM (2026-08-13): FLUX.1-Kontext-dev is ~12B params and
+                    # is only used for these TWO edits (not per-frame), so free
+                    # its pipeline + cached VRAM immediately. Without this the
+                    # 12B model stays resident for the whole ComfyUI session
+                    # (the global _FLUX_CACHE never cleared) — the "eating a
+                    # lot of VRAM" the user reported. A re-run that needs FLUX
+                    # simply reloads (the 30s load is one-shot, not per-frame).
+                    try:
+                        free_flux_cache()
+                    except Exception:  # noqa: BLE001
+                        pass
                 retarget_pose_metas = get_retarget_pose(
                     _pm_for_rt[0], refer_pose_meta, _pm_for_rt,
                     _tpl_edit_meta0, _refer_edit_meta
@@ -4920,6 +4937,27 @@ class PoseAndFaceDetectionV2:
                 logging.getLogger(__name__).warning(
                     "export_expression_coeffs failed (%s); expression_coeffs_json left empty.", _exc,
                 )
+
+        # VRAM/RAM (2026-08-13): release transient detection buffers and
+        # fragmented VRAM before returning. The blurred copy (a full
+        # per-frame array) is only needed during detection/pose and is now
+        # dead; drop it. empty_cache returns fragmented blocks from the
+        # ONNX detection passes to the session so the next node (and the
+        # sampler downstream) starts from a clean pool. Outputs are already
+        # built, so this is safe.
+        try:
+            if use_blur_for_pose:
+                images_blurred = None
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            import gc
+            gc.collect()
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:  # noqa: BLE001
+            pass
 
         return {
             "ui": _ui_payload,
