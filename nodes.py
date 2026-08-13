@@ -541,7 +541,7 @@ from .models.onnx_models import ViTPose, Yolo
 from .pose_utils.pose2d_utils import load_pose_metas_from_kp2ds_seq, crop, bbox_from_detector
 from .utils import (
     get_face_bboxes,
-    get_face_bboxes_central,
+    _SOURCE_FACE_MIN_PX,
     padding_resize,
     adjust_bbox_eye_upper_third,
     apply_eye_offset_to_center,
@@ -1922,7 +1922,7 @@ class PoseAndFaceDetectionV2:
                 "gaze_max_yaw_deg": ("FLOAT", {"default": 30.0, "min": 5.0, "max": 60.0, "step": 1.0, "tooltip": "Saturation yaw angle in degrees that corresponds to blend shape value 1.0. 30\u00b0 covers the comfortable physiological range; raise for more dramatic eye motion."}),
                 "gaze_max_pitch_deg": ("FLOAT", {"default": 25.0, "min": 5.0, "max": 60.0, "step": 1.0, "tooltip": "Saturation pitch angle in degrees that corresponds to blend shape value 1.0. 25\u00b0 covers the comfortable physiological range."}),
                 # ---- Jitterless face crop (manual frame-0 anchor + keyframes) ----
-                "crop_mode": (["expression_lock", "central_face", "default", "auto", "jitterless", "reference_smooth"], {"default": "expression_lock", "tooltip": "How the face crop box is built. All modes are available - pick what your shot needs.\n\nexpression_lock = reference face-tight box, RAW per-frame centre, only the box SIZE stabilised. Best measured registration (face wanders under 1px inside the tile) so the most of Wan-Animate's 20-number face code goes to expression rather than rigid motion.\n\ncentral_face = HunyuanPortrait (CVPR 2025, arXiv:2503.18860) central-face crop: eyebrow-to-mouth-bottom, excluding jaw/forehead/hair/ears. The crop is built from eyebrow (17-26), eye (36-47) and outer-mouth (48-59) landmarks only, so the tile is filled by the EXPRESSION-bearing region and the encoder's 20-number budget is not spent on jaw rigid motion or background. Uses the same expression_lock centre/size logic. Best for micro-expression fidelity on close-ups; can clip on a profile or a chin dip - fall back to expression_lock if it does.\n\ndefault = the reference behaviour exactly: per-frame box, no smoothing at all.\n\nauto = legacy motion-adaptive smoothing, optional constant-size box.\n\njitterless = locked constant-size crop, Mocha-style planar hold.\n\nreference_smooth = reference geometry with cx/cy/w/h temporally filtered.\n\nThe smoothed modes filter the crop CENTRE, which lets the face drift inside the tile (measured 26-61px on a pan vs under 1px for expression_lock/default). That costs subtle facial detail, but they are steadier on jittery footage - your call, not mine."}),
+                "crop_mode": (["expression_lock", "default"], {"default": "expression_lock", "tooltip": "How the face crop box is built. TWO modes — the extras (central_face / jitterless / auto / reference_smooth) were slicing the SAME detected face and central_face was HALVING it (eyebrow-to-mouth), which on a wide 832x480 plate produced a 46x46 tile, 11x upscaled to 512, with ~4px eyeballs. Saved graphs that still name a retired mode are remapped to expression_lock.\n\nexpression_lock = Wan-Animate's own full 68-point face-tight box (scale 1.3), RAW per-frame centre, only the box SIZE held steady. Face wanders under 1px inside the tile.\n\ndefault = the paper exactly: per-frame box, no size hold.\n\nNeither mode can invent iris pixels that are not in the plate. If the log says Tile 46x46, the face is 46 source pixels — feed a tighter shot or a higher-res plate."}),
                 "frame0_cx": ("INT", {"default": -1, "min": -1, "max": 8192, "tooltip": "Frame 0 anchor center X in pixels. -1 = use detected face center on frame 0. Used only when crop_mode=jitterless."}),
                 "frame0_cy": ("INT", {"default": -1, "min": -1, "max": 8192, "tooltip": "Frame 0 anchor center Y in pixels. -1 = use detected face center on frame 0."}),
                 "frame0_size": ("INT", {"default": 0, "min": 0, "max": 4096, "step": 4, "tooltip": "Locked square crop size in pixels (used for the entire clip). 0 = fall back to face_box_size_px."}),
@@ -2440,6 +2440,25 @@ class PoseAndFaceDetectionV2:
         # and, because it is a temporal filter, contaminates the neighbouring
         # frames too. A handful of failed detections is enough to pull the crop
         # off the face for a long run of frames.
+        # Retired crop modes (central_face / jitterless / auto /
+        # reference_smooth) were slicing the SAME detected face. central_face
+        # additionally SHRANK it to eyebrow-mouth, which on a wide 832x480
+        # plate produced a 46x46 tile (11x upsample, ~4px eyeballs). They
+        # all now use the full 68-point box the encoder was trained on.
+        # Saved graphs keep loading; the name is remapped once here.
+        _retired_crop = {
+            "central_face", "auto", "jitterless", "reference_smooth",
+        }
+        if str(crop_mode) in _retired_crop:
+            logging.getLogger(__name__).info(
+                "PoseAndFaceDetectionV2: crop_mode=%r now uses expression_lock "
+                "(full 68-point face-tight crop, raw centre, size held). "
+                "The extra modes were cropping the same face; central_face "
+                "was halving it.",
+                crop_mode,
+            )
+            crop_mode = "expression_lock"
+
         raw_face_missing = []
         for meta in pose_metas:
             # Neutralise UNCONFIDENT landmarks before the box is measured
@@ -2462,18 +2481,9 @@ class PoseAndFaceDetectionV2:
                     _med = np.median(_kf[_good, :2], axis=0)
                     _kf[~_good, :2] = _med
                     _kf[0, :2] = _med
-            # central_face (HunyuanPortrait, CVPR 2025 / arXiv:2503.18860):
-            # crop to eyebrow..mouth-bottom, excluding jaw/forehead/hair/ears.
-            # Same expression_lock logic downstream; only the RAW box source
-            # changes. The central region carries the expression signal; the
-            # jaw contour carries rigid head motion (already in pose_latents)
-            # and the forehead/hair carry no expression at all, so excluding
-            # them focuses the 20-number face budget on expression pixels.
-            _bbox_fn = (get_face_bboxes_central
-                        if str(crop_mode) == "central_face"
-                        else get_face_bboxes)
-            bbox_face = _bbox_fn(_kf[:, :2],
-                                 scale=float(face_crop_scale), image_shape=(H, W))
+            bbox_face = get_face_bboxes(
+                _kf[:, :2], scale=float(face_crop_scale), image_shape=(H, W)
+            )
             # Ensure ints and within bounds
             x1, x2, y1, y2 = map(int, bbox_face)
             x1 = max(0, min(W - 1, x1))
@@ -3109,7 +3119,25 @@ class PoseAndFaceDetectionV2:
                 _offs.append(math.hypot(_dx / _tw, _dy / _th))
             if _offs:
                 _mx = max(_offs)
-                _lvl = logging.WARNING if _mx > 0.20 else logging.INFO
+                _tile_w = face_bboxes[0][1] - face_bboxes[0][0]
+                _tile_h = face_bboxes[0][3] - face_bboxes[0][2]
+                _tile_side = max(_tile_w, _tile_h)
+                _tiny = _tile_side < int(_SOURCE_FACE_MIN_PX)
+                _lvl = logging.WARNING if (_mx > 0.20 or _tiny) else logging.INFO
+                _tiny_msg = (
+                    "  SOURCE FACE IS %dx%d PX — upscale to 512 is %.1fx, "
+                    "eyeballs are roughly %d source pixels. No crop mode "
+                    "recovers iris / micro-expression from that. Use a "
+                    "tighter shot or a higher-res plate (1080p/4K of the "
+                    "same framing). Motion blur and colour in the plate "
+                    "are already in these pixels; they cannot be invented."
+                    % (_tile_w, _tile_h, 512.0 / max(_tile_side, 1),
+                       max(1, int(round(_tile_side * 4 / 46.0))))
+                    if _tiny else
+                    ("  Raise crop_safety_margin / lower face_box_size_px, or "
+                     "use crop_mode='default' for the paper's exact per-frame "
+                     "face-tight crop." if _mx > 0.20 else "")
+                )
                 logging.getLogger(__name__).log(
                     _lvl,
                     "PoseAndFaceDetectionV2 [%s]: face-centre offset within the "
@@ -3117,11 +3145,7 @@ class PoseAndFaceDetectionV2:
                     "(0%% = perfectly centred; >20%% is visibly off and the face "
                     "encoder will struggle). Tile %dx%d.%s",
                     crop_mode_str, 100.0 * float(np.mean(_offs)), 100.0 * _mx,
-                    face_bboxes[0][1] - face_bboxes[0][0],
-                    face_bboxes[0][3] - face_bboxes[0][2],
-                    ("  Raise crop_safety_margin / lower face_box_size_px, or "
-                     "use crop_mode='default' for the paper's exact per-frame "
-                     "face-tight crop." if _mx > 0.20 else ""),
+                    _tile_w, _tile_h, _tiny_msg,
                 )
         except Exception:  # noqa: BLE001 — diagnostics must never break the node
             pass

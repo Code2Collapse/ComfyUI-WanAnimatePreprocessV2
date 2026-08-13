@@ -54,16 +54,13 @@ function applyVisibility(node) {
     const gazeLock   = !!get("gaze_lock_eyes")?.value;
     const blendGaze  = !!get("use_blendshape_gaze")?.value;
     const cropMode   = String(get("crop_mode")?.value ?? "default");
-    const jitterless = cropMode === "jitterless";
-    const refSmooth  = cropMode === "reference_smooth";
-    // expression_lock shares reference_smooth's branch but takes the centre
-    // RAW, so the centre filter knobs are inert there — only the SIZE is
-    // filtered, and crop_safety_margin is forced to 1.0 (no filter lag to
-    // absorb, and inflating the box just costs face resolution).
-    const exprLock   = cropMode === "expression_lock";
-    // a saved workflow may still carry one of the retired modes
-    const legacyMode = !exprLock && cropMode !== "default";
-    const auto       = cropMode === "auto";
+    // Only expression_lock and default are live. Retired names still
+    // present on saved graphs are treated as expression_lock so the old
+    // jitterless / auto widget pile does not come back.
+    const exprLock   = cropMode !== "default";
+    const jitterless = false;
+    const refSmooth  = false;
+    const auto       = false;
     const smoothing  = String(get("smoothing_method")?.value ?? "one_euro");
     const autoSm     = String(get("auto_smoothing_method")?.value ?? "legacy_ema");
     const cropActive = jitterless || auto;          // modes that BUILD their own box
