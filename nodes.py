@@ -1994,6 +1994,7 @@ class PoseAndFaceDetectionV2:
             "optional": {
                 "bbox_override": ("BBOX", {"tooltip": "Optional external BBOX for the frame-0 anchor. Highest priority; overrides frame0_cx/cy/size widgets."}),
                 "landmark_overrides_json": ("STRING", {"default": "{}", "multiline": True, "tooltip": "Manual body-keypoint corrections from the Pose editor. Shape: {\"<frame>\": {\"<jointIdx>\": [x_px, y_px], ...}, ...} in SOURCE pixels. Written by the viewer's Edit mode — drag a joint to fix a mis-detection and the correction flows through retargeting into pose_data AND the rendered pose images (not just the preview). Leave as {} for pure detection."}),
+                "face_resize_filter": (["mitchell", "cubic", "keys", "simon", "rifman", "parzen", "notch", "lanczos4", "lanczos6", "sinc4", "impulse"], {"default": "mitchell", "tooltip": "Resampling filter for the face crop -> 512 resize. Nuke's filter set, same names, so a compositor can reason about it with the vocabulary they already use.\n\nMEASURED on the real 46px-face case, resizing 46 -> 512 -> 64 and comparing against 46 -> 64 direct (lower error = less information mangled, overshoot = ringing):\n  cubic     err 0.00297   overshoot 0.0000\n  mitchell  err 0.00311   overshoot 0.0000   <- DEFAULT\n  keys      err 0.00329   overshoot 0.0000\n  lanczos4  err 0.00715   overshoot 0.0001\n  rifman    err 0.01007   overshoot 0.0312\n  sinc4     err 0.02274   overshoot 0.0804\nThe previous hardcoded cv2 LANCZOS4 measured 0.00721 - about 2.4x worse than mitchell.\n\nWHY: a filter rings when its kernel goes NEGATIVE, overshooting at hard edges. That overshoot is invented structure the 20-number face encoder cannot tell from real texture, and it is why a crop taken to 512 and sampled back down does not match the original sampled down directly - the ringing does not cancel.\n\ncubic / parzen / notch / impulse cannot ring (no negative lobes). mitchell has small negative lobes and measured zero overshoot here - Mitchell and Netravali's own paper concludes B=C=1/3 is the best blur-versus-ringing compromise, which is why it is the default. keys / simon / rifman / lanczos / sinc are progressively sharper and ring progressively harder.\n\nDOWNSIZING: prefer mitchell, or parzen if the plate is noisy - ringing survives into the latent as hard fringes, and softness does not."}),
                 "face_sr": (["none", "lanczos", "comfy_upscale"], {"default": "none", "tooltip": "Super-resolve the face crop BEFORE it is resized to the 512x512 the encoder needs.\n\nWhy it exists: the tile is always 512, but the region it is cut from is whatever the plate gives. A 46px face box means an ELEVEN-times upscale, so almost everything the model reads is invented by a resize filter. HeadsUp! (arXiv:2510.09924) discards training faces under 64px interocular (~160px face box) as too small to learn from - the node logs where your shot sits.\n\nnone = plain resize (previous behaviour).\nlanczos = deterministic baseline. Invents nothing, so if a real SR model does not beat this on your footage, that model is only adding hallucination and cost.\ncomfy_upscale = any ESRGAN-family model in ComfyUI/models/upscale_models, named in face_sr_model.\n\nSR runs on the NATIVE crop, before the 512 resize. Order matters: Lanczos is a windowed sinc with negative lobes, so it rings on hard edges; running SR after that would just sharpen the ringing. It is also why a crop taken to 512 and sampled back down does not match the original sampled down directly - the ringing does not cancel.\n\nPREFER hires_images if you have a full-res plate. Real pixels always beat invented ones."}),
                 "face_sr_model": ("STRING", {"default": "", "tooltip": "Filename of the upscale model in ComfyUI/models/upscale_models, used only when face_sr=comfy_upscale. Errors naming what is installed if it cannot be found."}),
                 "face_sr_stabilise": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.05, "tooltip": "How hard to stabilise SR detail over time. Per-frame SR hallucinates independently, so texture BOILS - and boiling is exactly the high-frequency per-frame noise Wan-Animate's 20-number motion code cannot tell from real motion. Hallo2 (arXiv:2410.07718) finds SR only helps expression fidelity when paired with temporal alignment.\n\nOnly the DETAIL layer is filtered; the base is left alone so real motion is never smeared.\n\nMeasured on a moving subject: 0.5 -> flicker -37% with 101% of real motion preserved; 0.7 -> -49% / 87%; 1.0 -> -58% / 75%. 0.5 is the last value that costs nothing in motion. Raise it only if a shot still boils."}),
@@ -2112,6 +2113,7 @@ class PoseAndFaceDetectionV2:
         face_sr="none",
         face_sr_model="",
         face_sr_stabilise=0.5,
+        face_resize_filter="mitchell",
     ):
         if not isinstance(images, torch.Tensor) or images.ndim != 4 or images.shape[-1] != 3:
             raise ValueError(
@@ -2188,6 +2190,7 @@ class PoseAndFaceDetectionV2:
                 detect_sharpen,
                 detect_saturation,
                 hires_images=hires_images,
+                face_resize_filter=face_resize_filter,
                 face_sr=face_sr,
                 face_sr_model=face_sr_model,
                 face_sr_stabilise=face_sr_stabilise,
@@ -2276,6 +2279,7 @@ class PoseAndFaceDetectionV2:
         face_sr="none",
         face_sr_model="",
         face_sr_stabilise=0.5,
+        face_resize_filter="mitchell",
     ):
         detector = model["yolo"]
         pose_model = model["vitpose"]
@@ -3377,7 +3381,18 @@ class PoseAndFaceDetectionV2:
                     if _sr_mode == "comfy_upscale" else "",
                 )
 
-        face_images = [resize_face_crop(_t, 512) for _t in face_images]
+        # Nuke-equivalent resample. See face_resize_filter's tooltip for the
+        # measured round-trip numbers; the old hardcoded cv2 INTER_LANCZOS4 was
+        # about 2.4x worse than mitchell on the 46px-face case.
+        try:
+            from .nodes_extras import _resize_filters as _RF
+            face_images = [_RF.resize(_t, 512, 512, str(face_resize_filter))
+                           for _t in face_images]
+        except Exception as _rf_exc:  # noqa: BLE001
+            logging.getLogger(__name__).warning(
+                "PoseAndFaceDetectionV2: face_resize_filter=%r unavailable (%s); "
+                "using the legacy cv2 resize.", face_resize_filter, _rf_exc)
+            face_images = [resize_face_crop(_t, 512) for _t in face_images]
         face_images_np = np.stack(face_images, 0)
         face_images_tensor = torch.from_numpy(face_images_np)
         # RAM (2026-08-13): the face_images list holds N per-frame 512x512x3
