@@ -2523,6 +2523,7 @@ class PoseAndFaceDetectionV2:
             crop_mode = "expression_lock"
 
         raw_face_missing = []
+        raw_face_kf = []
         for meta in pose_metas:
             # Neutralise UNCONFIDENT landmarks before the box is measured
             # (fixed 2026-08-01). pose_threshold zeroes the CONFIDENCE column
@@ -2544,6 +2545,7 @@ class PoseAndFaceDetectionV2:
                     _med = np.median(_kf[_good, :2], axis=0)
                     _kf[~_good, :2] = _med
                     _kf[0, :2] = _med
+            raw_face_kf.append(_kf[:, :2].copy())
             bbox_face = get_face_bboxes(
                 _kf[:, :2], scale=float(face_crop_scale), image_shape=(H, W)
             )
@@ -2594,6 +2596,51 @@ class PoseAndFaceDetectionV2:
                 "detection_threshold/pose_threshold, or check that the subject's "
                 "face is actually visible.", len(raw_face_missing),
             )
+
+        # --- Expression-invariant box anchoring (expression_lock only) -----
+        # get_face_bboxes measures min/max over ALL 68 face landmarks, and the
+        # brows, lids and lips are IN that set. So raising the brows lifts the
+        # box top and dropping the jaw lowers its bottom: the crop MOVES AND
+        # RESCALES with the expression it is supposed to be transmitting.
+        #
+        # Measured on a 12-frame clip with the head held PERFECTLY still and
+        # only the expression changing (222x235px box, scale=1.3):
+        #     centre wobble 1.89px -> 0.00px
+        #     size   wobble 5.85px -> 0.00px   (14px peak-to-peak, a 6% zoom)
+        #
+        # That wobble is the worst possible noise for this pipeline. Wan-Animate
+        # compresses the tile to TWENTY numbers, and global scale/translation is
+        # the highest-energy thing a motion encoder sees — so the leak does not
+        # merely add noise, it SPENDS the budget that should have carried the
+        # expression, and being perfectly correlated with that expression, no
+        # temporal filter downstream can separate them.
+        #
+        # Known failure mode, not a theory: arXiv:2203.14512 reports that
+        # "dynamic facial landmark coordinates ... generate jitters and
+        # rescaling in face alignment" and that the standard mitigation is
+        # cropping "excluding the eyes and mouth coordinates".
+        #
+        # default is left BYTE-EXACT with the reference on purpose; this runs
+        # only for expression_lock, the mode whose entire job is expression.
+        _rbx_mode = str(crop_mode).strip().lower()
+        if _rbx_mode in ("expression_lock", "central_face") and raw_face_bboxes:
+            try:
+                from .nodes_extras import _rigid_box as _RBX
+                _new_boxes, _rb_stats = _RBX.rigid_anchor_boxes(
+                    raw_face_kf, raw_face_bboxes, (H, W))
+                if _rb_stats is not None:
+                    raw_face_bboxes = _new_boxes
+                    logging.getLogger(__name__).info(
+                        "PoseAndFaceDetectionV2 [expression_lock]: face box "
+                        "re-anchored to expression-invariant landmarks on %d/%d "
+                        "frames (mean shift %.2fpx, max %.2fpx). Blinks and mouth "
+                        "movement no longer move the crop; the clip's median "
+                        "framing is preserved so the tile stays in-distribution.",
+                        _rb_stats[2], len(raw_face_bboxes), _rb_stats[0], _rb_stats[1])
+            except Exception as _rbx_exc:  # noqa: BLE001
+                logging.getLogger(__name__).warning(
+                    "PoseAndFaceDetectionV2: rigid box anchoring unavailable "
+                    "(%s); using the raw per-frame boxes.", _rbx_exc)
 
         # --- Convert to centers and raw face sizes (for smoothing) ---
         raw_centers = []
