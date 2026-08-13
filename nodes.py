@@ -541,6 +541,7 @@ from .models.onnx_models import ViTPose, Yolo
 from .pose_utils.pose2d_utils import load_pose_metas_from_kp2ds_seq, crop, bbox_from_detector
 from .utils import (
     get_face_bboxes,
+    get_face_bboxes_central,
     padding_resize,
     adjust_bbox_eye_upper_third,
     apply_eye_offset_to_center,
@@ -1918,7 +1919,7 @@ class PoseAndFaceDetectionV2:
                 "gaze_max_yaw_deg": ("FLOAT", {"default": 30.0, "min": 5.0, "max": 60.0, "step": 1.0, "tooltip": "Saturation yaw angle in degrees that corresponds to blend shape value 1.0. 30\u00b0 covers the comfortable physiological range; raise for more dramatic eye motion."}),
                 "gaze_max_pitch_deg": ("FLOAT", {"default": 25.0, "min": 5.0, "max": 60.0, "step": 1.0, "tooltip": "Saturation pitch angle in degrees that corresponds to blend shape value 1.0. 25\u00b0 covers the comfortable physiological range."}),
                 # ---- Jitterless face crop (manual frame-0 anchor + keyframes) ----
-                "crop_mode": (["expression_lock", "default", "auto", "jitterless", "reference_smooth"], {"default": "expression_lock", "tooltip": "How the face crop box is built. All modes are available - pick what your shot needs.\n\nexpression_lock = reference face-tight box, RAW per-frame centre, only the box SIZE stabilised. Best measured registration (face wanders under 1px inside the tile) so the most of Wan-Animate's 20-number face code goes to expression rather than rigid motion.\n\ndefault = the reference behaviour exactly: per-frame box, no smoothing at all.\n\nauto = legacy motion-adaptive smoothing, optional constant-size box.\n\njitterless = locked constant-size crop, Mocha-style planar hold.\n\nreference_smooth = reference geometry with cx/cy/w/h temporally filtered.\n\nThe smoothed modes filter the crop CENTRE, which lets the face drift inside the tile (measured 26-61px on a pan vs under 1px for expression_lock/default). That costs subtle facial detail, but they are steadier on jittery footage - your call, not mine."}),
+                "crop_mode": (["expression_lock", "central_face", "default", "auto", "jitterless", "reference_smooth"], {"default": "expression_lock", "tooltip": "How the face crop box is built. All modes are available - pick what your shot needs.\n\nexpression_lock = reference face-tight box, RAW per-frame centre, only the box SIZE stabilised. Best measured registration (face wanders under 1px inside the tile) so the most of Wan-Animate's 20-number face code goes to expression rather than rigid motion.\n\ncentral_face = HunyuanPortrait (CVPR 2025, arXiv:2503.18860) central-face crop: eyebrow-to-mouth-bottom, excluding jaw/forehead/hair/ears. The crop is built from eyebrow (17-26), eye (36-47) and outer-mouth (48-59) landmarks only, so the tile is filled by the EXPRESSION-bearing region and the encoder's 20-number budget is not spent on jaw rigid motion or background. Uses the same expression_lock centre/size logic. Best for micro-expression fidelity on close-ups; can clip on a profile or a chin dip - fall back to expression_lock if it does.\n\ndefault = the reference behaviour exactly: per-frame box, no smoothing at all.\n\nauto = legacy motion-adaptive smoothing, optional constant-size box.\n\njitterless = locked constant-size crop, Mocha-style planar hold.\n\nreference_smooth = reference geometry with cx/cy/w/h temporally filtered.\n\nThe smoothed modes filter the crop CENTRE, which lets the face drift inside the tile (measured 26-61px on a pan vs under 1px for expression_lock/default). That costs subtle facial detail, but they are steadier on jittery footage - your call, not mine."}),
                 "frame0_cx": ("INT", {"default": -1, "min": -1, "max": 8192, "tooltip": "Frame 0 anchor center X in pixels. -1 = use detected face center on frame 0. Used only when crop_mode=jitterless."}),
                 "frame0_cy": ("INT", {"default": -1, "min": -1, "max": 8192, "tooltip": "Frame 0 anchor center Y in pixels. -1 = use detected face center on frame 0."}),
                 "frame0_size": ("INT", {"default": 0, "min": 0, "max": 4096, "step": 4, "tooltip": "Locked square crop size in pixels (used for the entire clip). 0 = fall back to face_box_size_px."}),
@@ -2452,8 +2453,18 @@ class PoseAndFaceDetectionV2:
                     _med = np.median(_kf[_good, :2], axis=0)
                     _kf[~_good, :2] = _med
                     _kf[0, :2] = _med
-            bbox_face = get_face_bboxes(_kf[:, :2],
-                                        scale=float(face_crop_scale), image_shape=(H, W))
+            # central_face (HunyuanPortrait, CVPR 2025 / arXiv:2503.18860):
+            # crop to eyebrow..mouth-bottom, excluding jaw/forehead/hair/ears.
+            # Same expression_lock logic downstream; only the RAW box source
+            # changes. The central region carries the expression signal; the
+            # jaw contour carries rigid head motion (already in pose_latents)
+            # and the forehead/hair carry no expression at all, so excluding
+            # them focuses the 20-number face budget on expression pixels.
+            _bbox_fn = (get_face_bboxes_central
+                        if str(crop_mode) == "central_face"
+                        else get_face_bboxes)
+            bbox_face = _bbox_fn(_kf[:, :2],
+                                 scale=float(face_crop_scale), image_shape=(H, W))
             # Ensure ints and within bounds
             x1, x2, y1, y2 = map(int, bbox_face)
             x1 = max(0, min(W - 1, x1))
@@ -2522,7 +2533,10 @@ class PoseAndFaceDetectionV2:
         # expression_lock shares reference_smooth's code path but keeps the
         # RAW per-frame centre. See the branch below for why that is the whole
         # ballgame for micro-expressions.
-        expression_lock = crop_mode_str == "expression_lock"
+        # central_face (HunyuanPortrait) shares expression_lock's code path
+        # too; only the RAW box source differs (eyebrow..mouth-bottom
+        # instead of the full 68-point face box).
+        expression_lock = crop_mode_str in ("expression_lock", "central_face")
         reference_smooth = crop_mode_str == "reference_smooth"
         jitterless = crop_mode_str == "jitterless"
         crop_off = crop_mode_str == "default"
