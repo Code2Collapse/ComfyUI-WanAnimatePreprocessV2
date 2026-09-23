@@ -124,7 +124,16 @@ class WanExpressionCoefficientsV2:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "iris_data_json": ("STRING", {"multiline": True, "default": "[]"}),
+                "iris_data_json": ("STRING", {
+                    "multiline": True, "default": "[]",
+                    "tooltip": "WIRE THIS, do not type it. It is the "
+                               "'iris_data' STRING output of "
+                               "PoseAndFaceDetectionV2 - per-frame iris "
+                               "positions the detector measured. Nobody "
+                               "authors these by hand; an empty box here means "
+                               "the wire is missing, not that a value is "
+                               "wanted. Right-click the widget to convert it "
+                               "to an input socket."}),
                 "fps": ("FLOAT", {"default": 30.0, "min": 1.0, "max": 240.0, "step": 1.0}),
                 "smooth_min_cutoff": ("FLOAT", {"default": 1.5, "min": 0.01, "max": 30.0, "step": 0.1}),
                 "smooth_beta": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.001}),

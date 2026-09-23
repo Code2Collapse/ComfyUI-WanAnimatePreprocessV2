@@ -112,7 +112,15 @@ class WanQualityScorerJitterV2:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "pose_data_json": ("STRING", {"multiline": True, "default": "[]"}),
+                "pose_data_json": ("STRING", {
+                    "multiline": True, "default": "[]",
+                    "tooltip": "WIRE THIS, do not type it. Per-frame "
+                               "keypoints from a detector - "
+                               "PoseAndFaceDetectionV2's pose output, "
+                               "serialised. An empty box here means the wire "
+                               "is missing, not that a value is wanted. "
+                               "Right-click to convert it to an input "
+                               "socket."}),
                 "image_diagonal_px": ("FLOAT", {"default": 1500.0, "min": 64.0, "max": 16384.0,
                                                   "step": 1.0,
                                                   "tooltip": "Used to normalise pixel velocities."}),
