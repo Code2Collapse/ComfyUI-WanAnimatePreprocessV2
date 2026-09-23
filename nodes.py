@@ -6839,6 +6839,15 @@ class EARBlinkDetectorC2C:
     causal median smoothing pass). Output JSON includes the raw EAR series,
     a per-frame blink mask, and aggregate stats.
     """
+    DESCRIPTION = (
+        "Find the blinks in a clip from the eye contours PoseAndFaceDetectionV2 "
+        "already produced - no extra model. Uses Eye-Aspect-Ratio: the eye's "
+        "height over its width, which collapses when the lid closes. A blink "
+        "needs BOTH eyes below threshold for several consecutive frames, so a "
+        "single bad detection frame does not read as one. Use it to keep a "
+        "retargeted performance blinking where the actor did."
+    )
+
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -6957,6 +6966,14 @@ class SaccadeClassifierC2C:
     is sustained above threshold for at least ``min_consecutive_frames``
     frames (kills single-frame noise spikes).
     """
+    DESCRIPTION = (
+        "Mark the frames where the eyes FLICK rather than drift. A saccade is "
+        "the fast jump between fixations, and the 300 deg/s default is the "
+        "classical physiological boundary, not a taste setting. Matters for "
+        "retargeting because a saccade must be copied as a jump - smooth it "
+        "and the gaze reads as sedated."
+    )
+
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -7099,6 +7116,14 @@ class PupilDilationTrackerC2C:
     A 'dilation event' is reported when the normalized radius rises above
     ``event_threshold`` (relative units) for at least ``min_consecutive_frames``.
     """
+    DESCRIPTION = (
+        "Track pupil dilation per frame, normalised against an eye measurement "
+        "that does not change with distance. Raw pupil size in pixels is "
+        "useless on its own - it grows whenever the subject walks toward "
+        "camera - so it is divided by eye width, which is invariant. Use it "
+        "for emotional beats, or to catch a shot where the lighting changed."
+    )
+
 
     @classmethod
     def INPUT_TYPES(cls):
