@@ -88,8 +88,6 @@ function resolveUpstreamImageURL(node) {
     return null;
 }
 
-const _fill = (v, def) => (v || def);
-
 function makePanel(node) {
     ensureC2CKit();
     const root = document.createElement("div");
@@ -97,7 +95,7 @@ function makePanel(node) {
     root.style.cssText = `
         display:flex; flex-direction:column; gap:6px; width:100%; height:100%;
         box-sizing:border-box; font-family:ui-sans-serif,system-ui,sans-serif;
-        color:#e6e6e6; background:#161616; border-radius:8px; padding:8px;
+        color:var(--c2c-fg, #e6e6e6); background:var(--c2c-bg, #161616); border-radius:8px; padding:8px;
         overflow:hidden; min-height:0;
     `;
 
@@ -115,16 +113,17 @@ function makePanel(node) {
     header.append(title, engineEl, spacer);
 
     const state = { skel: true, iris: true, gaze: true, edit: false };
-    const mkChip = (label, key, color, onToggle) => {
+    const mkChip = (label, key, getColor, onToggle) => {
         const b = document.createElement("button");
         b.type = "button";
         b.textContent = label;
         const paint = () => {
+            const color = getColor();
             b.style.cssText = `
                 font-size:10.5px; padding:3px 8px; border-radius:999px; cursor:pointer;
-                border:1px solid ${state[key] ? color : _fill(C.surface1, "#45475a")};
+                border:1px solid ${state[key] ? color : "var(--c2c-surface1, #45475a)"};
                 background:${state[key] ? color + "22" : "transparent"};
-                color:${state[key] ? color : _fill(C.overlay1, "#7f849c")};
+                color:${state[key] ? color : "var(--c2c-overlay1, #7f849c)"};
             `;
         };
         paint();
@@ -133,13 +132,13 @@ function makePanel(node) {
         return b;
     };
     header.append(
-        mkChip("🦴 skeleton", "skel", _fill(C.blue, "#89b4fa")),
-        mkChip("👁 iris", "iris", _fill(C.red, "#f38ba8")),
-        mkChip("↗ gaze", "gaze", _fill(C.teal, "#94e2d5")),
+        mkChip("🦴 skeleton", "skel", () => C.blue),
+        mkChip("👁 iris", "iris", () => C.red),
+        mkChip("↗ gaze", "gaze", () => C.teal),
     );
     // Edit mode — turns the skeleton into draggable handles that CORRECT the
     // detection. When on, the skeleton chip is forced visible so joints show.
-    const editChip = mkChip("✏ edit joints", "edit", _fill(C.mauve, "#cba6f7"), () => {
+    const editChip = mkChip("✏ edit joints", "edit", () => C.mauve, () => {
         if (state.edit && !state.skel) { state.skel = true; skelChip._paint(); }
         resetBtn.style.display = state.edit ? "inline-block" : "none";
         cvs.style.cursor = state.edit ? "crosshair" : "default";
@@ -149,8 +148,8 @@ function makePanel(node) {
     resetBtn.textContent = "↺ reset frame";
     resetBtn.style.cssText = `
         display:none; font-size:10.5px; padding:3px 8px; border-radius:999px; cursor:pointer;
-        border:1px solid ${_fill(C.surface1, "#45475a")}; background:transparent;
-        color:${_fill(C.overlay1, "#7f849c")};
+        border:1px solid var(--c2c-surface1, #45475a); background:transparent;
+        color:var(--c2c-overlay1, #7f849c);
     `;
     resetBtn.onclick = () => resetFrame();
     const skelChip = header.children[3];   // the "skeleton" chip added above
@@ -163,9 +162,9 @@ function makePanel(node) {
     statusEl.style.cssText = `
         display:none; flex:0 0 auto; font-size:10.5px; line-height:1.35;
         padding:5px 8px; border-radius:6px;
-        background:${_fill(C.amber, "#fab387")}1e;
-        border:1px solid ${_fill(C.amber, "#fab387")}55;
-        color:${_fill(C.amber, "#fab387")};
+        background:color-mix(in srgb, var(--c2c-peach, #fab387) 12%, transparent);
+        border:1px solid color-mix(in srgb, var(--c2c-peach, #fab387) 33%, transparent);
+        color:var(--c2c-peach, #fab387);
     `;
     root.appendChild(statusEl);
 
@@ -173,7 +172,7 @@ function makePanel(node) {
     const stage = document.createElement("div");
     stage.style.cssText = `
         position:relative; flex:1 1 auto; min-height:0; border-radius:6px;
-        background:${_fill(C.black, "#0b0b12")}; border:1px solid ${_fill(C.surface1, "#45475a")};
+        background:var(--c2c-bg3, #0b0b12); border:1px solid var(--c2c-surface1, #45475a);
         overflow:hidden;
     `;
     const cvs = document.createElement("canvas");
@@ -186,9 +185,9 @@ function makePanel(node) {
     scrubRow.style.cssText = "display:flex; align-items:center; gap:8px; flex:0 0 auto;";
     const scrub = document.createElement("input");
     scrub.type = "range"; scrub.min = "0"; scrub.max = "0"; scrub.value = "0"; scrub.step = "1";
-    scrub.style.cssText = "flex:1 1 auto; accent-color:" + _fill(C.blue, "#89b4fa") + ";";
+    scrub.style.cssText = "flex:1 1 auto; accent-color:var(--c2c-blue, #89b4fa);";
     const frameEl = document.createElement("span");
-    frameEl.style.cssText = `font:11px ui-monospace,monospace; color:${_fill(C.overlay1, "#a6adc8")}; white-space:nowrap;`;
+    frameEl.style.cssText = "font:11px ui-monospace,monospace; color:var(--c2c-overlay1, #a6adc8); white-space:nowrap;";
     frameEl.textContent = "frame —";
     scrubRow.append(scrub, frameEl);
     root.appendChild(scrubRow);
@@ -279,16 +278,20 @@ function makePanel(node) {
             if (!srcW) { srcW = bdImg.naturalWidth; srcH = bdImg.naturalHeight; }
         } else {
             // Empty state — clear invitation, never a blank void.
-            ctx.fillStyle = "rgba(148,158,190,0.5)";
+            ctx.fillStyle = C.dim;
+            ctx.globalAlpha = 0.55;
             ctx.textAlign = "center"; ctx.textBaseline = "middle";
             ctx.font = "26px system-ui,sans-serif";
             ctx.fillText("👁", W / 2, H / 2 - 22);
-            ctx.fillStyle = "rgba(168,178,208,0.7)";
+            ctx.fillStyle = C.sub;
+            ctx.globalAlpha = 0.85;
             ctx.font = "600 12px system-ui,sans-serif";
             ctx.fillText("Connect an image, then Queue", W / 2, H / 2 + 2);
-            ctx.fillStyle = "rgba(128,138,166,0.55)";
+            ctx.fillStyle = C.dim;
+            ctx.globalAlpha = 0.7;
             ctx.font = "11px system-ui,sans-serif";
             ctx.fillText("the skeleton, iris and gaze appear here on the frame", W / 2, H / 2 + 20);
+            ctx.globalAlpha = 1;
             ctx.textAlign = "left"; ctx.textBaseline = "alphabetic";
             // Even without a backdrop, letterbox the overlay to the SOURCE
             // aspect ratio so the skeleton isn't stretched (and drag hit-tests
@@ -308,7 +311,7 @@ function makePanel(node) {
             lastMap = { ix, iy, sx, sy, srcW, srcH };   // for edit hit-testing
 
             if (state.skel && Array.isArray(frame.skeleton)) {
-                ctx.strokeStyle = _fill(C.blue, "#89b4fa"); ctx.lineWidth = 2;
+                ctx.strokeStyle = C.blue; ctx.lineWidth = 2;
                 for (const [a, b] of SKELETON_EDGES) {
                     const pa = frame.skeleton[a], pb = frame.skeleton[b];
                     if (!_ok(pa) || !_ok(pb)) continue;
@@ -324,14 +327,14 @@ function makePanel(node) {
                         const edited = _hasOverride(frameIdx, j);
                         const cx = px(p[0]), cy = py(p[1]);
                         ctx.beginPath(); ctx.arc(cx, cy, active ? 7 : 5, 0, Math.PI * 2);
-                        ctx.fillStyle = edited ? _fill(C.mauve, "#cba6f7") : _fill(C.green, "#a6e3a1");
+                        ctx.fillStyle = edited ? C.mauve : C.green;
                         ctx.globalAlpha = active ? 1 : 0.9; ctx.fill(); ctx.globalAlpha = 1;
                         ctx.lineWidth = active ? 2.5 : 1.5;
-                        ctx.strokeStyle = active ? _fill(C.text, "#e6e9f0") : "rgba(0,0,0,0.55)";
+                        ctx.strokeStyle = active ? C.fg : "rgba(0,0,0,0.55)";
                         ctx.stroke();
                     }
                 } else {
-                    ctx.fillStyle = _fill(C.green, "#a6e3a1");
+                    ctx.fillStyle = C.green;
                     for (const p of frame.skeleton) {
                         if (!p) continue;
                         ctx.beginPath(); ctx.arc(px(p[0]), py(p[1]), 2.5, 0, Math.PI * 2); ctx.fill();
@@ -339,8 +342,8 @@ function makePanel(node) {
                 }
             }
             const eyes = [
-                { key: "right_iris", gkey: "right_gaze", color: _fill(C.red, "#f38ba8") },
-                { key: "left_iris",  gkey: "left_gaze",  color: _fill(C.teal, "#94e2d5") },
+                { key: "right_iris", gkey: "right_gaze", color: C.red },
+                { key: "left_iris",  gkey: "left_gaze",  color: C.teal },
             ];
             for (const e of eyes) {
                 const ir = frame[e.key], gz = frame[e.gkey];
@@ -371,7 +374,7 @@ function makePanel(node) {
                     : (nEdits ? `${nEdits} joint${nEdits > 1 ? "s" : ""} corrected — re-Queue to bake`
                               : "Drag a joint to correct it");
                 ctx.fillStyle = "rgba(0,0,0,0.5)"; ctx.fillRect(ix, iy + ih - 22, iw, 22);
-                ctx.fillStyle = _fill(C.mauve, "#cba6f7"); ctx.font = "11px system-ui,sans-serif";
+                ctx.fillStyle = C.mauve; ctx.font = "11px system-ui,sans-serif";
                 ctx.textAlign = "center";
                 ctx.fillText(msg, ix + iw / 2, iy + ih - 8);
                 ctx.textAlign = "left";
@@ -379,11 +382,12 @@ function makePanel(node) {
         } else if (bdImg) {
             // Image present but no detection yet — prompt to queue.
             ctx.fillStyle = "rgba(0,0,0,0.45)"; ctx.fillRect(ix, iy + ih - 22, iw, 22);
-            ctx.fillStyle = "rgba(230,235,245,0.9)"; ctx.font = "11px system-ui,sans-serif";
+            ctx.fillStyle = C.fg; ctx.globalAlpha = 0.9; ctx.font = "11px system-ui,sans-serif";
             ctx.textAlign = "center";
             ctx.fillText(state.edit
                 ? "Queue once to detect, then drag joints to correct"
                 : "Queue to detect skeleton · iris · gaze", ix + iw / 2, iy + ih - 8);
+            ctx.globalAlpha = 1;
             ctx.textAlign = "left";
         }
     }

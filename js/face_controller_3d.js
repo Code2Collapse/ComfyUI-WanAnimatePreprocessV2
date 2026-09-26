@@ -5,6 +5,7 @@
 // Backend contract (overlay_meta, widget JSON) is unchanged.
 
 import { app } from "../../scripts/app.js";
+import { C } from "./_c2c_theme.js";
 /** Local labels only — avoids hard dependency on _c2c_i18n.js (load failure → blank widget). */
 function T(_key, fallback) { return fallback ?? _key; }
 
@@ -74,36 +75,29 @@ const FC3D_PARAM_OPTS = {
     preview_max_video_frames: { min: 1, max: 1024, step: 1 },
 };
 
-// ─── Theme palette (CSS-var backed; hex fallbacks) ──────────────────
-const _C_FALLBACK = {
-    bg:     "#1a1a22", border: "#2a2a35", grid:   "#26263a",
-    dim:    "#6c7086", sel:    "#cba6f7", emph:   "#fab387",
-    other:  "#45475a", text:   "#cdd6f4", accent: "#89b4fa",
-    pose_joint:"#a6e3a1", pose_bone:"#74c7ec", pose_selected:"#f9e2af",
-    pose_missing:"#585b70",
-    gaze_l:"#f38ba8", gaze_r:"#94e2d5", gaze_drag:"#f9e2af",
-    canvas_bg:"#0e0e16", input_bg:"#1a1a23", btn_off_bg:"#22222e",
-    fg_inverse:"#11111a", ok_bg:"#2d3b22", err_bg:"#3b2222", info_bg:"#222b3b",
-    tab_active:"#313145",
-};
-const _C_TOKEN = {
-    bg:"--c2c-bg", border:"--c2c-surface2", grid:"--c2c-surface1",
-    dim:"--c2c-sub", sel:"--c2c-violetSoft", emph:"--c2c-yellow",
-    other:"--c2c-surface2", text:"--c2c-fg", accent:"--c2c-blue",
-    pose_joint:"--c2c-green", pose_bone:"--c2c-blue",
-    pose_selected:"--c2c-yellow", pose_missing:"--c2c-sub",
-    gaze_l:"--c2c-red", gaze_r:"--c2c-green", gaze_drag:"--c2c-yellow",
-    canvas_bg:"--c2c-bg3", input_bg:"--c2c-bg2", btn_off_bg:"--c2c-surface0",
-    fg_inverse:"--c2c-bg3", ok_bg:"--c2c-okBg", err_bg:"--c2c-dangerBg",
-    info_bg:"--c2c-blueDim", tab_active:"--c2c-surface1",
-};
-const C = new Proxy(_C_FALLBACK, {
-    get(target, key) {
-        const tok = _C_TOKEN[key];
-        if (tok) { try { const v = getComputedStyle(document.documentElement).getPropertyValue(tok).trim(); if (v) return v; } catch {} }
-        return target[key];
-    },
+// Identity colours for landmarks / pose / gaze overlays (not theme chrome).
+const DATA = Object.freeze({
+    pose_joint: "#a6e3a1", pose_bone: "#74c7ec", pose_selected: "#f9e2af",
+    pose_missing: "#585b70",
+    gaze_l: "#f38ba8", gaze_r: "#94e2d5", gaze_drag: "#f9e2af",
+    lm_emph: "#fab387", lm_sel: "#cba6f7", lm_other: "#45475a",
 });
+
+// CSS-variable strings for DOM chrome.
+const V = Object.freeze({
+    bg: "var(--c2c-bg)", fg: "var(--c2c-fg)", dim: "var(--c2c-dim)",
+    border: "var(--c2c-border)", blue: "var(--c2c-blue)", mauve: "var(--c2c-mauve)",
+    bg2: "var(--c2c-bg2)", bg3: "var(--c2c-bg3)",
+    surface0: "var(--c2c-surface0)", surface1: "var(--c2c-surface1)",
+    okBg: "var(--c2c-okBg)", dangerBg: "var(--c2c-dangerBg)", danger: "var(--c2c-danger)",
+});
+
+function _fc3dTheme() {
+    return {
+        canvas_bg: C.bg3, text: C.fg, dim: C.dim,
+        border: C.border, accent: C.blue, sel: C.peach,
+    };
+}
 
 // ─── Data constants ─────────────────────────────────────────────────
 const POSE18_NAMES = [
@@ -533,7 +527,7 @@ function _fc3dSetupDomWidget(node, domW) {
         domW.element.style.minHeight = `${FC3D_MIN_H}px`;
         domW.element.style.maxHeight = `${FC3D_MAX_H}px`;
         domW.element.style.boxSizing = "border-box";
-        domW.element.style.background = C.bg;
+        domW.element.style.background = V.bg;
         domW.element.style.padding = "0";
     }
 }
@@ -730,7 +724,7 @@ function _el(tag, style, attrs) {
 }
 function _btn(label, title, bg) {
     const b = _el("button",
-        `background:${bg||C.border};color:${C.text};border:1px solid ${C.border};` +
+        `background:${bg||V.border};color:${V.fg};border:1px solid ${V.border};` +
         `border-radius:4px;padding:3px 8px;cursor:pointer;font:11px ui-sans-serif,system-ui;line-height:1;`);
     b.textContent = label; b.title = title || "";
     b.classList.add("fc3d-btn");
@@ -762,8 +756,8 @@ function buildEditor(node) {
         `display:flex;flex-direction:column;gap:4px;box-sizing:border-box;` +
         `width:calc(100% - 12px);margin:2px 6px 4px 6px;` +
         `height:auto;max-height:100%;align-self:stretch;` +
-        `background:${C.bg};border:1px solid ${C.border};border-radius:6px;` +
-        `padding:6px;overflow:hidden;font:12px ui-sans-serif,system-ui;color:${C.text};` +
+        `background:${V.bg};border:1px solid ${V.border};border-radius:6px;` +
+        `padding:6px;overflow:hidden;font:12px ui-sans-serif,system-ui;color:${V.fg};` +
         `user-select:none;pointer-events:auto;`);
     root.classList.add("fc3d-editor-root");
     root.style.flex = "1 1 auto";
@@ -809,7 +803,7 @@ function buildEditor(node) {
         `display:flex;gap:2px;overflow:hidden;pointer-events:auto;flex:0 0 auto;`);
     tabBar.classList.add("fc3d-tabbar");
     const frameHint = _el("span",
-        `font:9px ui-monospace,monospace;color:${C.dim};padding:0 4px;flex:0 0 auto;align-self:center;`);
+        `font:9px ui-monospace,monospace;color:${V.dim};padding:0 4px;flex:0 0 auto;align-self:center;`);
     frameHint.textContent = "";
 
     const TABS = [
@@ -836,7 +830,7 @@ function buildEditor(node) {
     // ── Main canvas (fixed height — flex:1 was absorbing ComfyUI grid slack → black slab) ──
     let _canvasViewPx = FC3D_CANVAS_VIEW_PX;
     const canvasWrap = _el("div",
-        `position:relative;flex:0 0 auto;width:100%;overflow:hidden;background:#2a2a3d;` +
+        `position:relative;flex:0 0 auto;width:100%;overflow:hidden;background:var(--c2c-bg3, #0e0e16);` +
         `pointer-events:auto;cursor:crosshair;`);
     canvasWrap.classList.add("fc3d-canvaswrap");
     const cvs = _el("canvas", "display:block;width:100%;height:100%;cursor:crosshair;outline:none;");
@@ -895,7 +889,7 @@ function buildEditor(node) {
         const sy = cvs.height / Math.max(1, r.height);
         return [(e.clientX - r.left) * sx, (e.clientY - r.top) * sy];
     }
-    cvs.addEventListener("focus", () => { cvs.style.boxShadow = `0 0 0 2px ${C.accent}`; });
+    cvs.addEventListener("focus", () => { cvs.style.boxShadow = `0 0 0 2px ${V.blue}`; });
     cvs.addEventListener("blur",  () => { cvs.style.boxShadow = "none"; });
     canvasWrap.appendChild(cvs);
     root.appendChild(canvasWrap);
@@ -914,21 +908,21 @@ function buildEditor(node) {
     const btnNext = _btn("\u25B6","Next frame"); btnNext.style.padding="2px 6px";
     const btnUndo = _btn("\u21B6","Undo (Ctrl+Z)"); btnUndo.disabled=true;
     const btnRedo = _btn("\u21B7","Redo (Ctrl+Shift+Z)"); btnRedo.disabled=true;
-    const btnReset = _btn("\u21BA","Reset this frame",C.err_bg);
+    const btnReset = _btn("\u21BA","Reset this frame",V.dangerBg);
     // Slice B: live face-warp preview toggle \u2014 deforms the input face image by
     // the rotated landmarks (head turns as you drag head pose), zero-GPU. The
     // queued ExpressionEditor remains the high-quality path.
     const btnWarp = _btn("\u25D1 warp","Live face-warp preview: the input face turns as you drag head pose (needs an input image + a queued frame)");
     btnWarp.style.padding="2px 6px";
     let _warpEnabled=false;
-    btnWarp.addEventListener("click",()=>{_warpEnabled=!_warpEnabled;btnWarp.style.background=_warpEnabled?C.accent:"";try{render();}catch(_){}});
+    btnWarp.addEventListener("click",()=>{_warpEnabled=!_warpEnabled;btnWarp.style.background=_warpEnabled?V.blue:"";try{render();}catch(_){}});
     transport.append(btnPrev,frameLbl,slider,btnNext,btnUndo,btnRedo,btnReset,btnWarp);
     root.appendChild(transport);
 
     // ── Mini timeline ───────────────────────────────────────────────
     const tl = _el("canvas",
-        `width:100%;height:20px;display:block;background:${C.canvas_bg};flex:0 0 auto;pointer-events:auto;` +
-        `border:1px solid ${C.border};border-radius:4px;cursor:pointer;`);
+        `width:100%;height:20px;display:block;background:${V.bg3};flex:0 0 auto;pointer-events:auto;` +
+        `border:1px solid ${V.border};border-radius:4px;cursor:pointer;`);
     tl.width = 480; tl.height = 20;
     tl.title = "click=jump \u00b7 shift-click=range \u00b7 right-click=clear frame";
     root.appendChild(tl);
@@ -943,10 +937,10 @@ function buildEditor(node) {
     // return the EDITED frame rendered through the same overlay renderer as
     // the node's preview_image output. Drag a slider / DOF → see the result.
     const lpDetails = _el("details",
-        `background:${C.canvas_bg};border:1px solid ${C.border};border-radius:6px;overflow:hidden;margin-bottom:3px;`);
+        `background:${V.bg3};border:1px solid ${V.border};border-radius:6px;overflow:hidden;margin-bottom:3px;`);
     lpDetails.open = false;  // closed by default — opt-in, so the Face tab stays compact
     const lpSummary = _el("summary",
-        `padding:6px 10px;cursor:pointer;font:11px ui-sans-serif;color:${C.dim};user-select:none;`);
+        `padding:6px 10px;cursor:pointer;font:11px ui-sans-serif;color:${V.dim};user-select:none;`);
     lpSummary.textContent = "▸ Live render preview";
     lpDetails.addEventListener("toggle", () => {
         lpSummary.textContent = (lpDetails.open ? "▾ " : "▸ ") + "Live render preview";
@@ -955,19 +949,19 @@ function buildEditor(node) {
     });
     const lpImg = _el("img",
         `display:block;width:100%;max-width:256px;margin:0 auto;border-radius:4px;` +
-        `background:${C.bg};min-height:96px;object-fit:contain;`);
+        `background:${V.bg};min-height:96px;object-fit:contain;`);
     lpImg.alt = "";
     const lpHint = _el("div",
-        `padding:4px 8px;font:9px ui-sans-serif;color:${C.dim};text-align:center;`);
+        `padding:4px 8px;font:9px ui-sans-serif;color:${V.dim};text-align:center;`);
     lpHint.textContent = "queue once, then edits re-render here live";
     const lpBody = _el("div", `padding:6px;`);
     lpBody.append(lpImg, lpHint);
     lpDetails.append(lpSummary, lpBody);
     ctxFace.appendChild(lpDetails);
     const faceDetails = _el("details",
-        `background:${C.canvas_bg};border:1px solid ${C.border};border-radius:6px;overflow:hidden;`);
+        `background:${V.bg3};border:1px solid ${V.border};border-radius:6px;overflow:hidden;`);
     const faceSummary = _el("summary",
-        `padding:6px 10px;cursor:pointer;font:11px ui-sans-serif;color:${C.dim};user-select:none;`);
+        `padding:6px 10px;cursor:pointer;font:11px ui-sans-serif;color:${V.dim};user-select:none;`);
     faceSummary.textContent = "\u25B8 Numeric coordinates";
     faceDetails.appendChild(faceSummary);
     faceDetails.addEventListener("toggle",()=>{
@@ -975,20 +969,20 @@ function buildEditor(node) {
         _relayout();
     });
     const faceEdRow = _el("div",
-        `display:flex;flex-wrap:wrap;align-items:center;gap:4px;padding:6px 8px;font:10px ui-sans-serif;color:${C.text};`);
+        `display:flex;flex-wrap:wrap;align-items:center;gap:4px;padding:6px 8px;font:10px ui-sans-serif;color:${V.fg};`);
     const _mkNumIn = (ph,step,w) => {
-        const i=_el("input",`width:${w}px;padding:3px 4px;background:${C.input_bg};color:${C.text};` +
-            `border:1px solid ${C.border};border-radius:3px;font:10px ui-monospace,monospace;outline:none;`);
+        const i=_el("input",`width:${w}px;padding:3px 4px;background:${V.bg2};color:${V.fg};` +
+            `border:1px solid ${V.border};border-radius:3px;font:10px ui-monospace,monospace;outline:none;`);
         i.type="number";i.step=String(step);i.placeholder=ph; return i;
     };
-    const tgtSel = _el("select",`padding:3px;background:${C.input_bg};color:${C.text};border:1px solid ${C.border};border-radius:3px;font:10px ui-sans-serif;cursor:pointer;outline:none;`);
+    const tgtSel = _el("select",`padding:3px;background:${V.bg2};color:${V.fg};border:1px solid ${V.border};border-radius:3px;font:10px ui-sans-serif;cursor:pointer;outline:none;`);
     for(const[v,t]of[["face","face"],["pose","pose"],["gaze-l","gaze L"],["gaze-r","gaze R"]]){const o=_el("option");o.value=v;o.textContent=t;tgtSel.appendChild(o);}
     const idxIn=_mkNumIn("idx",1,36); idxIn.value="30"; idxIn.min="0"; idxIn.max="67";
     const xIn=_mkNumIn("x",0.001,56);
     const yIn=_mkNumIn("y",0.001,56);
-    const btnSet=_btn("Set","Write override",C.ok_bg); btnSet.style.fontSize="10px";btnSet.style.padding="2px 6px";
-    const btnClear=_btn("Clear","Clear override",C.err_bg); btnClear.style.fontSize="10px";btnClear.style.padding="2px 6px";
-    const nameTag=_el("span",`color:${C.dim};font:9px ui-monospace,monospace;margin-left:auto;`);
+    const btnSet=_btn("Set","Write override",V.okBg); btnSet.style.fontSize="10px";btnSet.style.padding="2px 6px";
+    const btnClear=_btn("Clear","Clear override",V.dangerBg); btnClear.style.fontSize="10px";btnClear.style.padding="2px 6px";
+    const nameTag=_el("span",`color:${V.dim};font:9px ui-monospace,monospace;margin-left:auto;`);
     nameTag.textContent="\u2014";
     faceEdRow.append(tgtSel,idxIn,xIn,yIn,btnSet,btnClear,nameTag);
     faceDetails.appendChild(faceEdRow);
@@ -1048,21 +1042,21 @@ function buildEditor(node) {
         for (const ch of presetBar.children) {
             if (ch.tagName !== "BUTTON") continue;
             const on = ch.textContent === name;
-            ch.style.background = on ? C.tab_active : C.btn_off_bg;
-            ch.style.borderColor = on ? C.sel : C.border;
+            ch.style.background = on ? V.surface1 : V.surface0;
+            ch.style.borderColor = on ? V.mauve : V.border;
         }
     }
     for (const name of PRESET_QUICK) {
         const b = _el("button",
             `padding:3px 11px;font:10px ui-sans-serif;cursor:pointer;` +
-            `background:${name==="Neutral"?C.tab_active:C.btn_off_bg};color:${C.text};border:1px solid ${C.border};`);
+            `background:${name==="Neutral"?V.surface1:V.surface0};color:${V.fg};border:1px solid ${V.border};`);
         b.classList.add("fc3d-btn", "fc3d-chip");
         b.textContent = name;
         b.addEventListener("click", () => { _applyPreset(name); _markPreset(name); });
         presetBar.appendChild(b);
     }
     const moreSel = _el("select",
-        `font:10px ui-sans-serif;background:${C.input_bg};color:${C.dim};border:1px solid ${C.border};` +
+        `font:10px ui-sans-serif;background:${V.bg2};color:${V.dim};border:1px solid ${V.border};` +
         `border-radius:4px;padding:2px 4px;cursor:pointer;margin-left:auto;`);
     const moreOpt0 = _el("option"); moreOpt0.value = ""; moreOpt0.textContent = "More\u2026";
     moreSel.appendChild(moreOpt0);
@@ -1077,7 +1071,7 @@ function buildEditor(node) {
         moreSel.value = "";
     });
     presetBar.appendChild(moreSel);
-    const btnResetExpr = _btn("Clr", "Clear expression on this frame", C.err_bg);
+    const btnResetExpr = _btn("Clr", "Clear expression on this frame", V.dangerBg);
     btnResetExpr.style.cssText = "font-size:10px;padding:2px 6px;margin-left:2px;";
     btnResetExpr.addEventListener("click", () => {
         const d = _parseCoeffsJson();
@@ -1091,9 +1085,9 @@ function buildEditor(node) {
     ctxExpr.appendChild(presetBar);
 
     const exprFineTune = _el("details",
-        `background:${C.canvas_bg};border:1px solid ${C.border};border-radius:5px;`);
+        `background:${V.bg3};border:1px solid ${V.border};border-radius:5px;`);
     const exprFtSum = _el("summary",
-        `padding:4px 8px;cursor:pointer;font:10px ui-sans-serif;color:${C.dim};user-select:none;`);
+        `padding:4px 8px;cursor:pointer;font:10px ui-sans-serif;color:${V.dim};user-select:none;`);
     exprFtSum.textContent = "\u25B8 Fine-tune";
     exprFineTune.appendChild(exprFtSum);
 
@@ -1103,23 +1097,23 @@ function buildEditor(node) {
 
     function _addSliderRow(axis, parent) {
         const row = _el("div", `display:grid;grid-template-columns:52px 1fr 28px;align-items:center;gap:2px;height:18px;`);
-        const lbl = _el("span", `font:9px ui-sans-serif;color:${C.dim};overflow:hidden;text-overflow:ellipsis;white-space:nowrap;`);
+        const lbl = _el("span", `font:9px ui-sans-serif;color:${V.dim};overflow:hidden;text-overflow:ellipsis;white-space:nowrap;`);
         lbl.textContent = axis.label.split(" ").slice(-1)[0] || axis.id;
         lbl.title = axis.label;
-        const sl = _el("input", `width:100%;height:10px;accent-color:${C.sel};cursor:pointer;`);
+        const sl = _el("input", `width:100%;height:10px;accent-color:${V.mauve};cursor:pointer;`);
         sl.type = "range"; sl.min = "-1"; sl.max = "1"; sl.step = "0.01"; sl.value = "0";
-        const val = _el("span", `font:9px ui-monospace,monospace;color:${C.dim};text-align:right;`);
+        const val = _el("span", `font:9px ui-monospace,monospace;color:${V.dim};text-align:right;`);
         val.textContent = "0";
         sl.addEventListener("input", () => {
             const v = parseFloat(sl.value);
             val.textContent = v.toFixed(2);
-            val.style.color = Math.abs(v) > 0.01 ? C.sel : C.dim;
+            val.style.color = Math.abs(v) > 0.01 ? V.mauve : V.dim;
             _setCoeff(state.frame, axis.id, v);
             if (activeTab === "expr") render();
             try { _refreshFacs(); } catch (_) {}
         });
         sl.addEventListener("dblclick", () => {
-            sl.value = "0"; val.textContent = "0.00"; val.style.color = C.dim;
+            sl.value = "0"; val.textContent = "0.00"; val.style.color = V.dim;
             _setCoeff(state.frame, axis.id, 0);
             if (activeTab === "expr") render();
         });
@@ -1168,9 +1162,9 @@ function buildEditor(node) {
     }
     const _limitEls = {};
     const exprLimits = _el("details",
-        `background:${C.canvas_bg};border:1px solid ${C.border};border-radius:5px;margin-top:3px;`);
+        `background:${V.bg3};border:1px solid ${V.border};border-radius:5px;margin-top:3px;`);
     const exprLimSum = _el("summary",
-        `padding:4px 8px;cursor:pointer;font:10px ui-sans-serif;color:${C.dim};user-select:none;`);
+        `padding:4px 8px;cursor:pointer;font:10px ui-sans-serif;color:${V.dim};user-select:none;`);
     exprLimSum.textContent = "▸ Per-AU limits (dampening)";
     exprLimits.appendChild(exprLimSum);
     // Self-bounded: a 12-row grid would push the editor taller than the
@@ -1180,13 +1174,13 @@ function buildEditor(node) {
         `max-height:128px;overflow-y:auto;overflow-x:hidden;`);
     function _addLimitRow(axis, parent){
         const row = _el("div", `display:grid;grid-template-columns:52px 1fr 30px;align-items:center;gap:2px;height:18px;`);
-        const lbl = _el("span", `font:9px ui-sans-serif;color:${C.dim};overflow:hidden;text-overflow:ellipsis;white-space:nowrap;`);
+        const lbl = _el("span", `font:9px ui-sans-serif;color:${V.dim};overflow:hidden;text-overflow:ellipsis;white-space:nowrap;`);
         lbl.textContent = axis.label.split(" ").slice(-1)[0] || axis.id; lbl.title = "Max for " + axis.label;
-        const sl = _el("input", `width:100%;height:10px;accent-color:${C.accent};cursor:pointer;`);
+        const sl = _el("input", `width:100%;height:10px;accent-color:${V.blue};cursor:pointer;`);
         sl.type = "range"; sl.min = "0"; sl.max = "1.5"; sl.step = "0.05"; sl.value = String(FC3D_GLOBAL_CAP);
-        const val = _el("span", `font:9px ui-monospace,monospace;color:${C.dim};text-align:right;`);
+        const val = _el("span", `font:9px ui-monospace,monospace;color:${V.dim};text-align:right;`);
         const _paint = (v) => { const capped = v < FC3D_GLOBAL_CAP - 1e-6;
-            val.textContent = capped ? v.toFixed(2) : "max"; val.style.color = capped ? C.accent : C.dim; };
+            val.textContent = capped ? v.toFixed(2) : "max"; val.style.color = capped ? V.blue : V.dim; };
         sl.addEventListener("input", () => { const v = parseFloat(sl.value); _paint(v); _writePerAxisCap(axis.id, v); });
         sl.addEventListener("dblclick", () => { sl.value = String(FC3D_GLOBAL_CAP); _paint(FC3D_GLOBAL_CAP); _writePerAxisCap(axis.id, FC3D_GLOBAL_CAP); });
         row.append(lbl, sl, val); parent.appendChild(row);
@@ -1195,7 +1189,7 @@ function buildEditor(node) {
     for (const axis of FACS_AXES) _addLimitRow(axis, limGrid);
     exprLimits.appendChild(limGrid);
     const limFoot = _el("div", "display:flex;justify-content:flex-end;padding:0 6px 5px;");
-    const btnLimReset = _btn("Reset limits", "Clear all per-AU dampening", C.input_bg);
+    const btnLimReset = _btn("Reset limits", "Clear all per-AU dampening", V.bg2);
     btnLimReset.style.cssText = "font-size:9px;padding:2px 6px;";
     btnLimReset.addEventListener("click", () => {
         writeParam(node, "expression_clamp_per_axis_json", "");
@@ -1209,11 +1203,11 @@ function buildEditor(node) {
             const cap = _capForAxis(map, axis.id); el.sl.value = String(cap); el.paint(cap); } }
 
     const exprPropRow = _el("div", "display:flex;align-items:center;gap:4px;padding:2px 6px 4px;flex-wrap:wrap;");
-    const exprPropLbl = _el("span", `font:9px ui-sans-serif;color:${C.dim};`);
+    const exprPropLbl = _el("span", `font:9px ui-sans-serif;color:${V.dim};`);
     exprPropLbl.textContent = "Propagate";
     const exprPropSel = _el("select",
-        `font:9px ui-sans-serif;flex:1;min-width:100px;padding:2px;background:${C.input_bg};color:${C.text};` +
-        `border:1px solid ${C.border};border-radius:3px;`);
+        `font:9px ui-sans-serif;flex:1;min-width:100px;padding:2px;background:${V.bg2};color:${V.fg};` +
+        `border:1px solid ${V.border};border-radius:3px;`);
     for (const v of PROPAGATE_OPTS) {
         const o = _el("option"); o.value = v; o.textContent = v;
         exprPropSel.appendChild(o);
@@ -1247,23 +1241,23 @@ function buildEditor(node) {
     // (above baseline = positive, below = negative). The shared playhead
     // tracks the current frame; click any lane to scrub there.
     const facsDetails = _el("details",
-        `background:${C.canvas_bg};border:1px solid ${C.border};border-radius:5px;margin-top:3px;`);
+        `background:${V.bg3};border:1px solid ${V.border};border-radius:5px;margin-top:3px;`);
     const facsSum = _el("summary",
-        `padding:4px 8px;cursor:pointer;font:10px ui-sans-serif;color:${C.dim};user-select:none;`);
+        `padding:4px 8px;cursor:pointer;font:10px ui-sans-serif;color:${V.dim};user-select:none;`);
     facsSum.textContent = "▸ FACS keyframe lanes";
     facsDetails.appendChild(facsSum);
     const facsWrap = _el("div", "padding:4px 6px;");
     const facsCvs = _el("canvas", `width:100%;height:${FACS_AXES.length*11+4}px;display:block;border-radius:3px;cursor:pointer;`);
     facsCvs.width = 460; facsCvs.height = FACS_AXES.length * 11 + 4;
     facsWrap.appendChild(facsCvs);
-    const facsHint = _el("div", `font:8px ui-sans-serif;color:${C.dim};padding:2px 0 0;`);
+    const facsHint = _el("div", `font:8px ui-sans-serif;color:${V.dim};padding:2px 0 0;`);
     facsHint.textContent = "click a lane to scrub · dot height = coeff · ▲ above = +, ▼ below = −";
     facsWrap.appendChild(facsHint);
     facsDetails.appendChild(facsWrap);
     const _FACS_LBL_PX = 46;
     function drawFacsLanes() {
         const ctx = facsCvs.getContext("2d"), W = facsCvs.width, H = facsCvs.height;
-        ctx.fillStyle = C.canvas_bg; ctx.fillRect(0, 0, W, H);
+        ctx.fillStyle = C.bg3; ctx.fillRect(0, 0, W, H);
         const n = _frameCount();
         const trackX = _FACS_LBL_PX, trackW = Math.max(1, W - _FACS_LBL_PX - 2);
         const laneH = (H - 2) / FACS_AXES.length;
@@ -1283,7 +1277,7 @@ function buildEditor(node) {
                 const v = Number(data.frames[fk][a.id] || 0);
                 if (Math.abs(v) < 0.001) continue;
                 const mag = Math.min(1, Math.abs(v)), x = fx(f);
-                ctx.fillStyle = v >= 0 ? C.sel : C.gaze_l;
+                ctx.fillStyle = v >= 0 ? DATA.lm_sel : DATA.gaze_l;
                 ctx.globalAlpha = 0.45 + mag * 0.55;
                 ctx.beginPath(); ctx.arc(x, cy - v * (laneH * 0.34), 1.5 + mag * 2.2, 0, Math.PI * 2); ctx.fill();
                 ctx.globalAlpha = 1;
@@ -1291,7 +1285,7 @@ function buildEditor(node) {
         });
         if (n > 0) {
             const xp = fx(state.frame);
-            ctx.strokeStyle = C.accent; ctx.lineWidth = 1;
+            ctx.strokeStyle = C.blue; ctx.lineWidth = 1;
             ctx.beginPath(); ctx.moveTo(xp, 1); ctx.lineTo(xp, H - 1); ctx.stroke();
         }
     }
@@ -1321,9 +1315,9 @@ function buildEditor(node) {
     function _buildGimbal(label,eyeKey,color) {
         const wrap = _el("div","display:flex;flex-direction:column;align-items:center;gap:2px;");
         const eyeLbl = _el("span",`font:9px ui-sans-serif;font-weight:600;color:${color};`);eyeLbl.textContent=label;
-        const gCvs = _el("canvas",`width:${GIMBAL_PX}px;height:${GIMBAL_PX}px;border-radius:50%;cursor:crosshair;background:${C.bg};border:1px solid ${C.border};`);
+        const gCvs = _el("canvas",`width:${GIMBAL_PX}px;height:${GIMBAL_PX}px;border-radius:50%;cursor:crosshair;background:${V.bg};border:1px solid ${V.border};`);
         gCvs.width=GIMBAL_PX;gCvs.height=GIMBAL_PX;
-        const info = _el("span",`font:9px ui-monospace,monospace;color:${C.dim};`);info.textContent="0.0\u00b0 / 0.0\u00b0";
+        const info = _el("span",`font:9px ui-monospace,monospace;color:${V.dim};`);info.textContent="0.0\u00b0 / 0.0\u00b0";
         const SZ=GIMBAL_PX,R=SZ/2-5,MAX_DEG=30;
         function drawG() {
             const ctx=gCvs.getContext("2d");ctx.clearRect(0,0,SZ,SZ);
@@ -1349,29 +1343,29 @@ function buildEditor(node) {
         wrap.append(eyeLbl,gCvs,info);
         return {el:wrap,draw:drawG};
     }
-    const gimbalL = _buildGimbal("Left","l",C.gaze_l);
-    const gimbalR = _buildGimbal("Right","r",C.gaze_r);
+    const gimbalL = _buildGimbal("Left","l",DATA.gaze_l);
+    const gimbalR = _buildGimbal("Right","r",DATA.gaze_r);
     const linkBtn = _el("button",
-        `font:9px ui-sans-serif;padding:4px 6px;border:1px solid ${C.border};border-radius:4px;cursor:pointer;` +
-        `background:${C.ok_bg};color:${C.text};align-self:center;`);
+        `font:9px ui-sans-serif;padding:4px 6px;border:1px solid ${V.border};border-radius:4px;cursor:pointer;` +
+        `background:${V.okBg};color:${V.fg};align-self:center;`);
     linkBtn.textContent="Link"; linkBtn.title="Link both eyes";
     linkBtn.addEventListener("click",()=>{
         gazeLinked=!gazeLinked;
         linkBtn.textContent=gazeLinked?"Link":"Split";
-        linkBtn.style.background=gazeLinked?C.ok_bg:C.btn_off_bg;
+        linkBtn.style.background=gazeLinked?V.okBg:V.surface0;
     });
     // P4 (Face-Director plan): single "look-at target" mode. Toggle ON, then
     // drag one reticle on the face canvas — BOTH eyes converge on that point
     // (canvasToGaze run per-eye), the natural way humans fixate on a target.
     const lookAtBtn = _el("button",
-        `font:9px ui-sans-serif;padding:4px 6px;border:1px solid ${C.border};border-radius:4px;cursor:pointer;` +
-        `background:${C.btn_off_bg};color:${C.text};align-self:center;white-space:nowrap;`);
+        `font:9px ui-sans-serif;padding:4px 6px;border:1px solid ${V.border};border-radius:4px;cursor:pointer;` +
+        `background:${V.surface0};color:${V.fg};align-self:center;white-space:nowrap;`);
     lookAtBtn.textContent="🎯 Look-at";
     lookAtBtn.title="Look-at target: drag one point on the face — both eyes converge on it";
     lookAtBtn.addEventListener("click",()=>{
         gstate.lookAtMode=!gstate.lookAtMode;
-        lookAtBtn.style.background=gstate.lookAtMode?C.accent:C.btn_off_bg;
-        lookAtBtn.style.color=gstate.lookAtMode?C.bg:C.text;
+        lookAtBtn.style.background=gstate.lookAtMode?V.blue:V.surface0;
+        lookAtBtn.style.color=gstate.lookAtMode?V.bg:V.fg;
         if(!gstate.lookAtMode)gstate.lookAtPos=null;
         render();
     });
@@ -1399,15 +1393,15 @@ function buildEditor(node) {
         if(gstate.lookAtPos){[tx,ty]=gstate.lookAtPos;}
         else{tx=(lx+rx)/2;ty=(ly+ry)/2-H*0.05;}   // default: just above the eye line
         ctx.save();
-        ctx.strokeStyle=C.accent;ctx.globalAlpha=0.55;ctx.lineWidth=1.5;ctx.setLineDash([4,3]);
+        ctx.strokeStyle=C.blue;ctx.globalAlpha=0.55;ctx.lineWidth=1.5;ctx.setLineDash([4,3]);
         ctx.beginPath();ctx.moveTo(lx,ly);ctx.lineTo(tx,ty);ctx.moveTo(rx,ry);ctx.lineTo(tx,ty);ctx.stroke();
         ctx.setLineDash([]);ctx.globalAlpha=1;
-        ctx.strokeStyle=C.accent;ctx.lineWidth=2;
+        ctx.strokeStyle=C.blue;ctx.lineWidth=2;
         ctx.beginPath();ctx.arc(tx,ty,9,0,Math.PI*2);ctx.stroke();
         ctx.beginPath();
         ctx.moveTo(tx-13,ty);ctx.lineTo(tx-4,ty);ctx.moveTo(tx+4,ty);ctx.lineTo(tx+13,ty);
         ctx.moveTo(tx,ty-13);ctx.lineTo(tx,ty-4);ctx.moveTo(tx,ty+4);ctx.lineTo(tx,ty+13);ctx.stroke();
-        ctx.fillStyle=C.accent;ctx.beginPath();ctx.arc(tx,ty,2.5,0,Math.PI*2);ctx.fill();
+        ctx.fillStyle=C.blue;ctx.beginPath();ctx.arc(tx,ty,2.5,0,Math.PI*2);ctx.fill();
         ctx.restore();
     }
 
@@ -1417,15 +1411,15 @@ function buildEditor(node) {
     btn3D.style.width="100%";
     let _fc3dEditor=null,_fc3dHost=null;
     ctxPose.appendChild(btn3D);
-    const poseAdv = _el("details",`background:${C.canvas_bg};border:1px solid ${C.border};border-radius:5px;`);
-    const poseAdvSum = _el("summary",`padding:4px 8px;font:10px ui-sans-serif;color:${C.dim};cursor:pointer;`);
+    const poseAdv = _el("details",`background:${V.bg3};border:1px solid ${V.border};border-radius:5px;`);
+    const poseAdvSum = _el("summary",`padding:4px 8px;font:10px ui-sans-serif;color:${V.dim};cursor:pointer;`);
     poseAdvSum.textContent="\u25B8 Advanced";
     poseAdv.appendChild(poseAdvSum);
     const poseAdvRow = _el("div","display:flex;gap:4px;padding:4px 6px;flex-wrap:wrap;");
     const btnPropToggle = _btn("\u0394 off","Delta propagation for drags");
     let propagateMode = false;
-    btnPropToggle.addEventListener("click",()=>{propagateMode=!propagateMode;btnPropToggle.textContent=propagateMode?"\u0394 ON":"\u0394 off";btnPropToggle.style.background=propagateMode?C.accent:C.border;});
-    const btnClearAll = _btn("Clear all frames", "Clear every override", C.err_bg);
+    btnPropToggle.addEventListener("click",()=>{propagateMode=!propagateMode;btnPropToggle.textContent=propagateMode?"\u0394 ON":"\u0394 off";btnPropToggle.style.background=propagateMode?V.blue:V.border;});
+    const btnClearAll = _btn("Clear all frames", "Clear every override", V.dangerBg);
     btnClearAll.addEventListener("click",()=>{writeOverrides(node,{frames:{}});writePoseOverrides(node,{frames:{}});writeGazeOverrides(node,{frames:{}});const d=_parseCoeffsJson();d.frames={};_writeCoeffsJson(d);tlstate.selA=tlstate.selB=-1;render();drawTimeline();});
     poseAdvRow.append(btnPropToggle,btnClearAll);
     poseAdv.appendChild(poseAdvRow);
@@ -1440,10 +1434,10 @@ function buildEditor(node) {
 
     function _mkSetSection(title, open = true) {
         const det = _el("details",
-            `background:${C.canvas_bg};border:1px solid ${C.border};border-radius:5px;`);
+            `background:${V.bg3};border:1px solid ${V.border};border-radius:5px;`);
         det.open = open !== false;
         const sum = _el("summary",
-            `padding:4px 8px;font:10px ui-sans-serif;color:${C.dim};cursor:pointer;user-select:none;`);
+            `padding:4px 8px;font:10px ui-sans-serif;color:${V.dim};cursor:pointer;user-select:none;`);
         sum.textContent = (open ? "\u25BE " : "\u25B8 ") + title;
         det.appendChild(sum);
         const body = _el("div", "display:flex;flex-direction:column;gap:2px;padding:4px 8px 6px;");
@@ -1463,12 +1457,12 @@ function buildEditor(node) {
         const row = _el("div",
             "display:grid;grid-template-columns:clamp(72px,34%,110px) 1fr minmax(32px,2.5em);" +
             "align-items:center;gap:4px;min-height:22px;width:100%;");
-        const lbl = _el("span", `font:9px ui-sans-serif;color:${C.dim};overflow:hidden;text-overflow:ellipsis;`);
+        const lbl = _el("span", `font:9px ui-sans-serif;color:${V.dim};overflow:hidden;text-overflow:ellipsis;`);
         lbl.textContent = label || name;
-        const sl = _el("input", `width:100%;height:10px;accent-color:${C.sel};cursor:pointer;`);
+        const sl = _el("input", `width:100%;height:10px;accent-color:${V.mauve};cursor:pointer;`);
         sl.type = "range"; sl.min = String(min); sl.max = String(max); sl.step = String(step);
         sl.value = String(Number(readParam(node, name)) || 0);
-        const val = _el("span", `font:9px ui-monospace,monospace;color:${C.dim};text-align:right;`);
+        const val = _el("span", `font:9px ui-monospace,monospace;color:${V.dim};text-align:right;`);
         const _fmt = (v) => (Math.abs(step) < 0.1 ? Number(v).toFixed(2) : Number(v).toFixed(1));
         val.textContent = _fmt(sl.value);
         sl.addEventListener("input", () => {
@@ -1487,11 +1481,11 @@ function buildEditor(node) {
     function _addComboRow(parent, name, label, values) {
         const row = _el("div",
             "display:grid;grid-template-columns:clamp(72px,34%,110px) 1fr;align-items:center;gap:4px;min-height:22px;width:100%;");
-        const lbl = _el("span", `font:9px ui-sans-serif;color:${C.dim};overflow:hidden;text-overflow:ellipsis;`);
+        const lbl = _el("span", `font:9px ui-sans-serif;color:${V.dim};overflow:hidden;text-overflow:ellipsis;`);
         lbl.textContent = label || name;
         const sel = _el("select",
-            `font:9px ui-sans-serif;padding:2px;background:${C.input_bg};color:${C.text};` +
-            `border:1px solid ${C.border};border-radius:3px;width:100%;max-width:100%;`);
+            `font:9px ui-sans-serif;padding:2px;background:${V.bg2};color:${V.fg};` +
+            `border:1px solid ${V.border};border-radius:3px;width:100%;max-width:100%;`);
         const vals = values || PROPAGATE_OPTS;
         for (const v of vals) {
             const o = _el("option"); o.value = v; o.textContent = v;
@@ -1506,9 +1500,9 @@ function buildEditor(node) {
 
     function _addBoolRow(parent, name, label) {
         const row = _el("div", "display:flex;align-items:center;gap:5px;height:18px;");
-        const cb = _el("input", `accent-color:${C.sel};cursor:pointer;`);
+        const cb = _el("input", `accent-color:${V.mauve};cursor:pointer;`);
         cb.type = "checkbox"; cb.checked = !!readParam(node, name);
-        const lbl = _el("span", `font:9px ui-sans-serif;color:${C.dim};cursor:pointer;`);
+        const lbl = _el("span", `font:9px ui-sans-serif;color:${V.dim};cursor:pointer;`);
         lbl.textContent = label || name;
         const flip = () => _fc3dEmitParam(node, name, cb.checked, _onWidgetChg);
         cb.addEventListener("change", flip);
@@ -1522,10 +1516,10 @@ function buildEditor(node) {
         const opts = FC3D_PARAM_OPTS[name] || {};
         const row = _el("div",
             "display:grid;grid-template-columns:clamp(72px,34%,110px) 1fr;align-items:center;gap:4px;min-height:22px;width:100%;");
-        const lbl = _el("span", `font:9px ui-sans-serif;color:${C.dim};overflow:hidden;text-overflow:ellipsis;`);
+        const lbl = _el("span", `font:9px ui-sans-serif;color:${V.dim};overflow:hidden;text-overflow:ellipsis;`);
         lbl.textContent = label || name;
         const inp = _el("input",
-            `padding:2px 4px;background:${C.input_bg};color:${C.text};border:1px solid ${C.border};` +
+            `padding:2px 4px;background:${V.bg2};color:${V.fg};border:1px solid ${V.border};` +
             `border-radius:3px;font:9px ui-monospace,monospace;width:100%;max-width:100%;box-sizing:border-box;`);
         inp.type = "number";
         if (opts.min !== undefined) inp.min = String(opts.min);
@@ -1574,7 +1568,7 @@ function buildEditor(node) {
     _addBoolRow(bBlend, "blend_brows", "Brows");
     _addBoolRow(bBlend, "blend_eyes", "Eyes");
     _addBoolRow(bBlend, "blend_jaw", "Jaw");
-    const blendHint = _el("span", `font:9px ui-sans-serif;color:${C.dim};padding:0 2px;`);
+    const blendHint = _el("span", `font:9px ui-sans-serif;color:${V.dim};padding:0 2px;`);
     blendHint.textContent = "Connect reference_pose_data on the node socket.";
     bBlend.appendChild(blendHint);
 
@@ -1584,7 +1578,7 @@ function buildEditor(node) {
     _addIntRow(bPrev, "preview_max_video_frames", "Max vid frames");
 
     const setHint = _el("div",
-        `font:9px ui-sans-serif;color:${C.dim};padding:2px 4px 4px;line-height:1.35;`);
+        `font:9px ui-sans-serif;color:${V.dim};padding:2px 4px 4px;line-height:1.35;`);
     setHint.textContent =
         "Sliders and options here mirror the node widgets (workflow saves them). " +
         "Open sections below or scroll. Canvas edits write JSON overrides only.";
@@ -1626,7 +1620,7 @@ function buildEditor(node) {
     const grip = _el("div",
         `position:absolute;right:0;bottom:0;width:20px;height:20px;cursor:nwse-resize;` +
         `z-index:5;border-bottom-right-radius:8px;opacity:.9;` +
-        `background:linear-gradient(135deg, transparent 50%, ${C.accent} 50%);`);
+        `background:linear-gradient(135deg, transparent 50%, ${V.blue} 50%);`);
     grip.title = "Drag to resize (scales the whole editor proportionally)";
     grip.addEventListener("mouseenter", () => { grip.style.opacity = "1"; });
     grip.addEventListener("mouseleave", () => { grip.style.opacity = ".65"; });
@@ -1884,7 +1878,7 @@ function buildEditor(node) {
         _writeCoeffsJson(data);
         _refreshSliders();
     }
-    function _refreshSliders(){const coeffs=_coeffsForFrame(state.frame);for(const a of FACS_AXES){const el=_sliderEls[a.id];if(!el)continue;const v=coeffs[a.id]||0;el.sl.value=String(v);el.val.textContent=v.toFixed(2);el.val.style.color=Math.abs(v)>0.01?C.sel:C.dim;}try{_refreshFacs();}catch(_){}}
+    function _refreshSliders(){const coeffs=_coeffsForFrame(state.frame);for(const a of FACS_AXES){const el=_sliderEls[a.id];if(!el)continue;const v=coeffs[a.id]||0;el.sl.value=String(v);el.val.textContent=v.toFixed(2);el.val.style.color=Math.abs(v)>0.01?V.mauve:V.dim;}try{_refreshFacs();}catch(_){}}
     // ── Gaze helpers ────────────────────────────────────────────────
     function _getGazeForFrame(fi,eye){const data=parseGazeOverrides(node),fr=data.frames?.[String(fi)];if(fr&&fr[eye])return{yaw:(fr[eye][0]||0)*(180/Math.PI),pitch:(fr[eye][1]||0)*(180/Math.PI)};return{yaw:0,pitch:0};}
     function _setGazeForFrame(fi,eye,yawDeg,pitchDeg){const ov=parseGazeOverrides(node),key=String(fi);if(!ov.frames[key])ov.frames[key]={};const yr=yawDeg*(Math.PI/180),pr=pitchDeg*(Math.PI/180);if(Math.abs(yr)<0.001&&Math.abs(pr)<0.001){delete ov.frames[key][eye];if(!Object.keys(ov.frames[key]).length)delete ov.frames[key];}else ov.frames[key][eye]=[+yr.toFixed(5),+pr.toFixed(5)];writeGazeOverrides(node,ov);}
@@ -2013,7 +2007,7 @@ function buildEditor(node) {
         if(!_tlRafPending){_tlRafPending=true;requestAnimationFrame(()=>{_tlRafPending=false;drawTimeline();});}
         const ctx=cvs.getContext("2d"),W=cvs.width,H=cvs.height;
         if (!ctx || W < 8 || H < 8) return;
-        ctx.fillStyle="#2a2a3d";ctx.fillRect(0,0,W,H);
+        ctx.fillStyle=C.bg3;ctx.fillRect(0,0,W,H);
         switch(activeTab) {
             case "face": case "gaze": case "set":
                 _renderFaceGaze(ctx,W,H,activeTab==="gaze"); break;
@@ -2023,7 +2017,7 @@ function buildEditor(node) {
     }
 
     function _drawGrid(ctx,W,H){
-        ctx.strokeStyle="#6b7a9c";ctx.lineWidth=1;
+        ctx.strokeStyle=C.dim;ctx.lineWidth=1;
         for(let i=1;i<4;i++){
             ctx.beginPath();ctx.moveTo((i/4)*W,0);ctx.lineTo((i/4)*W,H);ctx.stroke();
             ctx.beginPath();ctx.moveTo(0,(i/4)*H);ctx.lineTo(W,(i/4)*H);ctx.stroke();
@@ -2118,11 +2112,11 @@ function buildEditor(node) {
         const lms=landmarksForFrame(state.frame),sel=selectedSet(),emp=emphSet();
         // Over a live warp, fade the wireframe so the deformed face reads clearly.
         _drawFaceWireframe(ctx,W,H,lms,gazeEmphasis?0.4:(warped?0.35:1));
-        for(let i=0;i<lms.length;i++){const[x,y]=denormToCanvas(lms[i][0],lms[i][1],W,H);const isSel=sel.has(i),isEmph=emp.has(i);const r=(state.hoverLm===i||state.dragLm===i)?6:isSel?4:2.5;ctx.beginPath();ctx.fillStyle=gazeEmphasis?(C.other+"80"):(isEmph?C.emph:(isSel?C.sel:C.other));ctx.arc(x,y,r,0,Math.PI*2);ctx.fill();}
-        if(!gazeEmphasis&&state.hoverLm>=0){const[x,y]=denormToCanvas(lms[state.hoverLm][0],lms[state.hoverLm][1],W,H);ctx.fillStyle=C.text;ctx.font="10px ui-monospace,monospace";ctx.textAlign="left";ctx.fillText(String(state.hoverLm),x+6,y-4);}
+        for(let i=0;i<lms.length;i++){const[x,y]=denormToCanvas(lms[i][0],lms[i][1],W,H);const isSel=sel.has(i),isEmph=emp.has(i);const r=(state.hoverLm===i||state.dragLm===i)?6:isSel?4:2.5;ctx.beginPath();ctx.fillStyle=gazeEmphasis?(DATA.lm_other+"80"):(isEmph?DATA.lm_emph:(isSel?DATA.lm_sel:DATA.lm_other));ctx.arc(x,y,r,0,Math.PI*2);ctx.fill();}
+        if(!gazeEmphasis&&state.hoverLm>=0){const[x,y]=denormToCanvas(lms[state.hoverLm][0],lms[state.hoverLm][1],W,H);ctx.fillStyle=C.fg;ctx.font="10px ui-monospace,monospace";ctx.textAlign="left";ctx.fillText(String(state.hoverLm),x+6,y-4);}
         // Gaze handles
         const handles=computeGazeHandles(lms,W,H);
-        for(const h of handles){const isDrag=gstate.dragEye===h.eye,isHov=gstate.hoverEye===h.eye,col=isDrag?C.gaze_drag:(h.eye==="l"?C.gaze_l:C.gaze_r);
+        for(const h of handles){const isDrag=gstate.dragEye===h.eye,isHov=gstate.hoverEye===h.eye,col=isDrag?DATA.gaze_drag:(h.eye==="l"?DATA.gaze_l:DATA.gaze_r);
             ctx.strokeStyle=col;ctx.lineWidth=gazeEmphasis?2.5:2;ctx.beginPath();ctx.arc(h.ax,h.ay,gazeEmphasis?5:4,0,Math.PI*2);ctx.stroke();
             ctx.beginPath();ctx.moveTo(h.ax,h.ay);ctx.lineTo(h.tx,h.ty);ctx.stroke();
             const r=isDrag?7:(isHov?6:(gazeEmphasis?5:4));ctx.fillStyle=col;ctx.beginPath();ctx.arc(h.tx,h.ty,r,0,Math.PI*2);ctx.fill();}
@@ -2147,7 +2141,7 @@ function buildEditor(node) {
             for(const k of reg.keys) maxAbs=Math.max(maxAbs,Math.abs(coeffs[k]||0));
             if(maxAbs<0.02) continue;
             const intensity=Math.min(1,maxAbs);
-            ctx.fillStyle=maxAbs>0?C.sel:C.gaze_l;
+            ctx.fillStyle=maxAbs>0?DATA.lm_sel:DATA.gaze_l;
             ctx.globalAlpha=intensity*0.5;
             for(const i of reg.ids){if(i>=lms.length)continue;const[x,y]=denormToCanvas(lms[i][0],lms[i][1],W,H);ctx.beginPath();ctx.arc(x,y,6,0,Math.PI*2);ctx.fill();}
             ctx.globalAlpha=1;
@@ -2158,7 +2152,7 @@ function buildEditor(node) {
             ctx.font="9px ui-sans-serif";ctx.textAlign="left";
             const top=active.sort((a,b)=>Math.abs(b[1])-Math.abs(a[1])).slice(0,3);
             let ty=12;
-            for(const[k,v]of top){ctx.fillStyle=v>0?C.sel:C.gaze_l;ctx.fillText(`${k} ${v>0?"+":""}${v.toFixed(2)}`,4,ty);ty+=10;}
+            for(const[k,v]of top){ctx.fillStyle=v>0?DATA.lm_sel:DATA.gaze_l;ctx.fillText(`${k} ${v>0?"+":""}${v.toFixed(2)}`,4,ty);ty+=10;}
         }
     }
 
@@ -2171,10 +2165,10 @@ function buildEditor(node) {
         const scale=Math.min(W/imgW,H/imgH),drawW=imgW*scale,drawH=imgH*scale,ox=(W-drawW)/2,oy=(H-drawH)/2;
         ctx.strokeStyle=C.border;ctx.lineWidth=1;ctx.strokeRect(ox+0.5,oy+0.5,drawW-1,drawH-1);
         const _toCvs=(xn,yn)=>[ox+xn*drawW,oy+yn*drawH];
-        ctx.strokeStyle=C.pose_bone;ctx.lineWidth=2.5;
+        ctx.strokeStyle=DATA.pose_bone;ctx.lineWidth=2.5;
         for(const[a,b]of pstate.edges){const ka=kps[a],kb=kps[b];if(!ka||!kb)continue;const[x1,y1]=_toCvs(ka[0],ka[1]),[x2,y2]=_toCvs(kb[0],kb[1]);ctx.beginPath();ctx.moveTo(x1,y1);ctx.lineTo(x2,y2);ctx.stroke();}
-        for(let i=0;i<kps.length;i++){const k=kps[i];if(!k)continue;const[x,y]=_toCvs(k[0],k[1]);const isDrag=pstate.dragJ===i,isHover=pstate.hoverJ===i,r=isDrag?7:(isHover?6:4.5);ctx.beginPath();ctx.fillStyle=isDrag?C.pose_selected:C.pose_joint;ctx.arc(x,y,r,0,Math.PI*2);ctx.fill();ctx.lineWidth=1;ctx.strokeStyle=C.canvas_bg;ctx.stroke();}
-        if(pstate.hoverJ>=0&&kps[pstate.hoverJ]){const[x,y]=_toCvs(kps[pstate.hoverJ][0],kps[pstate.hoverJ][1]);ctx.fillStyle=C.text;ctx.font="10px ui-monospace,monospace";ctx.textAlign="left";ctx.fillText(`${pstate.hoverJ}:${pstate.names[pstate.hoverJ]||"?"}`,x+7,y-5);}
+        for(let i=0;i<kps.length;i++){const k=kps[i];if(!k)continue;const[x,y]=_toCvs(k[0],k[1]);const isDrag=pstate.dragJ===i,isHover=pstate.hoverJ===i,r=isDrag?7:(isHover?6:4.5);ctx.beginPath();ctx.fillStyle=isDrag?DATA.pose_selected:DATA.pose_joint;ctx.arc(x,y,r,0,Math.PI*2);ctx.fill();ctx.lineWidth=1;ctx.strokeStyle=C.bg3;ctx.stroke();}
+        if(pstate.hoverJ>=0&&kps[pstate.hoverJ]){const[x,y]=_toCvs(kps[pstate.hoverJ][0],kps[pstate.hoverJ][1]);ctx.fillStyle=C.fg;ctx.font="10px ui-monospace,monospace";ctx.textAlign="left";ctx.fillText(`${pstate.hoverJ}:${pstate.names[pstate.hoverJ]||"?"}`,x+7,y-5);}
         _drawHeadGimbal(ctx,W,H);
     }
 
@@ -2204,22 +2198,22 @@ function buildEditor(node) {
         ctx.globalAlpha = 0.85;
         ctx.lineWidth = 1.5;
         // roll: outer circle
-        ctx.strokeStyle = C.emph; ctx.globalAlpha = 0.35;
+        ctx.strokeStyle = C.peach; ctx.globalAlpha = 0.35;
         ctx.beginPath(); ctx.arc(g.cx, g.cy, g.R + 12, 0, Math.PI * 2); ctx.stroke();
         // yaw: horizontal ellipse
-        ctx.strokeStyle = C.accent;
+        ctx.strokeStyle = C.blue;
         ctx.beginPath(); ctx.ellipse(g.cx, g.cy, g.R, g.R * 0.22, 0, 0, Math.PI * 2); ctx.stroke();
         // pitch: vertical ellipse
-        ctx.strokeStyle = C.sel;
+        ctx.strokeStyle = C.mauve;
         ctx.beginPath(); ctx.ellipse(g.cx, g.cy, g.R * 0.22, g.R, 0, 0, Math.PI * 2); ctx.stroke();
         // knobs
         ctx.globalAlpha = 1;
         const knob = (p, color) => {
             ctx.beginPath(); ctx.fillStyle = color;
             ctx.arc(p[0], p[1], _GIM.drag ? 7 : 6, 0, Math.PI * 2); ctx.fill();
-            ctx.lineWidth = 1.5; ctx.strokeStyle = C.canvas_bg; ctx.stroke();
+            ctx.lineWidth = 1.5; ctx.strokeStyle = C.bg3; ctx.stroke();
         };
-        knob(g.kyaw, C.accent); knob(g.kpitch, C.sel); knob(g.kroll, C.emph);
+        knob(g.kyaw, C.blue); knob(g.kpitch, C.mauve); knob(g.kroll, C.peach);
         ctx.font = "9px ui-sans-serif"; ctx.textAlign = "left"; ctx.fillStyle = C.dim;
         ctx.fillText("yaw", g.kyaw[0] + 9, g.kyaw[1] + 3);
         ctx.fillText("pitch", g.kpitch[0] + 9, g.kpitch[1] + 3);
@@ -2271,19 +2265,19 @@ function buildEditor(node) {
 
     function drawTimeline() {
         const ctx=tl.getContext("2d"),W=tl.width,H=tl.height;
-        ctx.fillStyle="#2a2a3d";ctx.fillRect(0,0,W,H);
+        ctx.fillStyle=C.bg3;ctx.fillRect(0,0,W,H);
         const n=_frameCount();
         if(n<=0){ctx.fillStyle=C.dim;ctx.font="9px ui-sans-serif";ctx.textAlign="center";ctx.fillText("queue to populate",W/2,H/2+3);return;}
         const range=_tlRange();
-        if(range){const xa=_frameToX(range[0],W),xb=_frameToX(range[1],W);ctx.fillStyle="rgba(137,180,250,0.18)";ctx.fillRect(Math.min(xa,xb)-1,1,Math.abs(xb-xa)+3,H-2);}
+        if(range){const xa=_frameToX(range[0],W),xb=_frameToX(range[1],W);ctx.fillStyle=C.blue;ctx.globalAlpha=0.18;ctx.fillRect(Math.min(xa,xb)-1,1,Math.abs(xb-xa)+3,H-2);ctx.globalAlpha=1;}
         ctx.strokeStyle=C.border;ctx.lineWidth=1;ctx.beginPath();ctx.moveTo(0,H-3);ctx.lineTo(W,H-3);ctx.stroke();
-        const rowY=[H*0.25,H*0.50,H*0.70],rowC=[C.sel,C.pose_joint,C.gaze_l];
+        const rowY=[H*0.25,H*0.50,H*0.70],rowC=[DATA.lm_sel,DATA.pose_joint,DATA.gaze_l];
         for(let f=0;f<n;f++){const x=_frameToX(f,W),fl=_editFlagsForFrame(f);
             if(fl.face){ctx.fillStyle=rowC[0];ctx.fillRect(x-0.5,rowY[0]-1,1.5,2);}
             if(fl.pose){ctx.fillStyle=rowC[1];ctx.fillRect(x-0.5,rowY[1]-1,1.5,2);}
-            if(fl.gaze||fl.expr){ctx.fillStyle=fl.gaze?rowC[2]:C.accent;ctx.fillRect(x-0.5,rowY[2]-1,1.5,2);}}
+            if(fl.gaze||fl.expr){ctx.fillStyle=fl.gaze?rowC[2]:C.blue;ctx.fillRect(x-0.5,rowY[2]-1,1.5,2);}}
         if(tlstate.hover>=0&&tlstate.hover<n){const x=_frameToX(tlstate.hover,W);ctx.strokeStyle=C.dim;ctx.setLineDash([2,2]);ctx.beginPath();ctx.moveTo(x,1);ctx.lineTo(x,H-1);ctx.stroke();ctx.setLineDash([]);}
-        const xp=_frameToX(state.frame,W);ctx.strokeStyle=C.accent;ctx.lineWidth=1.5;ctx.beginPath();ctx.moveTo(xp,1);ctx.lineTo(xp,H-1);ctx.stroke();
+        const xp=_frameToX(state.frame,W);ctx.strokeStyle=C.blue;ctx.lineWidth=1.5;ctx.beginPath();ctx.moveTo(xp,1);ctx.lineTo(xp,H-1);ctx.stroke();
     }
 
     // ── Timeline interaction ────────────────────────────────────────
@@ -2401,8 +2395,8 @@ function buildEditor(node) {
 
     // ── 3D Editor lazy-load ─────────────────────────────────────────
     btn3D.addEventListener("click",async()=>{
-        if(_fc3dEditor){try{_fc3dEditor.destroy();}catch(_){}_fc3dEditor=null;if(_fc3dHost){try{_fc3dHost.remove();}catch(_){}_fc3dHost=null;}panel3D.style.display="none";_editor3dH=0;_relayout();btn3D.style.background=C.border;try{_persistSave?.();}catch(_){}return;}
-        btn3D.style.background=C.accent;
+        if(_fc3dEditor){try{_fc3dEditor.destroy();}catch(_){}_fc3dEditor=null;if(_fc3dHost){try{_fc3dHost.remove();}catch(_){}_fc3dHost=null;}panel3D.style.display="none";_editor3dH=0;_relayout();btn3D.style.background=V.border;try{_persistSave?.();}catch(_){}return;}
+        btn3D.style.background=V.blue;
         // Mount into the dedicated full-width panel (NOT the capped ctxScroll),
         // reserve its height in the layout, and relayout so the node grows.
         _fc3dHost=_el("div",`width:100%;height:${FC3D_EDITOR3D_PX}px;`);
@@ -2413,11 +2407,11 @@ function buildEditor(node) {
         try{
             const mod=await import("./face_3d_editor.js");if(!_fc3dHost)return;
             _fc3dEditor=await mod.mount3DEditor(_fc3dHost,{
-                theme:C,
+                theme:_fc3dTheme(),
                 getLandmarks:()=>{try{return landmarksForFrame(state.frame);}catch(_){return null;}},
                 getHeadPose:()=>({yaw:_wRead("head_yaw_deg"),pitch:_wRead("head_pitch_deg"),roll:_wRead("head_roll_deg"),tx:_wRead("head_tx"),ty:_wRead("head_ty"),tz:_wRead("head_tz"),scale:_wRead("head_scale"),jaw:_wRead("jaw_rot_deg"),neck_yaw:_wRead("neck_yaw_deg"),neck_pitch:_wRead("neck_pitch_deg")}),
                 setHeadPose:partial=>{if(partial.yaw!==undefined)_wWrite("head_yaw_deg",partial.yaw);if(partial.pitch!==undefined)_wWrite("head_pitch_deg",partial.pitch);if(partial.roll!==undefined)_wWrite("head_roll_deg",partial.roll);if(partial.tx!==undefined)_wWrite("head_tx",partial.tx);if(partial.ty!==undefined)_wWrite("head_ty",partial.ty);if(partial.tz!==undefined)_wWrite("head_tz",partial.tz);if(partial.scale!==undefined)_wWrite("head_scale",partial.scale);if(partial.jaw!==undefined)_wWrite("jaw_rot_deg",partial.jaw);if(partial.neck_yaw!==undefined)_wWrite("neck_yaw_deg",partial.neck_yaw);if(partial.neck_pitch!==undefined)_wWrite("neck_pitch_deg",partial.neck_pitch);try{_scheduleLocalMirror();_scheduleServerResync();}catch(_){}},
-                onClose:()=>{_fc3dEditor=null;if(_fc3dHost){try{_fc3dHost.remove();}catch(_){}_fc3dHost=null;}panel3D.style.display="none";_editor3dH=0;_relayout();btn3D.style.background=C.border;try{_persistSave?.();}catch(_){}},
+                onClose:()=>{_fc3dEditor=null;if(_fc3dHost){try{_fc3dHost.remove();}catch(_){}_fc3dHost=null;}panel3D.style.display="none";_editor3dH=0;_relayout();btn3D.style.background=V.border;try{_persistSave?.();}catch(_){}},
                 // ── Body skeleton (OpenPose-18) — 3D pose → 2D writeback ──
                 bodyEdges:pstate.edges&&pstate.edges.length?pstate.edges:POSE18_EDGES_DEFAULT,
                 bodyNames:pstate.names&&pstate.names.length?pstate.names:POSE18_NAMES,
@@ -2429,7 +2423,7 @@ function buildEditor(node) {
                 height:FC3D_EDITOR3D_PX,
             });
             try{_persistSave?.();}catch(_){}
-        }catch(err){if(_fc3dHost){_fc3dHost.textContent="3D editor unavailable: "+(err?.message||String(err));_fc3dHost.style.cssText=`margin-top:4px;padding:4px 6px;color:#ff7070;background:${C.canvas_bg};border:1px solid ${C.border};border-radius:3px;font:10px ui-monospace,monospace;`;}btn3D.style.background=C.border;}
+        }catch(err){if(_fc3dHost){_fc3dHost.textContent="3D editor unavailable: "+(err?.message||String(err));_fc3dHost.style.cssText=`margin-top:4px;padding:4px 6px;color:var(--c2c-danger, #ff7070);background:${V.bg3};border:1px solid ${V.border};border-radius:3px;font:10px ui-monospace,monospace;`;}btn3D.style.background=V.border;}
     });
 
     // ── Live-preview engine ─────────────────────────────────────────

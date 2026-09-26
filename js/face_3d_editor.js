@@ -32,6 +32,8 @@
 // disposes geometries, materials, the renderer, and removes every DOM
 // node and listener so the editor leaves zero residue.
 
+import { C as TC } from "./_c2c_theme.js";
+
 // ── Canonical iBUG-68 depth table (mirrors python _CANONICAL_Z) ──────
 // Convention: +z = AWAY from camera; -z = forward (closer to viewer).
 // Values are in face-bbox-normalised units (face_width ≈ 1.0).
@@ -245,13 +247,17 @@ function _landmarksToXYZ(lms) {
     return out;
 }
 
+function _chromeTheme(theme) {
+    return theme || {
+        canvas_bg: TC.bg3, text: TC.fg, dim: TC.dim,
+        border: TC.border, accent: TC.blue, sel: TC.peach,
+    };
+}
+
 // ── Public entry point ───────────────────────────────────────────────
 export async function mount3DEditor(host, opts) {
     if (!host) throw new Error("mount3DEditor: host element required");
-    const C = opts.theme || {
-        canvas_bg: "#181a1d", text: "#ddd", dim: "#888",
-        border: "#333", accent: "#4a9eff", sel: "#ffae42",
-    };
+    const C = _chromeTheme(opts.theme);
 
     // ── Top-level overlay frame ──────────────────────────────────────
     const WRAP_H = Math.max(220, Number(opts.height) || 340);
@@ -348,7 +354,7 @@ export async function mount3DEditor(host, opts) {
     try {
         stack = await loadThreeStack();
     } catch (err) {
-        loadingMsg.style.color = "#ff7070";
+        loadingMsg.style.color = "var(--c2c-danger, #ff7070)";
         loadingMsg.textContent = "Three.js CDN load failed (" + (err?.message || err) +
                                  "). 3D view unavailable; the 2D canvas above still works.";
         // Return a stub so the caller can still call destroy()/refresh().
