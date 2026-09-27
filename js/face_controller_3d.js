@@ -506,7 +506,10 @@ function _fc3dSetupDomWidget(node, domW) {
 
     domW.computeSize = (width) => [
         Math.max(FC3D_NODE_W, width || node.size?.[0] || FC3D_NODE_W),
-        contentH(),
+        // + both DOM margins: ComfyUI sizes the element to its slot minus
+        // 2 x margin (default 10), so a slot of exactly contentH left the
+        // editor's last row ~20px under the node's bottom edge.
+        contentH() + 2 * (domW.margin ?? 10),
     ];
     domW.computeLayoutSize = () => ({
         minHeight: FC3D_MIN_H,
@@ -548,7 +551,7 @@ function _fc3dSyncNodeSize(node) {
         const w = Math.max(FC3D_NODE_W, cur[0] || FC3D_NODE_W);
         const editorH = node._faceOverlay?.getHeightForWidth?.(w)
             || node._faceOverlay?.getHeight?.() || FC3D_MIN_H;
-        const sz = [w, _fc3dEditorTopPx(node) + Math.min(FC3D_MAX_H, Math.max(FC3D_MIN_H, editorH)) + 8];
+        const sz = [w, _fc3dNodeHeightFor(node, Math.min(FC3D_MAX_H, Math.max(FC3D_MIN_H, editorH)))];
         // Skip setSize when nothing meaningful changed — sub-pixel drift
         // from layout reflows is enough to round-trip onResize forever.
         if (Math.abs((sz?.[0] || 0) - (cur[0] || 0)) > 2 ||
@@ -561,6 +564,16 @@ function _fc3dSyncNodeSize(node) {
         node.setDirtyCanvas?.(true, true);
     } catch (_) {}
     finally { _fc3dSyncInFlight = false; }
+}
+
+/** Node height that holds an editor of `editorH`. ComfyUI places the DOM
+ *  element `margin` (default 10) below its slot's top, plus 2px; the old
+ *  "top + editorH + 8" ignored that, so the editor's last row hung 4px past
+ *  the node's bottom edge (measured live). One formula for every path that
+ *  sizes the node - sync, resize, drag release - so they cannot drift. */
+function _fc3dNodeHeightFor(node, editorH) {
+    const domW = node?.widgets?.find?.((x) => x.name === "face_overlay");
+    return _fc3dEditorTopPx(node) + editorH + (domW?.margin ?? 10) + 8;
 }
 
 /** Measure the editor's top offset INSIDE the node, in graph units.
@@ -2661,7 +2674,6 @@ function _fc3dSetupNode(node) {
                 const sz = size || node.size;
                 const nw = Math.max(FC3D_NODE_W, sz?.[0] || FC3D_NODE_W);
                 const editorH = overlay.onNodeResize?.(nw) ?? FC3D_MIN_H;
-                const topPx = _fc3dEditorTopPx(node);
                 const cv = app?.canvas;
                 const nativeDragLive = !node.__fc3dSyncing &&
                     (cv?.resizing_node === node || cv?.resizingNode === node);
@@ -2676,13 +2688,13 @@ function _fc3dSetupNode(node) {
                             node.__fc3dDragEndArmed = false;
                             const w = Math.max(FC3D_NODE_W, node.size?.[0] || FC3D_NODE_W);
                             const eh = overlay.onNodeResize?.(w) ?? FC3D_MIN_H;
-                            _fc3dWriteNodeSize(node, w, _fc3dEditorTopPx(node) + eh + 8);
+                            _fc3dWriteNodeSize(node, w, _fc3dNodeHeightFor(node, eh));
                             node.setDirtyCanvas?.(true, true);
                         };
                         window.addEventListener("pointerup", finalize, { once: true, capture: true });
                     }
                 } else {
-                    _fc3dWriteNodeSize(node, nw, topPx + editorH + 8);
+                    _fc3dWriteNodeSize(node, nw, _fc3dNodeHeightFor(node, editorH));
                 }
             } finally { _inOnResize = false; }
         };
