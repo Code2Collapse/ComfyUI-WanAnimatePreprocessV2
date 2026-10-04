@@ -1001,21 +1001,53 @@ export async function mount3DEditor(host, opts) {
             renderer.setSize(w, h, false);
             camera.aspect = w / h;
             camera.updateProjectionMatrix();
+            requestRender();                 // setSize clears the drawing buffer
         });
     });
     ro.observe(sceneHost);
     cleanups.push(() => ro.disconnect());
 
-    // ── Animation loop (rAF-driven; cancelled on destroy) ────────────
+    // ── Render on demand (cancelled on destroy) ──────────────────────
+    // PERF: this used to render the WebGL scene 60 times a second for as long
+    // as the panel was open - off screen, idle, or on a detached host alike.
+    // The scene only changes through input inside the editor, the orbit/gizmo
+    // controls or refresh(), so a frame is drawn when one of those asks, and
+    // the loop keeps going only while orbit damping is still settling. A 2/s
+    // redraw while visible catches anything that changed without asking.
     let rafId = 0;
+    let onScreen = true;
     const tick = () => {
-        if (destroyed) return;
-        rafId = requestAnimationFrame(tick);
-        orbit.update();
+        rafId = 0;
+        if (destroyed || !onScreen || document.hidden) return;
+        const settling = orbit.update();          // true while damping moves the camera
         renderer.render(scene, camera);
+        if (settling) requestRender();
     };
-    tick();
-    cleanups.push(() => cancelAnimationFrame(rafId));
+    function requestRender() {
+        if (!rafId && !destroyed) rafId = requestAnimationFrame(tick);
+    }
+    const INPUT_EVENTS = ["pointerdown", "pointermove", "pointerup", "wheel", "input", "change", "click", "keydown"];
+    for (const t of INPUT_EVENTS) wrap.addEventListener(t, requestRender, { capture: true, passive: true });
+    orbit.addEventListener("change", requestRender);
+    xform.addEventListener("change", requestRender);
+    const io = typeof IntersectionObserver === "function"
+        ? new IntersectionObserver((es) => {
+            onScreen = es.some((e) => e.isIntersecting);
+            if (onScreen) requestRender();
+        })
+        : null;
+    io?.observe(sceneHost);
+    const heartbeat = setInterval(() => { if (onScreen && !document.hidden) requestRender(); }, 500);
+    requestRender();
+    cleanups.push(() => {
+        cancelAnimationFrame(rafId);
+        clearInterval(heartbeat);
+        io?.disconnect();
+        for (const t of INPUT_EVENTS) wrap.removeEventListener(t, requestRender, { capture: true });
+        orbit.removeEventListener("change", requestRender);
+        xform.removeEventListener("change", requestRender);
+    });
 
-    return { destroy, refresh };
+    // The host calls refresh() after it changes landmarks or the head pose.
+    return { destroy, refresh: () => { refresh(); requestRender(); } };
 }

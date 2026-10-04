@@ -1,6 +1,13 @@
 # Copyright 2025-2026 Code2Collapse (https://github.com/Code2Collapse)
 # Licensed under the Apache License, Version 2.0
 
+# ── Memory guard: release pack-owned GPU caches when ComfyUI frees VRAM ──
+try:
+    from .nodes_extras._c2c_memguard import install as _c2c_memguard_install
+    _c2c_memguard_install()
+except Exception:  # noqa: BLE001 — never block the pack on a memory hook
+    pass
+
 from .nodes import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS
 
 WEB_DIRECTORY = "./js"

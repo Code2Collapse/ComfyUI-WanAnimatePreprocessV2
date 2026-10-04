@@ -344,6 +344,21 @@ def _to_input_tensor(face_bgr_224: np.ndarray, device: torch.device) -> torch.Te
 _MODEL_CACHE: dict[str, "torch.nn.Module"] = {}
 
 
+def _release_gaze_cache() -> None:
+    _MODEL_CACHE.clear()
+
+
+try:
+    from ._c2c_memguard import register as _c2c_memguard_register
+    _c2c_memguard_register(
+        "wap.gaze_ethxgaze",
+        _release_gaze_cache,
+        lambda: bool(_MODEL_CACHE),
+    )
+except Exception:
+    pass
+
+
 def _load_gaze_model(ckpt_path: Path, device: torch.device) -> "torch.nn.Module":
     key = f"{ckpt_path.resolve()}|{device}"
     if key in _MODEL_CACHE:

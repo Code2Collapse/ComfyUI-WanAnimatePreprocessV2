@@ -99,6 +99,21 @@ def _ensure_nlf(name):
 _NLF_CACHE = {}
 
 
+def _release_nlf_cache() -> None:
+    _NLF_CACHE.clear()
+
+
+try:
+    from ._c2c_memguard import register as _c2c_mem_register
+    _c2c_mem_register(
+        "wap.pose3d_nlf",
+        _release_nlf_cache,
+        lambda: bool(_NLF_CACHE),
+    )
+except Exception:
+    pass
+
+
 def _load_nlf(name, device):
     import torch
     # NLF's TorchScript calls torchvision::nms — importing torchvision registers
