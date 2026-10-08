@@ -6,6 +6,7 @@
 
 import { app } from "../../scripts/app.js";
 import { C } from "./_c2c_theme.js";
+import { claimUndo } from "./_c2c_undo_scope.js";
 /** Local labels only — avoids hard dependency on _c2c_i18n.js (load failure → blank widget). */
 function T(_key, fallback) { return fallback ?? _key; }
 
@@ -886,6 +887,7 @@ function buildEditor(node) {
     }
     _applyCanvasViewPx(FC3D_CANVAS_VIEW_PX);
     cvs.tabIndex = 0;
+    claimUndo(cvs);   // Ctrl+Z here undoes the editor, not the graph (CNP L2.15)
     cvs.title = "drag to edit \u00b7 arrow keys step frame \u00b7 R reset frame";
     /** Undo LiteGraph zoom scale so drags land on the correct landmark. */
     function eventCanvas(e) {
