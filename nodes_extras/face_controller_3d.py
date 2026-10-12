@@ -1276,14 +1276,14 @@ class WanFaceController3DV2:
                 try:
                     arr = t.cpu().numpy()
                     import hashlib
-                    return shape_str + ":" + hashlib.md5(arr.tobytes()).hexdigest()
+                    return shape_str + ":" + hashlib.sha256(arr.tobytes()).hexdigest()
                 except Exception:
                     pass
             # numpy array directly.
             if hasattr(t, "tobytes"):
                 try:
                     import hashlib
-                    return shape_str + ":" + hashlib.md5(t.tobytes()).hexdigest()
+                    return shape_str + ":" + hashlib.sha256(t.tobytes()).hexdigest()
                 except Exception:
                     pass
             # Last resort: shape + dtype only (still stable for same input).
