@@ -5974,6 +5974,38 @@ class WanAnimateFaceQualityCheckV2:
 # ====================================================================
 # Standalone Depth + Pose + Canny composer
 # ====================================================================
+def _midas_hub_load(entry):
+    """torch.hub.load("intel-isl/MiDaS", entry) that survives comfyui_controlnet_aux (L7.87, measured 2026-10-12).
+
+    MiDaS's hub repo ships `midas/` WITHOUT an __init__.py, so Python treats it as a namespace package, and a regular
+    `midas` package found later on sys.path wins: comfyui_controlnet_aux appends its `src/custom_controlnet_aux` folder,
+    whose `midas` package uses `from ..util import ...` -> "attempted relative import beyond top-level package" on
+    every install that has controlnet_aux. During the load only, `midas` is pinned to the hub repo's folder; whatever
+    was imported under that name before is put back afterwards, so controlnet_aux is untouched.
+    """
+    import importlib.machinery
+    import importlib.util
+    import sys as _sys
+
+    repo = os.path.join(torch.hub.get_dir(), "intel-isl_MiDaS_master")
+    if not os.path.isdir(os.path.join(repo, "midas")):
+        try:                                     # first use: let torch.hub download the repo (the import may fail)
+            return torch.hub.load("intel-isl/MiDaS", entry, trust_repo=True)
+        except ImportError:
+            if not os.path.isdir(os.path.join(repo, "midas")):
+                raise
+    saved = {k: _sys.modules.pop(k) for k in list(_sys.modules) if k == "midas" or k.startswith("midas.")}
+    shim = importlib.util.module_from_spec(importlib.machinery.ModuleSpec("midas", None, is_package=True))
+    shim.__path__ = [os.path.join(repo, "midas")]
+    _sys.modules["midas"] = shim
+    try:
+        return torch.hub.load("intel-isl/MiDaS", entry, trust_repo=True)
+    finally:
+        for k in [k for k in _sys.modules if k == "midas" or k.startswith("midas.")]:
+            _sys.modules.pop(k, None)
+        _sys.modules.update(saved)
+
+
 class DepthPoseCannyCombinedV2:
     DESCRIPTION = (
         "Self-contained ControlNet preprocessor producing depth, pose, canny, "
@@ -6349,9 +6381,9 @@ class DepthPoseCannyCombinedV2:
                 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
             if cls._midas_cache["model"] is None or cls._midas_cache["device"] != device:
-                midas = torch.hub.load("intel-isl/MiDaS", "MiDaS_small", trust_repo=True)
+                midas = _midas_hub_load("MiDaS_small")
                 midas.to(device).eval()
-                transforms = torch.hub.load("intel-isl/MiDaS", "transforms", trust_repo=True)
+                transforms = _midas_hub_load("transforms")
                 cls._midas_cache["model"] = midas
                 cls._midas_cache["transform"] = transforms.small_transform
                 cls._midas_cache["device"] = device
