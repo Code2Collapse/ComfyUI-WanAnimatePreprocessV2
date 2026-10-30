@@ -1,11 +1,12 @@
 # Vendored helpers from ComfyUI-CustomNodePacks/js/
 
-These 5 files are COPIES of upstream sources in `ComfyUI-CustomNodePacks/js/`:
+These 6 files are COPIES of upstream sources in `ComfyUI-CustomNodePacks/js/`:
 - `_c2c_theme.js`
 - `_c2c_dialog.js`
 - `_c2c_report.js`
 - `_c2c_i18n.js`
 - `_c2c_window.js`
+- `_widget_visibility.js` (L7.65 P21: the Face/Pose Delta editor moved here uses it)
 
 ## Why duplicated
 Each ComfyUI custom-node pack is served under its own static URL. A relative

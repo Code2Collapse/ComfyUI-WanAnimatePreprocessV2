@@ -71,6 +71,17 @@ except Exception as _e:                                                  # noqa:
 # PoseAndFaceDetectionV2's built-in `debug_image` output (no second node to
 # wire). pose_overlay.py is kept as a drawing-helper module.
 
+# Face / Pose Delta Editor: moved from ComfyUI-CustomNodePacks (L7.65 P21, owner 2026-10-31), same node id so saved
+# workflows load it unchanged; reads / writes this pack's POSEDATA.
+try:
+    from .face_pose_delta import FacePoseDeltaCoreMEC
+    _FPD_OK = True
+except Exception as _e:                                                  # noqa: BLE001
+    import logging as _logging
+    _logging.getLogger(__name__).warning("FacePoseDeltaCoreMEC not registered: %s", _e)
+    FacePoseDeltaCoreMEC = None                                          # type: ignore
+    _FPD_OK = False
+
 EXTRA_NODE_CLASS_MAPPINGS = {
     "WanIrisControlNetV2":      WanIrisControlNetV2,
     "WanSHLightingTransferV2":  WanSHLightingTransferV2,
@@ -83,6 +94,8 @@ if _ETHXGAZE_OK:
     EXTRA_NODE_CLASS_MAPPINGS["WanGazeETHXGazeV2"] = WanGazeETHXGazeV2
 if _POSE3D_OK:
     EXTRA_NODE_CLASS_MAPPINGS["WanPose3DRefineNLFV2"] = WanPose3DRefineNLFV2
+if _FPD_OK:
+    EXTRA_NODE_CLASS_MAPPINGS["FacePoseDeltaCoreMEC"] = FacePoseDeltaCoreMEC
 
 EXTRA_NODE_DISPLAY_NAME_MAPPINGS = {
     "WanIrisControlNetV2":      "Wan Iris ControlNet Conditioning (V2)",
@@ -92,6 +105,8 @@ EXTRA_NODE_DISPLAY_NAME_MAPPINGS = {
     "WanPoseDetectViTPoseV2":   "Wan Pose Detect — YOLO + ViTPose (V2)",
     "WanFaceController3DV2":    "Wan Face Controller 3D",
 }
+if _FPD_OK:
+    EXTRA_NODE_DISPLAY_NAME_MAPPINGS["FacePoseDeltaCoreMEC"] = "Face/Pose Delta Editor"
 if _ETHXGAZE_OK:
     EXTRA_NODE_DISPLAY_NAME_MAPPINGS["WanGazeETHXGazeV2"] = (
         "Wan Gaze — ETH-XGaze Post-Processor (V2)"

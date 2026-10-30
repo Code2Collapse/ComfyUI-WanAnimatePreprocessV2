@@ -9,7 +9,8 @@ Regenerate after changing any node's `INPUT_TYPES`.
 
 - **WanAnimatePreprocess/Pose** (1)
   - [Wan Pose 3D Refine — NLF (V2)](#wanpose3drefinenlfv2)
-- **WanAnimatePreprocessV2/extras** (4)
+- **WanAnimatePreprocessV2/extras** (5)
+  - [Face/Pose Delta Editor](#faceposedeltacoremec)
   - [Wan Face Controller 3D](#wanfacecontroller3dv2)
   - [Wan Gaze — ETH-XGaze Post-Processor (V2)](#wangazeethxgazev2)
   - [Wan Pose Detect — YOLO + ViTPose (V2)](#wanposedetectvitposev2)
@@ -69,6 +70,42 @@ Refine ViTPose POSEDATA with NLF 3D pose (jitter/occlusion/temporal) — Wan-Ani
 ---
 
 ## WanAnimatePreprocessV2/extras
+
+
+### FacePoseDeltaCoreMEC
+
+**Shown in the menu as:** Face/Pose Delta Editor
+
+Move individual face points on chosen frames; the edit is stored relative to the face (1.0 = the distance between the
+outer eye corners), so it follows the face through the clip as the head turns or moves. Reads and writes Pose and Face
+Detection (V2)'s pose_data (iBUG-68 face points), or other landmarks (MediaPipe FaceMesh). Moved here from
+ComfyUI-CustomNodePacks (L7.65 P21); how-to: docs/face-pose-delta.md.
+
+
+**Required inputs**
+
+| Parameter | Type | Constraints | What it does |
+|---|---|---|---|
+| `keyframe_edits_json` | `STRING` | default no edit, multiline | The edits, authored with **Edit landmark deltas…**: `{"keyframes": [{"frame": f, "deltas": {"<point>": [dx, dy]}}], "ease": ..., "extrapolate": ...}`. |
+| `anchor_mode` | choice: `intereye`, `centroid` | default `"intereye"` | How each frame's face is measured: by the outer eye corners, or by all points. |
+| `left_eye_idx` | `INT` | default `-1`, range -1…100000 | Outer eye corner on the image's left; -1 = 36 for iBUG-68, 33 for MediaPipe. |
+| `right_eye_idx` | `INT` | default `-1`, range -1…100000 | Outer eye corner on the image's right; -1 = 45 for iBUG-68, 263 for MediaPipe. |
+
+**Optional inputs**
+
+| Parameter | Type | Constraints | What it does |
+|---|---|---|---|
+| `external_anchors_json` | `STRING` | default `""`, multiline | Per-frame centres and sizes from another tracker: `{"centers": [[cx, cy], ...], "scales": [s, ...]}`. |
+| `landmarks` | `LANDMARKS` |  | Other per-frame landmarks (T, N, 2), e.g. FantasyPortrait's. |
+| `pose_data` | `POSEDATA` |  | Pose and Face Detection (V2)'s pose data; the edited copy comes out of `pose_data`. Wins over landmarks. |
+
+**Outputs**
+
+| # | Name | Type | What it is |
+|---|---|---|---|
+| 0 | `landmarks_modified` | `LANDMARKS` | The edited points (T, N, 2) in pixels. |
+| 1 | `info_json` | `STRING` | Frames with and without a face, keyframes used, blend weights. |
+| 2 | `pose_data` | `POSEDATA` | The edited pose data (with pose_data in); empty with landmarks. |
 
 
 ### WanFaceController3DV2
