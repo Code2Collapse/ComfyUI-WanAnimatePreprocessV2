@@ -198,6 +198,15 @@ This is where all the magic happens. See the [Parameter Deep-Dive](#-parameter-d
 
 **Output:** `pose_images` — A batch of skeleton images (B×H×W×3) as float tensors.
 
+### 4. Face/Pose Delta Editor
+
+**Purpose:** Move individual face points on chosen frames, between Pose and Face Detection (V2) and Draw ViT Pose (V2). The edit is stored relative to the face, so it follows the face through the clip.
+
+- Press **Edit landmark deltas…**, pick a frame and a point (eye corners, brows, mouth corners, lips, nose, chin), and set how far it moves (1.0 = the distance between the outer eye corners).
+- It complements Face Controller 3D, which works with named expression dials.
+- Moved here from ComfyUI-CustomNodePacks; saved workflows load it unchanged.
+- How-to: [docs/face-pose-delta.md](docs/face-pose-delta.md).
+
 ---
 
 ## 🔧 Parameter Deep-Dive
