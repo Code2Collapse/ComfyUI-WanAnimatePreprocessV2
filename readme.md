@@ -137,6 +137,8 @@ ComfyUI/models/detection/
 > **Tip:** If you get CUDA errors, ensure your `onnxruntime-gpu` version matches your CUDA toolkit version. You can check with `python -c "import onnxruntime; print(onnxruntime.get_available_providers())"`.
 
 **Output:** A `POSEMODEL` object containing both loaded models, to be connected to the **Pose and Face Detection (V2)** node.
+One loader can feed several nodes (Pose and Face Detection, the YOLO + ViTPose detector, Depth/Pose/Canny, Face
+Controller 3D): a node that finds the models closed by another one re-opens them.
 
 ---
 
