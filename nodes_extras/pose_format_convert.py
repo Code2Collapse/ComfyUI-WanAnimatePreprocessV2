@@ -239,6 +239,38 @@ def _hand_pixels_for_openpose(meta: dict, side: str, W: int, H: int) -> list:
     return flat[: 21 * 3]
 
 
+def _meta_view(meta) -> dict:
+    """One frame as the normalised dict this converter reads (A22 L9.120).
+
+    ``pose_metas_original`` holds dicts already ([0, 1] coordinates, confidence in column 3). ``pose_metas`` - the
+    retargeted / edited list and this node's DEFAULT source - holds AAPoseMeta objects instead: PIXEL coordinates
+    with separate confidence arrays (pose2d_utils.AAPoseMeta.from_humanapi_meta). Reading those as dicts turned every
+    frame into {}."""
+    if isinstance(meta, dict):
+        return meta
+    W = float(getattr(meta, "width", 0) or 0)
+    H = float(getattr(meta, "height", 0) or 0)
+    if getattr(meta, "kps_body", None) is None or W <= 0 or H <= 0:
+        return {}
+
+    def pack(kps, conf):
+        if kps is None:
+            return None
+        a = np.asarray(kps, dtype=np.float32)[:, :2] / np.array([W, H], dtype=np.float32)
+        c = (np.ones((a.shape[0],), np.float32) if conf is None
+             else np.asarray(conf, dtype=np.float32).reshape(-1)[: a.shape[0]])
+        return np.concatenate([a, c[:, None]], axis=1)
+
+    view = {"width": int(W), "height": int(H),
+            "keypoints_body": pack(meta.kps_body, getattr(meta, "kps_body_p", None)),
+            "keypoints_left_hand": pack(getattr(meta, "kps_lhand", None), getattr(meta, "kps_lhand_p", None)),
+            "keypoints_right_hand": pack(getattr(meta, "kps_rhand", None), getattr(meta, "kps_rhand_p", None))}
+    face = pack(getattr(meta, "kps_face", None), getattr(meta, "kps_face_p", None))
+    if face is not None:
+        view["keypoints_face"] = face
+    return view
+
+
 # ── Node ─────────────────────────────────────────────────────────────
 class WanPoseFormatConvertV2:
     CATEGORY    = "WanAnimatePreprocessV2/extras"
@@ -300,11 +332,19 @@ class WanPoseFormatConvertV2:
         pose_keypoint_list: list[dict] = []
 
         for f_idx, meta in enumerate(target_metas):
-            new_meta = deepcopy(meta) if isinstance(meta, dict) else {}
-            op18 = _read_op18_xyc(new_meta.get("keypoints_body"))
+            view = _meta_view(meta)
+            op18 = _read_op18_xyc(view.get("keypoints_body"))
             converted = _convert_one(op18, target_format)
-            new_meta[f"keypoints_body_{target_format}"] = converted
-            new_meta["body_format"] = target_format
+            if isinstance(meta, dict):
+                new_meta = deepcopy(meta)
+                new_meta[f"keypoints_body_{target_format}"] = converted
+                new_meta["body_format"] = target_format
+            else:
+                # Keep an AAPoseMeta frame an AAPoseMeta (DrawViTPoseV2 reads meta.kps_body); a copy, so the input
+                # bundle is never mutated. The converted joints ride along as attributes.
+                new_meta = deepcopy(meta)
+                setattr(new_meta, f"keypoints_body_{target_format}", converted)
+                new_meta.body_format = target_format
             for v in converted:
                 if v is None:
                     n_missing += 1
@@ -314,8 +354,8 @@ class WanPoseFormatConvertV2:
 
             # Build the OpenPose-style POSE_KEYPOINT entry (always emitted —
             # for COCO-17 we still flatten so the user can repurpose it).
-            W = int(new_meta.get("width") or 0)
-            H = int(new_meta.get("height") or 0)
+            W = int(view.get("width") or 0)
+            H = int(view.get("height") or 0)
             if W <= 0 or H <= 0:
                 W = W or 1024
                 H = H or 1024
@@ -323,10 +363,10 @@ class WanPoseFormatConvertV2:
                 "pose_keypoints_2d": _flatten_for_openpose_json(converted, W, H),
             }
             if emit_face:
-                person["face_keypoints_2d"] = _face_pixels_for_openpose(new_meta, W, H)
+                person["face_keypoints_2d"] = _face_pixels_for_openpose(view, W, H)
             if emit_hands:
-                person["hand_left_keypoints_2d"]  = _hand_pixels_for_openpose(new_meta, "left",  W, H)
-                person["hand_right_keypoints_2d"] = _hand_pixels_for_openpose(new_meta, "right", W, H)
+                person["hand_left_keypoints_2d"]  = _hand_pixels_for_openpose(view, "left",  W, H)
+                person["hand_right_keypoints_2d"] = _hand_pixels_for_openpose(view, "right", W, H)
             pose_keypoint_list.append({
                 "people": [person],
                 "canvas_width":  W,

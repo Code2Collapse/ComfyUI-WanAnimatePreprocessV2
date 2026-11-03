@@ -95,6 +95,15 @@ class SimpleOnnxInference(object):
             del self.session
             self.session = None
 
+    def _live_session(self):
+        """The ONNX session, re-opened when a node closed it (A22 L9.120).
+
+        One loader's model bundle is shared by every node wired to it; PoseAndFaceDetectionV2 calls cleanup() after
+        its loops, and the next node's forward() then found session=None ('NoneType' object has no attribute 'run')."""
+        if getattr(self, "session", None) is None:
+            self.reinit()
+        return self.session
+
     def reinit(self, provider=None):
         # Preserve threshold_conf or other settings before reinitialization
         current_threshold_conf = getattr(self, "threshold_conf", 0.05)
@@ -312,7 +321,8 @@ class Yolo(SimpleOnnxInference):
             img = img.cpu().numpy()
             shape_raw = shape_raw.cpu().numpy()
 
-        outputs = self.session.run(None, {self.session.get_inputs()[0].name: img})[0]
+        session = self._live_session()
+        outputs = session.run(None, {session.get_inputs()[0].name: img})[0]
         person_results = [
             [{'bbox': np.array([0., 0., 1. * shape_raw[i][1], 1. * shape_raw[i][0], -1]), 'track_id': -1}]
             for i in range(len(outputs))
@@ -330,7 +340,8 @@ class ViTPose(SimpleOnnxInference):
         super(ViTPose, self).__init__(checkpoint, device=device)
 
     def forward(self, img, center, scale, **kwargs):
-        heatmaps = self.session.run([], {self.session.get_inputs()[0].name: img})[0]
+        session = self._live_session()
+        heatmaps = session.run([], {session.get_inputs()[0].name: img})[0]
         points, prob = keypoints_from_heatmaps(
             heatmaps=heatmaps,
             center=center,
