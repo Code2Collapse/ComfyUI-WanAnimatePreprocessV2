@@ -6989,10 +6989,10 @@ class EARBlinkDetectorC2C:
 class SaccadeClassifierC2C:
     """Classify per-frame saccades from the gaze (yaw, pitch) time series.
 
-    Computes angular velocity ω(t) = ||Δ(yaw,pitch)|| / Δt, smooths the
-    yaw/pitch independently with a OneEuro low-pass, then thresholds at
-    ``velocity_threshold_deg_s`` (300°/s by default — the classical
-    physiological saccade boundary).
+    Computes angular velocity ω(t) = ||Δ(yaw,pitch)|| / Δt on the raw gaze and
+    thresholds it at ``velocity_threshold_deg_s`` (300°/s by default — the
+    classical physiological saccade boundary). A OneEuro-smoothed yaw / pitch
+    series is reported alongside (smoothing before measuring hid the saccades).
 
     Tracks the user's stricter intent: 'saccade' only when the velocity
     is sustained above threshold for at least ``min_consecutive_frames``
@@ -7021,9 +7021,12 @@ class SaccadeClassifierC2C:
                 "min_consecutive_frames": ("INT", {"default": 1, "min": 1,
                                                     "max": 30}),
                 "one_euro_min_cutoff": ("FLOAT", {"default": 1.0, "min": 0.1,
-                                                   "max": 10.0, "step": 0.1}),
+                                                   "max": 10.0, "step": 0.1, "tooltip": (
+                    "Smoothing of the reported yaw / pitch series only; saccades are measured on the raw gaze "
+                    "(smoothing flattened them below the threshold).")}),
                 "one_euro_beta": ("FLOAT", {"default": 0.05, "min": 0.0,
-                                             "max": 1.0, "step": 0.01}),
+                                             "max": 1.0, "step": 0.01, "tooltip": (
+                    "One-euro speed coefficient for the reported smoothed series.")}),
             },
         }
 
@@ -7076,9 +7079,13 @@ class SaccadeClassifierC2C:
 
         dt = 1.0 / max(float(fps), 1e-6)
         vel_deg_s: List[float] = [0.0]
-        for i in range(1, len(yaw_f)):
-            y0, y1 = yaw_f[i - 1], yaw_f[i]
-            p0, p1 = pitch_f[i - 1], pitch_f[i]
+        # A22 L9.121 W8: velocity from the RAW gaze. Measured after the one-euro smoothing, a textbook 450 deg/s
+        # saccade (15 deg in one frame at 30 fps) peaked at ~80 deg/s with the defaults and never crossed the
+        # 300 deg/s threshold. Gaze jitter of a few degrees per frame stays far below it; min_consecutive_frames
+        # still rejects single spikes. The smoothed series is still reported (yaw/pitch_smoothed_rad).
+        for i in range(1, len(yaw_series)):
+            y0, y1 = yaw_series[i - 1], yaw_series[i]
+            p0, p1 = pitch_series[i - 1], pitch_series[i]
             if any(v != v for v in (y0, y1, p0, p1)):
                 vel_deg_s.append(float('nan'))
                 continue

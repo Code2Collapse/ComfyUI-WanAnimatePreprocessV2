@@ -154,6 +154,8 @@ in the image plane), and `transfer` without a target image and normal map stops 
 quietly returning the source.
 Iris ControlNet: it now draws the irises, gaze arrows and gaze heatmap from the iris_data that Pose and Face
 Detection (V2) produces (it looked for field names nothing produced, so only the eye shapes were drawn).
+Saccade Classifier: saccades are measured on the raw gaze, so a real saccade is detected (measured after the
+smoothing, a 450 deg/s saccade came out near 80 deg/s and never crossed the 300 deg/s threshold).
 
 ---
 
