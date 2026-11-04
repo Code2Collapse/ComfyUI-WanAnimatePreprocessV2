@@ -2189,6 +2189,9 @@ class PoseAndFaceDetectionV2:
                 detect_denoise,
                 detect_sharpen,
                 detect_saturation,
+                # A22 L9.121: these two were never handed on, so use_flux did nothing at all
+                use_flux=use_flux,
+                flux_kontext_path=flux_kontext_path,
                 hires_images=hires_images,
                 face_resize_filter=face_resize_filter,
                 face_sr=face_sr,
@@ -2349,12 +2352,13 @@ class PoseAndFaceDetectionV2:
                     "PoseAndFaceDetectionV2: retarget reference detected (%dx%d).",
                     _rt_np.shape[1], _rt_np.shape[0],
                 )
-            except Exception as _rt_exc:  # noqa: BLE001 — a bad reference just disables retarget
-                logging.getLogger(__name__).warning(
-                    "PoseAndFaceDetectionV2: retarget_image detection failed (%s); ignoring.", _rt_exc,
-                )
-                refer_pose_meta = None
-                refer_img_proc = None
+            except Exception as _rt_exc:  # noqa: BLE001
+                # A22 L9.121 W5: this used to log and continue WITHOUT retarget, so a connected reference silently
+                # did nothing. (No person found is not an error: the full frame is used, as above.)
+                raise RuntimeError(
+                    f"PoseAndFaceDetectionV2: the pose of retarget_image could not be detected ({_rt_exc}). "
+                    "Check the reference image, or disconnect retarget_image to run without retargeting."
+                ) from _rt_exc
 
         comfy_pbar = ProgressBar(B * 2)
         progress = 0
@@ -3358,6 +3362,12 @@ class PoseAndFaceDetectionV2:
                       if hasattr(hires_images, "detach") else np.asarray(hires_images))
             if _hi_np.ndim == 4 and _hi_np.shape[0] >= 1:
                 _hH, _hW = int(_hi_np.shape[1]), int(_hi_np.shape[2])
+                if int(_hi_np.shape[0]) != B:
+                    # A22 L9.121 W5: frames past the end of a shorter hires clip reused its last frame (the face
+                    # tile came from the wrong moment); a longer one was silently cut.
+                    raise ValueError(
+                        f"PoseAndFaceDetectionV2: hires_images has {int(_hi_np.shape[0])} frames but images has "
+                        f"{B}. Wire the full-resolution version of the same clip (same frames).")
                 if _hW >= W and _hH >= H and (_hW > W or _hH > H):
                     _hi = _hi_np
                     _hi_sx, _hi_sy = float(_hW) / float(W), float(_hH) / float(H)
@@ -3577,6 +3587,8 @@ class PoseAndFaceDetectionV2:
                         """Detect body pose on a single HxWx3 uint8 image, mirroring
                         the reference-detection block above. Returns an
                         AAPoseMeta-style dict or None on failure."""
+                        if img_np.dtype == np.uint8:          # A22 L9.121 W3: FLUX returns 0..255
+                            img_np = img_np.astype(np.float32) / 255.0
                         _h, _w = img_np.shape[:2]
                         _shp = np.array([_h, _w])[None]
                         _dets = detector(
@@ -3626,18 +3638,29 @@ class PoseAndFaceDetectionV2:
                             "Set flux_kontext_path to the model folder, or drop "
                             "FLUX.1-Kontext-dev into ComfyUI/models/flux/. Download "
                             "from https://huggingface.co/black-forest-labs/FLUX.1-Kontext-dev")
-                    _flux_pipe = load_flux_kontext(_flux_path)
-                    _tpl_prompt, _refer_prompt = get_editing_prompts(
-                        pose_metas, refer_pose_meta)
-                    # Edit the reference to a standard front-facing pose.
-                    _refer_edit = edit_with_flux(
-                        _flux_pipe, refer_img_proc, _refer_prompt)
-                    # Edit the first template frame (frames[1] in the reference;
-                    # fall back to frames[0] for a single-frame clip).
-                    _tpl_idx = 1 if B >= 2 else 0
-                    _tpl_frame = (images[_tpl_idx].detach().cpu().numpy()
-                                   * 255.0).clip(0, 255).astype(np.uint8)
-                    _tpl_edit = edit_with_flux(_flux_pipe, _tpl_frame, _tpl_prompt)
+                    _flux_pipe = None
+                    try:
+                        _flux_pipe = load_flux_kontext(_flux_path)
+                        _tpl_prompt, _refer_prompt = get_editing_prompts(
+                            pose_metas, refer_pose_meta)
+                        # Edit the reference to a standard front-facing pose. A22 L9.121 W3: the reference is
+                        # 0..1 floats; it went to FLUX cast straight to uint8 (an all-black image).
+                        _refer_u8 = (np.asarray(refer_img_proc) * 255.0).clip(0, 255).astype(np.uint8)
+                        _refer_edit = edit_with_flux(
+                            _flux_pipe, _refer_u8, _refer_prompt)
+                        # Edit the first template frame (frames[1] in the reference;
+                        # fall back to frames[0] for a single-frame clip).
+                        _tpl_idx = 1 if B >= 2 else 0
+                        _tpl_frame = (images[_tpl_idx].detach().cpu().numpy()
+                                       * 255.0).clip(0, 255).astype(np.uint8)
+                        _tpl_edit = edit_with_flux(_flux_pipe, _tpl_frame, _tpl_prompt)
+                    finally:
+                        # A22 L9.121 W4: freed on failure too (the 12B pipeline stayed resident after an error)
+                        _flux_pipe = None
+                        try:
+                            free_flux_cache()
+                        except Exception:  # noqa: BLE001
+                            pass
                     # Re-detect pose on the edited images.
                     _refer_edit_meta = _pose_of(_refer_edit)
                     _tpl_edit_meta0 = _pose_of(_tpl_edit)
@@ -3645,27 +3668,21 @@ class PoseAndFaceDetectionV2:
                         "PoseAndFaceDetectionV2 [use_flux]: normalized reference "
                         "and template frame to a front-facing pose via "
                         "FLUX.1-Kontext-dev before retargeting.")
-                    # VRAM (2026-08-13): FLUX.1-Kontext-dev is ~12B params and
-                    # is only used for these TWO edits (not per-frame), so free
-                    # its pipeline + cached VRAM immediately. Without this the
-                    # 12B model stays resident for the whole ComfyUI session
-                    # (the global _FLUX_CACHE never cleared) — the "eating a
-                    # lot of VRAM" the user reported. A re-run that needs FLUX
-                    # simply reloads (the 30s load is one-shot, not per-frame).
-                    try:
-                        free_flux_cache()
-                    except Exception:  # noqa: BLE001
-                        pass
+                    # VRAM (2026-08-13): FLUX.1-Kontext-dev is ~12B params and only used for these TWO edits, so it
+                    # is freed right after them (the finally above) - a re-run that needs FLUX simply reloads.
                 retarget_pose_metas = get_retarget_pose(
                     _pm_for_rt[0], refer_pose_meta, _pm_for_rt,
                     _tpl_edit_meta0, _refer_edit_meta
                 )
-            except Exception as _rt_exc:  # noqa: BLE001 — fall back to non-retargeted
-                logging.getLogger(__name__).warning(
-                    "PoseAndFaceDetectionV2: get_retarget_pose failed (%s); using non-retargeted pose.",
-                    _rt_exc,
-                )
-                retarget_pose_metas = [AAPoseMeta.from_humanapi_meta(meta) for meta in pose_metas]
+            except Exception as _rt_exc:  # noqa: BLE001
+                # A22 L9.121 W2/W5: this fell back to the NON-retargeted pose with only a log line - also for
+                # "use_flux is on but FLUX was not found", which the tooltip promises never to swallow.
+                if isinstance(_rt_exc, (FileNotFoundError, ValueError)) and "FLUX" in str(_rt_exc):
+                    raise
+                raise RuntimeError(
+                    f"PoseAndFaceDetectionV2: retargeting onto retarget_image failed ({_rt_exc}). Disconnect "
+                    "retarget_image to run without retargeting."
+                ) from _rt_exc
         else:
             if use_flux:
                 raise ValueError(
