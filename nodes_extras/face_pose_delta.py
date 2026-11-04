@@ -427,7 +427,9 @@ def edit_pose_data(
 
     Frames with no face are filled with the nearest face for the anchors only and written back untouched, so keyframe
     numbers stay the clip's frame numbers."""
-    from .expression_3d_coeffs import _read_face_normalised, _write_face_normalised
+    # iBUG-68 order: the eye-corner indices 36 / 45 below are dlib numbers (A22 L9.121 W13)
+    from .expression_3d_coeffs import _read_face_dlib68 as _read_face_normalised
+    from .expression_3d_coeffs import _write_face_dlib68 as _write_face_normalised
     from ._face_helpers import _meta_height, _meta_width
     if not isinstance(pose_data, dict):
         raise ValueError("Face/Pose Delta Editor: pose_data is not a pose bundle (connect Pose and Face Detection V2).")

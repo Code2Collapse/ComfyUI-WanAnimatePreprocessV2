@@ -281,6 +281,12 @@ class WanQualityScorerJitterV2:
         # Weighted: visibility most important, face velocity matters for identity work.
         quality = float(0.4 * vis_score + 0.25 * vel_score + 0.20 * face_vel_score + 0.15 * expr_score)
         quality = max(0.0, min(1.0, quality))
+        note = ""
+        if not per_frame_metrics:
+            # A22 L9.121 W12: no frames scored a perfect 1.0 (every partial score defaults to 1 when it has no data),
+            # so an empty or broken pose input passed any quality gate. Nothing to judge is not good quality.
+            quality = 0.0
+            note = "no frames in pose_data_json: nothing to score"
 
         out_json = json.dumps({
             "frames": per_frame_metrics,
@@ -294,6 +300,7 @@ class WanQualityScorerJitterV2:
                 "bad_frame_count": bad,
                 "n_frames": len(per_frame_metrics),
                 "quality_score": quality,
+                **({"note": note} if note else {}),
                 "weights": {"visibility": 0.4, "body_velocity": 0.25,
                             "face_velocity": 0.20, "expression": 0.15},
                 "thresholds": {

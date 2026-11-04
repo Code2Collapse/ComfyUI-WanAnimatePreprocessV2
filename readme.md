@@ -145,6 +145,10 @@ The NLF 3D pose refine (Pose 3D Refine NLF V2) now changes the pose that Draw Vi
 retarget (it used to change only the stored original). With a retarget, its info says the drawn pose does not
 include the refinement. A missing or broken NLF model stops the run with the reason, and an interrupted model
 download no longer leaves a broken file behind.
+The Expression 3D Coefficients node and Face/Pose Delta now move the landmarks they name. Pose data stores
+the face as 69 rows (a body-anchored point, then the 68 dlib landmarks), and both read it one row early, so
+an expression edit moved the neighbouring point (a mouth-corner push moved an eye point) and the eye-corner
+scale used the wrong points. The Quality Scorer gives an empty pose input 0.0 instead of a perfect 1.0.
 
 ---
 

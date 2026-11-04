@@ -68,7 +68,7 @@ from __future__ import annotations
 import json
 import logging
 from copy import deepcopy
-from typing import Dict, Tuple
+from typing import Optional, Dict, Tuple
 
 import numpy as np
 
@@ -354,6 +354,67 @@ def _write_face_normalised(meta, xy_norm: np.ndarray) -> None:
     meta["keypoints_face"] = src
 
 
+def _dlib_offset(n_rows: int) -> int:
+    """POSEDATA face arrays have 69 rows: row 0 is the body-anchored face point, rows 1-68 are the 68 dlib/iBUG
+    landmarks (nodes.py: face_kps[1:69] = kps68). A plain 68-row array is already dlib-ordered."""
+    return 1 if int(n_rows) >= _N_LM + 1 else 0
+
+
+def _read_face_dlib68(meta) -> Optional[np.ndarray]:
+    """(68, 2) normalised landmarks in dlib / iBUG-68 order (index 36 = right-eye outer corner ...).
+
+    A22 L9.121 W13: _read_face_normalised returns the first 68 ROWS (array-slot layout, used by force_eyes_open and
+    FC3D with slot indices). Callers that index by iBUG-68 numbers (the expression basis, Face/Pose Delta's eye
+    corners) read through this instead; on a 69-row array the slot layout put every landmark one place early."""
+    from ._face_helpers import _is_aa_pose_meta, _meta_height, _meta_width
+
+    if _is_aa_pose_meta(meta):
+        kps = getattr(meta, "kps_face", None)
+        if kps is None:
+            return None
+        arr = np.asarray(kps, dtype=np.float32)
+        if arr.ndim != 2 or arr.shape[0] < _N_LM or arr.shape[1] < 2:
+            return None
+        o = _dlib_offset(arr.shape[0])
+        w = max(_meta_width(meta), 1e-6)
+        h = max(_meta_height(meta), 1e-6)
+        out = arr[o:o + _N_LM, :2].copy()
+        out[:, 0] /= w
+        out[:, 1] /= h
+        return out
+    if not isinstance(meta, dict) or meta.get("keypoints_face") is None:
+        return None
+    arr = np.asarray(meta["keypoints_face"], dtype=np.float32)
+    if arr.ndim != 2 or arr.shape[0] < _N_LM or arr.shape[1] < 2:
+        return None
+    o = _dlib_offset(arr.shape[0])
+    return arr[o:o + _N_LM, :2].copy()
+
+
+def _write_face_dlib68(meta, xy_norm: np.ndarray) -> None:
+    """Write (68, 2) dlib-ordered normalised landmarks back (the inverse of _read_face_dlib68)."""
+    from ._face_helpers import _is_aa_pose_meta, _meta_height, _meta_width
+
+    if _is_aa_pose_meta(meta):
+        kps = getattr(meta, "kps_face", None)
+        if kps is None:
+            return
+        src = np.asarray(kps, dtype=np.float32).copy()
+        o = _dlib_offset(src.shape[0])
+        w = max(_meta_width(meta), 1e-6)
+        h = max(_meta_height(meta), 1e-6)
+        src[o:o + _N_LM, 0] = xy_norm[:, 0] * w
+        src[o:o + _N_LM, 1] = xy_norm[:, 1] * h
+        meta.kps_face = src[:, :2]
+        return
+    if not isinstance(meta, dict):
+        return
+    src = np.asarray(meta["keypoints_face"], dtype=np.float32).copy()
+    o = _dlib_offset(src.shape[0])
+    src[o:o + _N_LM, :2] = xy_norm
+    meta["keypoints_face"] = src
+
+
 def _face_bbox_size(xy_norm: np.ndarray) -> Tuple[float, float]:
     mins = xy_norm.min(axis=0)
     maxs = xy_norm.max(axis=0)
@@ -633,7 +694,7 @@ class WanExpression3DCoeffsV2:
             if f_idx >= n_frames:
                 continue
             meta = metas[f_idx]
-            xy_norm = _read_face_normalised(meta)
+            xy_norm = _read_face_dlib68(meta)      # the basis is iBUG-68 indexed (W13)
             if xy_norm is None:
                 skipped_no_face += 1
                 continue
@@ -647,7 +708,7 @@ class WanExpression3DCoeffsV2:
             delta_img[:, 0] = delta_bbox[:, 0] * bw
             delta_img[:, 1] = delta_bbox[:, 1] * bh
             new_xy = xy_norm + delta_img
-            _write_face_normalised(meta, new_xy.astype(np.float32))
+            _write_face_dlib68(meta, new_xy.astype(np.float32))
             affected += 1
             coeff_series[f_idx] = {
                 _AXIS_NAMES[k]: float(c[k]) for k in range(_N_AXES) if abs(c[k]) > 1e-6
