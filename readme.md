@@ -141,6 +141,10 @@ One loader can feed several nodes (Pose and Face Detection, the YOLO + ViTPose d
 Controller 3D): a node that finds the models closed by another one re-opens them.
 Depth/Pose/Canny's pose pass now draws with its own draw threshold (it used to fall back to 0.5), and the
 Pupil Dilation Tracker's `face_bbox_diag` normaliser reads face boxes as (x1, y1, x2, y2).
+The NLF 3D pose refine (Pose 3D Refine NLF V2) now changes the pose that Draw ViTPose draws when there is no
+retarget (it used to change only the stored original). With a retarget, its info says the drawn pose does not
+include the refinement. A missing or broken NLF model stops the run with the reason, and an interrupted model
+download no longer leaves a broken file behind.
 
 ---
 
