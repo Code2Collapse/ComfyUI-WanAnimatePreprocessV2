@@ -156,6 +156,9 @@ Iris ControlNet: it now draws the irises, gaze arrows and gaze heatmap from the 
 Detection (V2) produces (it looked for field names nothing produced, so only the eye shapes were drawn).
 Saccade Classifier: saccades are measured on the raw gaze, so a real saccade is detected (measured after the
 smoothing, a 450 deg/s saccade came out near 80 deg/s and never crossed the 300 deg/s threshold).
+Draw ViTPose: without a retarget, the skeleton is drawn at the source size and then resized to the target, as
+the official Wan 2.2 preprocess does, so it lines up with the irises when the source and target sizes differ (it
+was drawn at source coordinates on the target canvas and was misplaced or cut off).
 
 ---
 

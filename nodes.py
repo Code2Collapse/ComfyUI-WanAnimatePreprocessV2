@@ -5566,6 +5566,11 @@ class DrawViTPoseV2:
         else:
             transform = None  # cannot retarget without source dims
 
+        canvas_hw = None
+        if pose_data.get("refer_pose_meta") is None and src_size and len(src_size) == 2 \
+                and (int(src_size[0]), int(src_size[1])) != (int(height), int(width)):
+            canvas_hw = (int(src_size[0]), int(src_size[1]))
+
         comfy_pbar = ProgressBar(len(pose_metas))
         progress = 0
         pose_images = []
@@ -5574,7 +5579,15 @@ class DrawViTPoseV2:
             list(enumerate(pose_metas)), len(pose_metas),
             "WanAnimateV2: draw pose images",
         ):
-            canvas = np.zeros((height, width, 3), dtype=np.uint8)
+            # A22 L9.121 W6: without a retarget the metas are in SOURCE pixels. Draw on a source-size canvas, then
+            # padding-resize to the target - the official Wan2.2 order (process_pipepline.py: canvas =
+            # zeros_like(frames[0]) -> draw -> padding_resize) and the same transform the iris overlay uses. Drawing
+            # source pixels straight onto a target-size canvas misplaced / clipped the skeleton whenever the sizes
+            # differed. A retargeted pose is already in the target frame and is drawn as before.
+            if canvas_hw is not None:
+                canvas = np.zeros((canvas_hw[0], canvas_hw[1], 3), dtype=np.uint8)
+            else:
+                canvas = np.zeros((height, width, 3), dtype=np.uint8)
             pose_image = draw_aapose_by_meta_new(
                 canvas,
                 meta,
