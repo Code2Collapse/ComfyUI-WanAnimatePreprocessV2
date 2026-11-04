@@ -114,26 +114,29 @@ def _render_sh(coeffs: np.ndarray, normals: np.ndarray) -> np.ndarray:
     return np.clip(irr, 0, None).astype(np.float32)
 
 
-def _rotate_sh_y_axis(coeffs: np.ndarray, yaw_rad: float) -> np.ndarray:
-    """Rotate SH coefficients about the Y axis. Closed-form for L<=2.
+def _sphere_dirs(n: int = 256) -> np.ndarray:
+    """Well-spread unit directions (Fibonacci sphere) for exact SH re-projection."""
+    i = np.arange(n, dtype=np.float64) + 0.5
+    phi = np.arccos(1.0 - 2.0 * i / n)
+    theta = np.pi * (1.0 + 5 ** 0.5) * i
+    return np.stack([np.cos(theta) * np.sin(phi), np.cos(phi), np.sin(theta) * np.sin(phi)], axis=1)
 
-    Reference: Ivanic & Ruedenberg 1996 / Sloan 2008.
-    Coeff order assumed: [0:(0,0), 1:(1,-1), 2:(1,0), 3:(1,1),
-                          4:(2,-2), 5:(2,-1), 6:(2,0), 7:(2,1), 8:(2,2)].
-    """
-    c, s = math.cos(yaw_rad), math.sin(yaw_rad)
-    out = coeffs.copy()
-    # L=1
-    out[:, 3] = c * coeffs[:, 3] + s * coeffs[:, 1]    # m=+1
-    out[:, 1] = -s * coeffs[:, 3] + c * coeffs[:, 1]   # m=-1
-    # L=2 (Y rotation)
-    c2 = math.cos(2 * yaw_rad)
-    s2 = math.sin(2 * yaw_rad)
-    out[:, 8] = c2 * coeffs[:, 8] + s2 * coeffs[:, 4]  # m=+2
-    out[:, 4] = -s2 * coeffs[:, 8] + c2 * coeffs[:, 4]  # m=-2
-    out[:, 7] = c * coeffs[:, 7] + s * coeffs[:, 5]    # m=+1
-    out[:, 5] = -s * coeffs[:, 7] + c * coeffs[:, 5]   # m=-1
-    return out
+
+def _rotate_sh_y_axis(coeffs: np.ndarray, yaw_rad: float) -> np.ndarray:
+    """Rotate L<=2 SH lighting about the vertical (Y, up) axis: the light turns left / right, as a head yaw would.
+
+    A22 L9.121 W11: the old closed form mixed the m=+-1 terms of the x and y basis functions (and the L=2 xy /
+    x^2-y^2 pair), which is a roll about Z - "yaw" turned the light in the image plane. Now the 9x9 rotation matrix
+    is built by re-projection: f'(n) = f(R^T n) evaluated on well-spread directions and fitted by least squares,
+    which is exact for L<=2 (rotations keep each band separate). R = R_y(yaw): +90 deg turns +x towards -z.
+    Basis order as _sh_basis: [1, y, z, x, xy, yz, 3z^2-1, xz, x^2-y^2]."""
+    c, s_ = math.cos(yaw_rad), math.sin(yaw_rad)
+    R = np.array([[c, 0.0, s_], [0.0, 1.0, 0.0], [-s_, 0.0, c]], dtype=np.float64)
+    dirs = _sphere_dirs()
+    Y = _sh_basis(dirs).astype(np.float64)                 # f at n
+    Yr = _sh_basis(dirs @ R).astype(np.float64)            # rows n_i @ R = (R^T n_i)^T: f at R^T n
+    M = np.linalg.lstsq(Y, Yr, rcond=None)[0]              # (9, 9): Y @ M = Yr
+    return (coeffs.astype(np.float64) @ M.T).astype(coeffs.dtype)
 
 
 class WanSHLightingTransferV2:
@@ -195,6 +198,12 @@ class WanSHLightingTransferV2:
         tgt_img = target_image.detach().cpu().numpy().astype(np.float32) if target_image is not None else None
         tgt_nrm = target_normal.detach().cpu().numpy().astype(np.float32) if target_normal is not None else None
         tgt_alb = target_albedo.detach().cpu().numpy().astype(np.float32) if target_albedo is not None else None
+
+        if operation == "transfer" and (tgt_img is None or tgt_nrm is None):
+            # A22 L9.121 W11: this fell through to fit_only and returned the source reconstruction as if it were a
+            # transfer
+            raise ValueError("WanSHLightingTransferV2: operation 'transfer' needs target_image and target_normal "
+                             "connected (the lighting is moved onto that target).")
 
         B = src_img.shape[0]
         relit_frames = []

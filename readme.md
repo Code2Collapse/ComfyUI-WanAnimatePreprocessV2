@@ -149,6 +149,9 @@ The Expression 3D Coefficients node and Face/Pose Delta now move the landmarks t
 the face as 69 rows (a body-anchored point, then the 68 dlib landmarks), and both read it one row early, so
 an expression edit moved the neighbouring point (a mouth-corner push moved an eye point) and the eye-corner
 scale used the wrong points. The Quality Scorer gives an empty pose input 0.0 instead of a perfect 1.0.
+SH Lighting Transfer: `rotate_yaw_deg` now turns the light left / right around the vertical axis (it rolled it
+in the image plane), and `transfer` without a target image and normal map stops with a message instead of
+quietly returning the source.
 
 ---
 
