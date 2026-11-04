@@ -152,6 +152,8 @@ scale used the wrong points. The Quality Scorer gives an empty pose input 0.0 in
 SH Lighting Transfer: `rotate_yaw_deg` now turns the light left / right around the vertical axis (it rolled it
 in the image plane), and `transfer` without a target image and normal map stops with a message instead of
 quietly returning the source.
+Iris ControlNet: it now draws the irises, gaze arrows and gaze heatmap from the iris_data that Pose and Face
+Detection (V2) produces (it looked for field names nothing produced, so only the eye shapes were drawn).
 
 ---
 

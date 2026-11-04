@@ -93,6 +93,35 @@ def _draw_arrow(canvas: np.ndarray, x0: float, y0: float, x1: float, y1: float,
                     color, thickness, cv2.LINE_AA, tipLength=0.3)
 
 
+def _entry_from_pose_iris(entry: dict) -> dict:
+    """Accept the iris_data entries PoseAndFaceDetectionV2 really emits.
+
+    A22 L9.121 W10: they carry ``right_iris`` / ``left_iris`` = {x, y, confidence, radius} (source-frame pixels) and
+    ``right_gaze`` / ``left_gaze`` = {yaw_rad, pitch_rad, dx, dy, ...}. This node read ``right_pupil_xy`` and
+    ``gaze_yaw_rad``, which nothing emits, so no iris disc, gaze arrow or heatmap was ever drawn from real data.
+    Keys already in the old form win."""
+    e = dict(entry)
+    yaws, pitches = [], []
+    for side in ("right", "left"):
+        iris = entry.get(f"{side}_iris")
+        if e.get(f"{side}_pupil_xy") is None and isinstance(iris, dict) \
+                and iris.get("x") is not None and iris.get("y") is not None:
+            e[f"{side}_pupil_xy"] = [float(iris["x"]), float(iris["y"])]
+        gz = entry.get(f"{side}_gaze")
+        if isinstance(gz, dict):
+            if e.get(f"{side}_yaw_rad") is None and gz.get("yaw_rad") is not None:
+                e[f"{side}_yaw_rad"] = float(gz["yaw_rad"])
+            if e.get(f"{side}_pitch_rad") is None and gz.get("pitch_rad") is not None:
+                e[f"{side}_pitch_rad"] = float(gz["pitch_rad"])
+        if e.get(f"{side}_yaw_rad") is not None and e.get(f"{side}_pitch_rad") is not None:
+            yaws.append(float(e[f"{side}_yaw_rad"]))
+            pitches.append(float(e[f"{side}_pitch_rad"]))
+    if e.get("gaze_yaw_rad") is None and yaws:
+        e["gaze_yaw_rad"] = sum(yaws) / len(yaws)
+        e["gaze_pitch_rad"] = sum(pitches) / len(pitches)
+    return e
+
+
 def _eye_bbox_from_face(face_bbox: tuple[float, float, float, float],
                        side: str) -> tuple[int, int, int, int]:
     x1, y1, x2, y2 = face_bbox
@@ -212,6 +241,7 @@ class WanIrisControlNetV2:
             entry = data[i] if i < len(data) else {}
             if not isinstance(entry, dict):
                 entry = {}
+            entry = _entry_from_pose_iris(entry)
 
             # Determine eye bboxes
             r_eye = entry.get("right_eye_bbox")
