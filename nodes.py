@@ -6593,10 +6593,10 @@ class DepthPoseCannyCombinedV2:
                     canvas, aa,
                     body_stick_width=-1, hand_stick_width=-1,
                     draw_head=True,
-                    pose_draw_threshold=float(draw_threshold),
+                    threshold=float(draw_threshold),
                 )
             except TypeError:
-                # Older signature without pose_draw_threshold
+                # Older signature without a threshold keyword
                 draw_aapose_by_meta_new(
                     canvas, aa,
                     body_stick_width=-1, hand_stick_width=-1,
@@ -7241,7 +7241,7 @@ class PupilDilationTrackerC2C:
             elif normaliser == "face_bbox_diag":
                 if face_bboxes and i < len(face_bboxes) and face_bboxes[i] is not None:
                     try:
-                        x1, x2, y1, y2 = face_bboxes[i]
+                        x1, y1, x2, y2 = face_bboxes[i]  # BBOX = (x1, y1, x2, y2)
                         scale.append(math.hypot(x2 - x1, y2 - y1))
                     except Exception:
                         scale.append(float('nan'))
