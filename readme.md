@@ -139,6 +139,8 @@ ComfyUI/models/detection/
 **Output:** A `POSEMODEL` object containing both loaded models, to be connected to the **Pose and Face Detection (V2)** node.
 One loader can feed several nodes (Pose and Face Detection, the YOLO + ViTPose detector, Depth/Pose/Canny, Face
 Controller 3D): a node that finds the models closed by another one re-opens them.
+Depth/Pose/Canny's pose pass now draws with its own draw threshold (it used to fall back to 0.5), and the
+Pupil Dilation Tracker's `face_bbox_diag` normaliser reads face boxes as (x1, y1, x2, y2).
 
 ---
 
