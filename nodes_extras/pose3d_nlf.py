@@ -82,14 +82,24 @@ def _ensure_nlf(name):
         return path
     import urllib.request
 
+    part = path + ".part"
     for url in _NLF_URLS:
         try:
             log.info("[pose3d_nlf] downloading NLF model: %s", url)
-            urllib.request.urlretrieve(url, path)
-            if os.path.getsize(path) > 1_000_000:
+            # A22 L9.121 W14: download to .part and rename only when complete - a partial file at `path` was taken
+            # for the model on the next run.
+            urllib.request.urlretrieve(url, part)
+            if os.path.getsize(part) > 1_000_000:
+                os.replace(part, path)
                 return path
         except Exception as exc:  # noqa: BLE001
             log.warning("[pose3d_nlf] download failed (%s): %s", url, exc)
+        finally:
+            if os.path.exists(part):
+                try:
+                    os.remove(part)
+                except OSError:
+                    pass
     raise FileNotFoundError(
         f"NLF model '{name}' not found in models/nlf and auto-download failed. "
         f"Place a TorchScript NLF model there manually (see github.com/isarandi/nlf)."
@@ -227,6 +237,11 @@ class WanPose3DRefineNLFV2:
             euro_x = _OneEuro(smoothing_min_cutoff, smoothing_beta) if temporal_smoothing else None
             euro_y = _OneEuro(smoothing_min_cutoff, smoothing_beta) if temporal_smoothing else None
             refined_frames = 0
+            # A22 L9.121 W14: DrawViTPoseV2 draws out["pose_metas"]. Without a retarget those are the detected frames
+            # (AAPoseMeta, pixels), so the refined body goes there too; face keypoints there keep their edits.
+            drawn = out.get("pose_metas") if isinstance(out, dict) else None
+            retargeted = isinstance(out, dict) and out.get("refer_pose_meta") is not None
+            drawn_updated = 0
 
             for fi in range(min(F, len(metas))):
                 meta = metas[fi]
@@ -273,16 +288,27 @@ class WanPose3DRefineNLFV2:
 
                 _set_kb(meta, refined)
                 refined_frames += 1
+                if not retargeted and isinstance(drawn, list) and fi < len(drawn)                         and getattr(drawn[fi], "kps_body", None) is not None:
+                    mw = float(meta.get("width") or W)
+                    mh = float(meta.get("height") or H)
+                    body_px = refined[:, :2] * np.array([mw, mh], dtype=np.float32) if normalized else refined[:, :2]
+                    if np.asarray(drawn[fi].kps_body).shape[0] == body_px.shape[0]:
+                        drawn[fi].kps_body = body_px.astype(np.float32)
+                        drawn_updated += 1
 
             info = (f"pose3d_nlf: refined {refined_frames}/{F} frames on {dev} "
                     f"(blend={blend_strength}, smooth={temporal_smoothing}, occl_fill={occlusion_fill}). "
                     f"Body joints 3D-stabilized via NLF; head/face kept from ViTPose.")
+            if retargeted:
+                info += (" The drawn pose (pose_metas) is RETARGETED, so it does not include this refinement: run "
+                         "NLF before retargeting, or draw pose_metas_original.")
+            else:
+                info += f" Drawn pose updated on {drawn_updated} frame(s)."
             log.info("[pose3d_nlf] %s", info)
             return (out, info)
         except Exception as exc:  # noqa: BLE001
-            msg = f"pose3d_nlf: NLF refine unavailable ({exc}); returning original POSEDATA unchanged."
-            log.warning("[pose3d_nlf] %s", msg)
-            return (out, msg)
+            # A22 L9.121 W14: fail with the reason (it used to pass the pose through unrefined, looking like success)
+            raise RuntimeError(f"NLF pose refine failed: {type(exc).__name__}: {exc}") from exc
 
     @classmethod
     def IS_CHANGED(cls, pose_data, images, nlf_model, device, blend_strength,
