@@ -159,6 +159,16 @@ smoothing, a 450 deg/s saccade came out near 80 deg/s and never crossed the 300 
 Draw ViTPose: without a retarget, the skeleton is drawn at the source size and then resized to the target, as
 the official Wan 2.2 preprocess does, so it lines up with the irises when the source and target sizes differ (it
 was drawn at source coordinates on the target canvas and was misplaced or cut off).
+Pose and Face Detection (V2), retarget and FLUX (fixed 2026-11-04):
+- `use_flux` now runs: it was accepted and never passed on, so it did nothing.
+- FLUX gets the reference as a real image (it got an all-black one), and its edits are re-detected correctly.
+- The FLUX model is freed even when an edit fails.
+- With `retarget_image` connected, a failure in reference detection, in FLUX (including "FLUX.1-Kontext-dev not
+  found") or in retargeting stops the run with the reason. It used to fall back silently to a pose that was not
+  retargeted.
+- `hires_images` must have the same number of frames as `images` (frames past the end reused the last one).
+
+FLUX itself is NOT RUN here: it needs the 12B FLUX.1-Kontext-dev weights and a GPU.
 
 ---
 
