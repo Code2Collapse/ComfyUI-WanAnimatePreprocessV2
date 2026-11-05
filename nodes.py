@@ -1883,6 +1883,13 @@ def build_jitterless_boxes(
 # ---------------------------------------------------
 # Pose and Face Detection
 # ---------------------------------------------------
+def _upscale_model_names():
+    try:
+        return list(folder_paths.get_filename_list("upscale_models"))
+    except Exception:  # noqa: BLE001 - no such folder key: nothing to list
+        return []
+
+
 class PoseAndFaceDetectionV2:
     DESCRIPTION = (
         "Run YOLO person detection + ViTPose 2D keypoints + (optional) MediaPipe "
@@ -1909,6 +1916,12 @@ class PoseAndFaceDetectionV2:
         "for the Wan-Animate face branch specifically — if you need this, "
         "load the full checkpoint in fp16/fp32 rather than an fp8 quant."
     )
+
+    @classmethod
+    def VALIDATE_INPUTS(cls, face_sr_model=None):
+        """L2.32: face_sr_model is a dropdown now; a saved value ("" from the old text box, or a model that is no longer
+        installed) must not make the whole workflow refuse to load. The run checks the model when it is used."""
+        return True
 
     @classmethod
     def INPUT_TYPES(s):
@@ -1996,7 +2009,9 @@ class PoseAndFaceDetectionV2:
                 "landmark_overrides_json": ("STRING", {"default": "{}", "multiline": True, "tooltip": "Manual body-keypoint corrections from the Pose editor. Shape: {\"<frame>\": {\"<jointIdx>\": [x_px, y_px], ...}, ...} in SOURCE pixels. Written by the viewer's Edit mode — drag a joint to fix a mis-detection and the correction flows through retargeting into pose_data AND the rendered pose images (not just the preview). Leave as {} for pure detection."}),
                 "face_resize_filter": (["mitchell", "cubic", "keys", "simon", "rifman", "parzen", "notch", "lanczos4", "lanczos6", "sinc4", "impulse"], {"default": "mitchell", "tooltip": "Resampling filter for the face crop -> 512 resize. Nuke's filter set, same names, so a compositor can reason about it with the vocabulary they already use.\n\nMEASURED on the real 46px-face case, resizing 46 -> 512 -> 64 and comparing against 46 -> 64 direct (lower error = less information mangled, overshoot = ringing):\n  cubic     err 0.00297   overshoot 0.0000\n  mitchell  err 0.00311   overshoot 0.0000   <- DEFAULT\n  keys      err 0.00329   overshoot 0.0000\n  lanczos4  err 0.00715   overshoot 0.0001\n  rifman    err 0.01007   overshoot 0.0312\n  sinc4     err 0.02274   overshoot 0.0804\nThe previous hardcoded cv2 LANCZOS4 measured 0.00721 - about 2.4x worse than mitchell.\n\nWHY: a filter rings when its kernel goes NEGATIVE, overshooting at hard edges. That overshoot is invented structure the 20-number face encoder cannot tell from real texture, and it is why a crop taken to 512 and sampled back down does not match the original sampled down directly - the ringing does not cancel.\n\ncubic / parzen / notch / impulse cannot ring (no negative lobes). mitchell has small negative lobes and measured zero overshoot here - Mitchell and Netravali's own paper concludes B=C=1/3 is the best blur-versus-ringing compromise, which is why it is the default. keys / simon / rifman / lanczos / sinc are progressively sharper and ring progressively harder.\n\nDOWNSIZING: prefer mitchell, or parzen if the plate is noisy - ringing survives into the latent as hard fringes, and softness does not."}),
                 "face_sr": (["none", "lanczos", "comfy_upscale"], {"default": "none", "tooltip": "Super-resolve the face crop BEFORE it is resized to the 512x512 the encoder needs.\n\nWhy it exists: the tile is always 512, but the region it is cut from is whatever the plate gives. A 46px face box means an ELEVEN-times upscale, so almost everything the model reads is invented by a resize filter. HeadsUp! (arXiv:2510.09924) discards training faces under 64px interocular (~160px face box) as too small to learn from - the node logs where your shot sits.\n\nnone = plain resize (previous behaviour).\nlanczos = deterministic baseline. Invents nothing, so if a real SR model does not beat this on your footage, that model is only adding hallucination and cost.\ncomfy_upscale = any ESRGAN-family model in ComfyUI/models/upscale_models, named in face_sr_model.\n\nSR runs on the NATIVE crop, before the 512 resize. Order matters: Lanczos is a windowed sinc with negative lobes, so it rings on hard edges; running SR after that would just sharpen the ringing. It is also why a crop taken to 512 and sampled back down does not match the original sampled down directly - the ringing does not cancel.\n\nPREFER hires_images if you have a full-res plate. Real pixels always beat invented ones."}),
-                "face_sr_model": ("STRING", {"default": "", "tooltip": "Filename of the upscale model in ComfyUI/models/upscale_models, used only when face_sr=comfy_upscale. Errors naming what is installed if it cannot be found."}),
+                # L2.32: a dropdown of the installed models (it was free text, so nothing was listed). Old saves keep
+                # loading: VALIDATE_INPUTS names this input, so core does not refuse a value that is not in the list.
+                "face_sr_model": (["none"] + _upscale_model_names(), {"default": "none", "tooltip": "Upscale model from ComfyUI/models/upscale_models, used only when face_sr=comfy_upscale. A model that is not installed any more stops the run with what is installed."}),
                 "face_sr_stabilise": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.05, "tooltip": "How hard to stabilise SR detail over time. Per-frame SR hallucinates independently, so texture BOILS - and boiling is exactly the high-frequency per-frame noise Wan-Animate's 20-number motion code cannot tell from real motion. Hallo2 (arXiv:2410.07718) finds SR only helps expression fidelity when paired with temporal alignment.\n\nOnly the DETAIL layer is filtered; the base is left alone so real motion is never smeared.\n\nMeasured on a moving subject: 0.5 -> flicker -37% with 101% of real motion preserved; 0.7 -> -49% / 87%; 1.0 -> -58% / 75%. 0.5 is the last value that costs nothing in motion. Raise it only if a shot still boils."}),
                 "hires_images": ("IMAGE", {"tooltip": "OPTIONAL, and the single biggest quality lever in this node.\n\nWire your FULL-RESOLUTION plate here (the EXR/source sequence). Detection still runs at the working resolution because that is what ViTPose wants and it is fast, but the face TILE is cut from this hi-res source instead.\n\nWhy it matters more than any crop_mode: on an 832x480 plate a face box measures about 46px, and that tile is upscaled ELEVEN times to reach the 512x512 the encoder needs - 99.2% of what the model reads is invented, and an eyeball at that scale is roughly 4 pixels across. There is no iris in 4 pixels. Every crop_mode was cropping the same starved image, which is why none of them fixed eye direction or micro-expression detail.\n\nSame framing, real pixels: 46px becomes 106px from a 1080p plate, 212px from 4K.\n\nIgnored (with a warning) if it is not larger than the working plate."}),
                 "retarget_image": ("IMAGE", {"tooltip": "Optional reference image of the TARGET character. When connected, the detected driver pose is RETARGETED onto this reference's body proportions and position (the same retarget V1 had): the reference's pose is detected, then get_retarget_pose maps the driver's motion onto it. Leave unconnected for straight detection (no retarget)."}),
@@ -3444,7 +3459,8 @@ class PoseAndFaceDetectionV2:
                 if _sr_mode == "lanczos":
                     _sr_out, _sr_note = _FSR._backend_lanczos(_u8)
                 else:
-                    _sr_out, _sr_note = _FSR._backend_comfy_upscale(_u8, str(face_sr_model))
+                    _sr_out, _sr_note = _FSR._backend_comfy_upscale(
+                        _u8, "" if str(face_sr_model) == "none" else str(face_sr_model))
                 _sr_out = _FSR.temporally_stabilise(
                     _sr_out, _u8, strength=float(face_sr_stabilise), window=5)
                 _sharp0 = float(np.mean([_FSR.sharpness(t) for t in _u8]))
