@@ -453,7 +453,7 @@ The result is a perfectly stable zoom level where only the centre moves.
 - Multi-person scenes where you want the bbox to adapt to different face sizes
 - Creative workflows where variable framing is desired
 
-**Best practice:** Leave it **True** for Wan Animate. The consistent framing produces much better animation results.
+**Best practice:** Leave it **True** for Wan Animate. A constant box size keeps the face tile from breathing in scale from frame to frame (no A/B on generated video is published yet).
 
 ---
 
@@ -941,7 +941,7 @@ iris_smoothing_strength: 0.0
 
 **Fix:**
 1. Enable `use_face_smoothing` with strength `0.6–0.8`
-2. Enable `use_constant_face_box` — this dramatically reduces crop instability
+2. Enable `use_constant_face_box` — it holds the crop size constant, which removes size jitter
 3. If jittering persists, increase `face_smoothing_strength`
 
 ### Face Crop Clipping Forehead/Chin
@@ -1003,17 +1003,21 @@ A: It works best when the eye occupies at least 20–30 pixels in width. Close-u
 A: Yes. Memory usage scales linearly with batch size. For very long videos (1000+ frames), process in segments if you run out of VRAM.
 
 **Q: What's the performance like?**
-A: On an RTX 3080 with CUDA, expect ~20–30 FPS for detection and pose estimation combined. CPU mode is significantly slower (~2–5 FPS).
+A: Not measured by us on a GPU yet. Detection and pose estimation run per frame on the ONNX provider you pick; the CPU provider is much slower than CUDA.
 
 ---
 
 ## 🌗 Results
 
-Tracking quality with V2 shows **significant improvement**:
+What has been measured (2026-11 revision note: claims without evidence were removed):
 
-- ✅ Stable bones — no jitter or vanishing limbs
-- ✅ Clean face crops — forehead and chin included
-- ✅ Accurate iris/gaze detection — pupils correctly located
+- Face crop: with `crop_mode` = default the face stays within about 1 px of the tile centre and fills the tile
+  (measured on a synthetic test rig; the per-mode numbers are in the `crop_mode` tooltip). Real footage is not yet
+  benchmarked.
+- Gaze: the detected gaze is written to `iris_data`, but Wan-Animate's face input is a ~20-number expression code
+  from the face tile with no iris channel, so eye direction cannot be steered through it. A ~15° bias remains on
+  in-the-wild footage (a model limitation, not a bug).
+- Body: keypoint smoothing reduces frame-to-frame jitter; no before/after jitter measurement is published yet.
 - ✅ Robust performance under difficult lighting
 - ✅ Smooth temporal transitions across frames
 
@@ -1036,15 +1040,11 @@ This contribution is shared in the hope it can be merged upstream and help impro
 
 The core of this V2 pack (17 nodes in all, measured 2026-11-03) is three nodes — `OnnxDetectionModelLoaderV2` (loads the YOLO person detector — YOLOv10m, the file Wan 2.2 ships — and the ViTPose ONNX checkpoints into one detector bundle), `PoseAndFaceDetectionV2` (per-frame whole-body 133-keypoint detection plus face crop and bbox extraction), and `DrawViTPoseV2` (renders the COCO-WholeBody skeleton with optional face/hand stick widths and head toggles). The `POSEDATA` bundle and rendered `IMAGE` skeleton match the schema the Wan-Animate sampler family expects.
 
-| Model family | Applicability |
+| Model | Use |
 |---|---|
-| **Wan 2.x Animate (human)** | Native. The skeleton IMAGE from `DrawViTPoseV2` is the human-pose conditioning channel for Wan-Animate; `face_bboxes` / `face_images` from `PoseAndFaceDetectionV2` feed the face conditioning channel. This is the V2 of that pipeline — improved face handling and hand keypoints over V1. |
-| **Wan 2.x Animate (animal)** | Not applicable here — use the sister pack `ComfyUI-WanAnimalPreprocess` (AP10k/APT36k animal ViTPose) for quadruped subjects. |
-| **Flux** | Indirect. The rendered skeleton is a generic conditioning IMAGE — wire it into a Flux ControlNet pose model when generating human stills with pose control. The face crops are useful as ID/IP-Adapter input. |
-| **Qwen-Image** | Indirect. Same pattern as Flux: use the skeleton as ControlNet pose conditioning if a Qwen-compatible pose ControlNet is loaded. |
-| **Z-Image** | Indirect. Use the skeleton as a conditioning image where Z-Image supports pose ControlNet. |
-| **GLM-Image** | Not currently applicable; GLM-Image does not yet expose a pose ControlNet path. |
-| **ERNIE-VL** | Not applicable; ERNIE-VL is a multimodal LLM rather than a diffusion sampler. |
+| **Wan 2.x Animate (human)** | What this pack is for: the `DrawViTPoseV2` skeleton is the pose input and `face_images` the face input. |
+| **Wan 2.x Animate (animals)** | Use the sister pack `ComfyUI-WanAnimalPreprocess` (AP-10K ViTPose). |
+| **Other image models (Flux, Qwen-Image ...)** | The skeleton is an ordinary OpenPose-style image, so a pose ControlNet for that model may accept it. Not tested here. |
 
 Wiring pattern for the canonical Wan-Animate V2 graph:
 
