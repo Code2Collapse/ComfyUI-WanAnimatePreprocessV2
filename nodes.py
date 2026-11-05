@@ -1276,7 +1276,7 @@ class OnnxDetectionModelLoaderV2:
                 f"yolo_model {yolo_model!r} has ONNX input shape "
                 f"[N,C,{yl_h},{yl_w}], but the YOLO detection path expects "
                 f"[N,C,640,640]. Pick a real YOLO person-detector ONNX "
-                f"(e.g. yolov8n.onnx / yoloxpose-s.onnx). The file you "
+                f"(e.g. yolov10m.onnx, the file Wan 2.2 ships). The file you "
                 f"selected looks like a pose model "
                 f"({'ViTPose' if (yl_h, yl_w) == (256, 192) else 'unknown'})."
             )

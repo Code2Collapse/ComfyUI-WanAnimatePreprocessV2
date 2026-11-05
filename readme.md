@@ -107,6 +107,11 @@ ComfyUI/models/detection/
 |-------|------|
 | YOLOv10m (recommended) | [yolov10m.onnx](https://huggingface.co/Wan-AI/Wan2.2-Animate-14B/blob/main/process_checkpoint/det/yolov10m.onnx) |
 
+Licences (checked 2026-11-05): the Wan2.2-Animate-14B repository that hosts `yolov10m.onnx` is labelled
+Apache-2.0; the upstream YOLOv10 project (THU-MIG/yolov10) is AGPL-3.0, and the ONNX file carries no separate
+licence. This pack only loads the file you download and contains no YOLOv10 code. Check the terms yourself
+before you redistribute the model file.
+
 ### ViTPose (Keypoint Estimation)
 
 | Model | Size | Link |
@@ -1029,7 +1034,7 @@ This contribution is shared in the hope it can be merged upstream and help impro
 
 ## Use in image/video generation pipelines (Flux / Qwen-Image / Wan / Z-Image / ERNIE-VL)
 
-This V2 pack ships three nodes — `OnnxDetectionModelLoaderV2` (loads YOLOv8 + ViTPose ONNX checkpoints into a unified detector bundle), `PoseAndFaceDetectionV2` (per-frame whole-body 133-keypoint detection plus face crop and bbox extraction), and `DrawViTPoseV2` (renders the COCO-WholeBody skeleton with optional face/hand stick widths and head toggles). The `POSEDATA` bundle and rendered `IMAGE` skeleton match the schema the Wan-Animate sampler family expects.
+The core of this V2 pack (17 nodes in all, measured 2026-11-03) is three nodes — `OnnxDetectionModelLoaderV2` (loads the YOLO person detector — YOLOv10m, the file Wan 2.2 ships — and the ViTPose ONNX checkpoints into one detector bundle), `PoseAndFaceDetectionV2` (per-frame whole-body 133-keypoint detection plus face crop and bbox extraction), and `DrawViTPoseV2` (renders the COCO-WholeBody skeleton with optional face/hand stick widths and head toggles). The `POSEDATA` bundle and rendered `IMAGE` skeleton match the schema the Wan-Animate sampler family expects.
 
 | Model family | Applicability |
 |---|---|
