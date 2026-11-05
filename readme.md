@@ -172,6 +172,8 @@ FLUX itself is NOT RUN here: it needs the 12B FLUX.1-Kontext-dev weights and a G
 
 Pose and Face Detection (V2): `face_sr_model` is now a list of the models in ComfyUI/models/upscale_models (it was
 a text box, so nothing was listed). Saved workflows keep loading with their old value (fixed 2026-11-05).
+`crop_mode` jitterless, auto and action show their own controls again (frame-0 anchor, key frames, smoothing,
+constant box, safety margin, containment). The node hid them as if those modes were retired (fixed 2026-11-05).
 
 ---
 

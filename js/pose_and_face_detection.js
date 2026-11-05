@@ -54,13 +54,15 @@ function applyVisibility(node) {
     const gazeLock   = !!get("gaze_lock_eyes")?.value;
     const blendGaze  = !!get("use_blendshape_gaze")?.value;
     const cropMode   = String(get("crop_mode")?.value ?? "default");
-    // Only expression_lock and default are live. Retired names still
-    // present on saved graphs are treated as expression_lock so the old
-    // jitterless / auto widget pile does not come back.
-    const exprLock   = cropMode !== "default";
-    const jitterless = false;
+    // L2.33: the Python offers default / expression_lock / jitterless / auto / action again ("the ones you asked to
+    // keep"), but this file still treated every non-default mode as expression_lock, so jitterless and auto lost the
+    // controls they read. Each mode now shows what its branch in nodes.py uses. Retired names still on saved graphs
+    // (central_face, reference_smooth) keep the expression_lock rules.
+    const jitterless = cropMode === "jitterless";
+    const auto       = cropMode === "auto";
+    const action     = cropMode === "action";
+    const exprLock   = !["default", "jitterless", "auto", "action"].includes(cropMode);
     const refSmooth  = false;
-    const auto       = false;
     const smoothing  = String(get("smoothing_method")?.value ?? "one_euro");
     const autoSm     = String(get("auto_smoothing_method")?.value ?? "legacy_ema");
     const cropActive = jitterless || auto;          // modes that BUILD their own box
@@ -106,23 +108,24 @@ function applyVisibility(node) {
         // is inert and stays hidden. They remain in INPUT_TYPES so existing
         // workflows keep loading with their values intact — widgets are matched
         // by position, and deleting them would shift every later value.
-        smoothing_method:           false,
-        crop_size_one_euro_beta:    false,
-        crop_gaussian_window:       false,
-        face_smoothing_strength:    false,
-        crop_one_euro_min_cutoff:   oneEuro,
-        crop_one_euro_beta:         oneEuro,
-        crop_safety_margin:         cropActive || refSmooth,
-        crop_containment_check:     cropActive,
-        crop_containment_tolerance:  cropActive && containOn,
-        preserve_face_aspect:       cropActive,
-        auto_smoothing_method:      auto,
+        // expression_lock keeps its earlier rules; jitterless / auto / action show what their branch reads
+        smoothing_method:           jitterless,
+        crop_size_one_euro_beta:    jitterless && method === "one_euro",
+        crop_gaussian_window:       (jitterless || (auto && faceSmooth)) && gaussian,
+        face_smoothing_strength:    (jitterless && emaLike) || (auto && faceSmooth),
+        crop_one_euro_min_cutoff:   oneEuro && (!auto || faceSmooth),
+        crop_one_euro_beta:         oneEuro && (!auto || faceSmooth),
+        crop_safety_margin:         jitterless || action || (auto && constBox) || refSmooth,
+        crop_containment_check:     jitterless || (auto && constBox),
+        crop_containment_tolerance:  ((jitterless || (auto && constBox)) && containOn) || action,
+        preserve_face_aspect:       jitterless || (auto && constBox),
+        auto_smoothing_method:      auto && faceSmooth,
         use_face_smoothing:         auto,
         use_constant_face_box:      auto,
         face_box_size_px:           (auto && constBox) || jitterless,
         frame0_cx:                  jitterless,
         frame0_cy:                  jitterless,
-        frame0_size:                jitterless,
+        frame0_size:                jitterless || action,
         keyframes_json:             jitterless,
         // --- gaze / iris ---------------------------------------------------
         // These land in pose_data. The pose conditioning image is a BODY
