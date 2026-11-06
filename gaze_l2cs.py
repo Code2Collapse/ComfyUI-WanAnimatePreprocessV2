@@ -32,6 +32,15 @@ from __future__ import annotations
 import logging
 import math
 import os
+
+try:  # owner D7.91 (L7.100): weights download only inside a node run with allow_download ticked
+    from ._download_policy import downloads_allowed as _downloads_allowed
+except ImportError:  # pragma: no cover - module run outside the package
+    try:
+        from _download_policy import downloads_allowed as _downloads_allowed  # type: ignore
+    except ImportError:
+        def _downloads_allowed():
+            return False
 from typing import Optional, Tuple
 
 import numpy as np
@@ -118,6 +127,13 @@ def get_pipeline(variant: str = "gaze360"):
 
     repo, fname = _WEIGHTS_HF[variant]
     weight_path = os.path.join(_gaze_dir(), fname)
+    if not os.path.exists(weight_path) and not _downloads_allowed():
+        msg = (f"[gaze_l2cs] L2CS weights '{fname}' are not installed and downloading is off - tick allow_download "
+               f"on Pose and Face Detection, or place the file at {weight_path} "
+               f"(from https://huggingface.co/{repo}). Falling back to the blendshape engine.")
+        print(msg, flush=True)
+        logger.warning(msg)
+        raise RuntimeError(msg)
     if not os.path.exists(weight_path):
         print(
             f"[gaze_l2cs] Weights NOT found at {weight_path} -- "

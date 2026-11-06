@@ -35,6 +35,15 @@
 # - Renamed nodes to V2 namespace; added RETURN_TYPES for iris/gaze/lip outputs
 
 import os
+
+try:  # owner D7.91 (L7.100): weights download only inside a node run with allow_download ticked
+    from ._download_policy import downloads_allowed as _downloads_allowed
+except ImportError:  # pragma: no cover - module run outside the package
+    try:
+        from _download_policy import downloads_allowed as _downloads_allowed  # type: ignore
+    except ImportError:
+        def _downloads_allowed():
+            return False
 import torch
 from tqdm import tqdm
 import numpy as np
@@ -2017,6 +2026,7 @@ class PoseAndFaceDetectionV2:
                 "retarget_image": ("IMAGE", {"tooltip": "Optional reference image of the TARGET character. When connected, the detected driver pose is RETARGETED onto this reference's body proportions and position (the same retarget V1 had): the reference's pose is detected, then get_retarget_pose maps the driver's motion onto it. Leave unconnected for straight detection (no retarget)."}),
                 "use_flux": ("BOOLEAN", {"default": False, "tooltip": "Enhanced retargeting via FLUX.1-Kontext-dev (Wan 2.2 Animate's third retarget mode). When ON with retarget_image connected, FLUX normalizes the reference AND the first template frame to a standard front-facing pose BEFORE retargeting, so retargeting starts from a neutral instead of carrying a 3/4-profile or head-tilt into the output. Recommended ONLY when the reference character is NOT front-facing; for a front-facing reference, basic retarget (use_flux off) is enough. Needs the FLUX.1-Kontext-dev model — set flux_kontext_path. The authors' caveat: FLUX.1-Kontext-dev has limited capability, consistency is not guaranteed; check the intermediate edited frames."}),
                 "flux_kontext_path": ("STRING", {"default": "", "tooltip": "Path to the FLUX.1-Kontext-dev diffusers checkpoint FOLDER. Download from https://huggingface.co/black-forest-labs/FLUX.1-Kontext-dev. Empty = look the model up via ComfyUI's folder_paths ('flux' / 'checkpoints' / 'unet' keys, in that order). Raises a clear error naming what was searched if nothing is found — never silently disables use_flux."}),
+                "allow_download": ("BOOLEAN", {"default": False, "tooltip": "Let this node download missing model files (gaze / depth / pose weights). Off: only installed files are used and the log says which file is missing and where it goes (owner rule D7.91). Appended last: saved workflows keep their values."}),
             },
         }
 
@@ -2045,7 +2055,17 @@ class PoseAndFaceDetectionV2:
     def IS_CHANGED(cls, **kwargs):
         return hash_args_and_kwargs(**kwargs)
 
-    def process(
+    def process(self, *args, allow_download=False, **kwargs):
+        """L7.100 (owner D7.91): model files may download only with allow_download ticked."""
+        try:
+            from ._download_policy import allow_downloads
+        except ImportError:  # pragma: no cover
+            import contextlib
+            allow_downloads = lambda flag: contextlib.nullcontext()  # noqa: E731
+        with allow_downloads(bool(allow_download)):
+            return self._process_entry(*args, **kwargs)
+
+    def _process_entry(
         self,
         model,
         images,
@@ -6034,6 +6054,13 @@ def _midas_hub_load(entry):
     import sys as _sys
 
     repo = os.path.join(torch.hub.get_dir(), "intel-isl_MiDaS_master")
+    if not _downloads_allowed():                 # owner D7.91 (L7.100): torch.hub fetches the repo AND the weights
+        ckpts = os.path.join(torch.hub.get_dir(), "checkpoints")
+        have_w = os.path.isdir(ckpts) and any(n.startswith("midas") for n in os.listdir(ckpts))
+        if not os.path.isdir(os.path.join(repo, "midas")) or (entry != "transforms" and not have_w):
+            raise RuntimeError(
+                "MiDaS (intel-isl/MiDaS via torch.hub) is not installed and downloading is off - tick allow_download "
+                f"on this node, or put the repo in {repo} and its weights in {ckpts}.")
     if not os.path.isdir(os.path.join(repo, "midas")):
         try:                                     # first use: let torch.hub download the repo (the import may fail)
             return torch.hub.load("intel-isl/MiDaS", entry, trust_repo=True)
@@ -6118,6 +6145,7 @@ class DepthPoseCannyCombinedV2:
                 "depthcrafter_guidance":   ("FLOAT", {"default": 1.0, "min": 0.1, "max": 10.0, "step": 0.1, "tooltip": "DepthCrafter only: classifier-free guidance."}),
                 "depthcrafter_window":     ("INT", {"default": 110, "min": 1, "max": 200, "tooltip": "DepthCrafter only: temporal window size."}),
                 "depthcrafter_overlap":    ("INT", {"default": 25, "min": 0, "max": 100, "tooltip": "DepthCrafter only: window overlap."}),
+                "allow_download": ("BOOLEAN", {"default": False, "tooltip": "Let this node download missing model files (gaze / depth / pose weights). Off: only installed files are used and the log says which file is missing and where it goes (owner rule D7.91). Appended last: saved workflows keep their values."}),
             },
         }
 
@@ -6684,7 +6712,17 @@ class DepthPoseCannyCombinedV2:
             return np.concatenate([top, bot], axis=1)
         return d
 
-    def process(
+    def process(self, *args, allow_download=False, **kwargs):
+        """L7.100 (owner D7.91): model files may download only with allow_download ticked."""
+        try:
+            from ._download_policy import allow_downloads
+        except ImportError:  # pragma: no cover
+            import contextlib
+            allow_downloads = lambda flag: contextlib.nullcontext()  # noqa: E731
+        with allow_downloads(bool(allow_download)):
+            return self._process_entry(*args, **kwargs)
+
+    def _process_entry(
         self, images, width, height,
         enable_depth, enable_pose, enable_canny,
         canny_threshold1, canny_threshold2, canny_aperture,

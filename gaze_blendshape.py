@@ -44,6 +44,15 @@ import logging
 import math
 import os
 import urllib.request
+
+try:  # owner D7.91 (L7.100): weights download only inside a node run with allow_download ticked
+    from ._download_policy import downloads_allowed as _downloads_allowed
+except ImportError:  # pragma: no cover - module run outside the package
+    try:
+        from _download_policy import downloads_allowed as _downloads_allowed  # type: ignore
+    except ImportError:
+        def _downloads_allowed():
+            return False
 from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
@@ -213,6 +222,10 @@ def _ensure_model_file() -> Optional[str]:
     if os.path.isfile(path) and os.path.getsize(path) > 100_000:
         return path
     if _DOWNLOAD_FAILED:
+        return None
+    if not _downloads_allowed():
+        logger.warning("[gaze] face_landmarker.task is not installed and downloading is off - tick allow_download on "
+                       "Pose and Face Detection, or place it at %s (from %s).", path, FACE_LANDMARKER_URL)
         return None
     try:
         logger.info(

@@ -101,6 +101,13 @@ All models go into:
 ComfyUI/models/detection/
 ```
 
+**Nothing downloads on its own (2026-11-06).** Pose and Face Detection, Depth + Pose + Canny and Pose 3D Refine (NLF)
+have an `allow_download` switch, last on the node and off by default; saved workflows keep their values. With it off,
+only installed files are used: the MediaPipe `face_landmarker.task`, the L2CS gaze weights, MiDaS (torch hub) and the
+NLF model. A missing one is named in the log or the error, with the folder it goes in. Tick `allow_download` to fetch
+it there. ETH-XGaze no longer downloads ImageNet weights it immediately overwrites, and the NLF model list no longer
+creates `models/nlf` at start-up.
+
 ### YOLO (Person Detection)
 
 | Model | Link |

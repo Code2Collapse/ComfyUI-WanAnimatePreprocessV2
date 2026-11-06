@@ -31,6 +31,15 @@ import logging
 import math
 import os
 
+try:  # owner D7.91 (L7.100): weights download only inside a node run with allow_download ticked
+    from .._download_policy import downloads_allowed as _downloads_allowed
+except ImportError:  # pragma: no cover - module run outside the package
+    try:
+        from _download_policy import downloads_allowed as _downloads_allowed  # type: ignore
+    except ImportError:
+        def _downloads_allowed():
+            return False
+
 import numpy as np
 
 log = logging.getLogger(__name__)
@@ -58,20 +67,21 @@ _NLF_URLS = [
 ]
 
 
-def _models_dir():
+def _models_dir(create=False):
     try:
         import folder_paths
 
         d = os.path.join(folder_paths.models_dir, "nlf")
     except Exception:  # noqa: BLE001
         d = os.path.join(os.path.dirname(__file__), "..", "..", "..", "models", "nlf")
-    os.makedirs(d, exist_ok=True)
+    if create:                       # L7.100: only a download creates the folder - never the node list at start-up
+        os.makedirs(d, exist_ok=True)
     return d
 
 
 def _list_nlf_models():
     d = _models_dir()
-    out = [f for f in os.listdir(d) if f.endswith(".torchscript")]
+    out = [f for f in os.listdir(d) if f.endswith(".torchscript")] if os.path.isdir(d) else []
     return out or [_NLF_FILENAME]
 
 
@@ -80,6 +90,11 @@ def _ensure_nlf(name):
     path = os.path.join(_models_dir(), name)
     if os.path.exists(path):
         return path
+    if not _downloads_allowed():     # owner D7.91 (L7.100)
+        raise FileNotFoundError(
+            f"NLF model '{name}' is not installed and downloading is off - tick allow_download on this node, or "
+            f"place the TorchScript file at {path} (see github.com/isarandi/nlf).")
+    _models_dir(create=True)
     import urllib.request
 
     part = path + ".part"
@@ -201,6 +216,9 @@ class WanPose3DRefineNLFV2:
                 "occlusion_fill": ("BOOLEAN", {"default": True,
                                                "tooltip": "Where ViTPose confidence is low, trust NLF's 3D projection."}),
             },
+            "optional": {
+                "allow_download": ("BOOLEAN", {"default": False, "tooltip": "Let this node download missing model files (gaze / depth / pose weights). Off: only installed files are used and the log says which file is missing and where it goes (owner rule D7.91). Appended last: saved workflows keep their values."}),
+            },
         }
 
     RETURN_TYPES = ("POSEDATA", "STRING")
@@ -209,7 +227,17 @@ class WanPose3DRefineNLFV2:
     CATEGORY = "WanAnimatePreprocess/Pose"
     DESCRIPTION = "Refine ViTPose POSEDATA with NLF 3D pose (jitter/occlusion/temporal) — Wan-Animate ready."
 
-    def refine(self, pose_data, images, nlf_model, device, blend_strength,
+    def refine(self, *args, allow_download=False, **kwargs):
+        """L7.100 (owner D7.91): model files may download only with allow_download ticked."""
+        try:
+            from .._download_policy import allow_downloads
+        except ImportError:  # pragma: no cover
+            import contextlib
+            allow_downloads = lambda flag: contextlib.nullcontext()  # noqa: E731
+        with allow_downloads(bool(allow_download)):
+            return self._refine_impl(*args, **kwargs)
+
+    def _refine_impl(self, pose_data, images, nlf_model, device, blend_strength,
                temporal_smoothing, smoothing_min_cutoff, smoothing_beta, occlusion_fill):
         from copy import deepcopy
 

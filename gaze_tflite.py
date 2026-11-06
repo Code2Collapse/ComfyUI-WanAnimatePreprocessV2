@@ -53,6 +53,15 @@ import io
 import logging
 import os
 import urllib.request
+
+try:  # owner D7.91 (L7.100): weights download only inside a node run with allow_download ticked
+    from ._download_policy import downloads_allowed as _downloads_allowed
+except ImportError:  # pragma: no cover - module run outside the package
+    try:
+        from _download_policy import downloads_allowed as _downloads_allowed  # type: ignore
+    except ImportError:
+        def _downloads_allowed():
+            return False
 import zipfile
 from typing import Any, Dict, Optional
 
@@ -106,6 +115,10 @@ def _ensure_task_file() -> Optional[str]:
     if os.path.isfile(path) and os.path.getsize(path) > 100_000:
         return path
     if _TASK_DOWNLOAD_FAILED:
+        return None
+    if not _downloads_allowed():
+        logger.warning("[gaze-tflite] face_landmarker.task is not installed and downloading is off - tick "
+                       "allow_download on Pose and Face Detection, or place it at %s.", path)
         return None
     try:
         logger.info("[gaze-tflite] Downloading face_landmarker.task ...")

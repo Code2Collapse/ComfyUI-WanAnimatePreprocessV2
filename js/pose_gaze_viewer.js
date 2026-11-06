@@ -520,6 +520,9 @@ app.registerExtension({
                     getHeight: () => PANEL_H,
                 });
                 w.computeSize = () => [this.size?.[0] || 320, PANEL_H];
+                // L7.100: a display widget must not be saved. fe 1.53 reads widget.serialize (the options flag alone
+                // still wrote a value), and that trailing value landed on the next Python widget appended before it.
+                w.serialize = false;
                 if (this.size && this.size[1] < 560) this.setSize([Math.max(this.size[0], 360), Math.max(this.size[1], 560)]);
                 // Hide the raw landmark-overrides widget — it's driven by the
                 // editor, not typed by hand (keep its value serialised).
@@ -562,6 +565,20 @@ app.registerExtension({
         nodeType.prototype.onRemoved = function () {
             try { this.__pgv?.dispose(); } catch (_) {}
             return onRemoved?.apply(this, arguments);
+        };
+
+        // L7.100: saves made before allow_download existed end with the viewer's value (''), which fe 1.53 restores
+        // by POSITION onto allow_download. Fix it by name: anything that is not a boolean there is "off".
+        const onConfigure = nodeType.prototype.onConfigure;
+        nodeType.prototype.onConfigure = function () {
+            const r = onConfigure?.apply(this, arguments);
+            try {
+                const ad = (this.widgets || []).find((wd) => wd.name === "allow_download");
+                if (ad && typeof ad.value !== "boolean") ad.value = false;
+            } catch (e) {
+                reportFailure("pose_gaze_viewer.onConfigure", e);
+            }
+            return r;
         };
     },
 });
