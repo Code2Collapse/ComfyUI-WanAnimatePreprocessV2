@@ -340,7 +340,10 @@ class WanPose3DRefineNLFV2:
 
     @classmethod
     def IS_CHANGED(cls, pose_data, images, nlf_model, device, blend_strength,
-                   temporal_smoothing, smoothing_min_cutoff, smoothing_beta, occlusion_fill):
+                   temporal_smoothing, smoothing_min_cutoff, smoothing_beta, occlusion_fill,
+                   allow_download=False, **_kwargs):
+        # L7.100 fix: core passes EVERY input (allow_download included); the fixed signature raised TypeError on each
+        # queue after 317c7d4. allow_download does not change the result, so it is not part of the fingerprint.
         import hashlib
 
         try:
