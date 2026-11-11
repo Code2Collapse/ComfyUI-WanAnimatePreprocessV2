@@ -7007,26 +7007,34 @@ class EARBlinkDetectorC2C:
             ear_r.append(_eye_aspect_ratio(face_kps, _RIGHT_EYE_IDX, W, H))
             ear_l.append(_eye_aspect_ratio(face_kps, _LEFT_EYE_IDX,  W, H))
 
-        # Mean of both eyes per frame (NaN-aware)
+        # Per frame (NaN-aware): the mean of both eyes (kept in the series output) and the MORE OPEN eye, which is what
+        # decides. "Both eyes below threshold" == "the more open eye below threshold"; the mean let a deep wink
+        # (0.0 + 0.3 -> 0.15) count as a blink (A22 audit P4, L2.34). One eye missing: that eye alone decides.
         ear_mean: List[float] = []
+        ear_open: List[float] = []
         for r, l in zip(ear_r, ear_l):
             vals = [v for v in (r, l) if v == v]  # filter NaN
             ear_mean.append(float(np.mean(vals)) if vals else float('nan'))
+            ear_open.append(float(max(vals)) if vals else float('nan'))
 
         # Causal median smoothing (odd window only)
         win = max(1, int(smooth_window) | 1)
-        ear_smooth = list(ear_mean)
-        if win > 1:
-            half = win // 2
-            for i in range(len(ear_smooth)):
-                lo = max(0, i - half)
-                hi = i + 1  # causal
-                chunk = [v for v in ear_mean[lo:hi] if v == v]
-                if chunk:
-                    ear_smooth[i] = float(np.median(chunk))
+
+        def _smooth(series: List[float]) -> List[float]:
+            out = list(series)
+            if win > 1:
+                half = win // 2
+                for i in range(len(out)):
+                    chunk = [v for v in series[max(0, i - half):i + 1] if v == v]   # causal
+                    if chunk:
+                        out[i] = float(np.median(chunk))
+            return out
+
+        ear_smooth = _smooth(ear_mean)
+        open_smooth = _smooth(ear_open)
 
         # Threshold + run-length consolidation
-        below = [(v == v) and (v < float(threshold)) for v in ear_smooth]
+        below = [(v == v) and (v < float(threshold)) for v in open_smooth]
         blink_mask = [False] * len(below)
         run_start = None
         for i, b in enumerate(below + [False]):
@@ -7061,6 +7069,7 @@ class EARBlinkDetectorC2C:
             "right": [None if v != v else round(v, 5) for v in ear_r],
             "left":  [None if v != v else round(v, 5) for v in ear_l],
             "mean_smoothed": [None if v != v else round(v, 5) for v in ear_smooth],
+            "open_eye_smoothed": [None if v != v else round(v, 5) for v in open_smooth],   # the series that decides
         }
         return (
             json.dumps(report),
