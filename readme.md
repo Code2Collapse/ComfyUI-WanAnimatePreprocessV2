@@ -3,10 +3,13 @@
 > ### 📖 Full node & parameter reference
 > **[NODE_REFERENCE.md](NODE_REFERENCE.md)** documents **every node in this pack**:
 > each input's type, default, valid range and what it actually does, plus every
-> output. It is generated directly from the live `NODE_CLASS_MAPPINGS`, so the
+> output, its source file and provenance. It is generated directly from the live registration, so the
 > descriptions there are the *same strings* you see as tooltips in ComfyUI and
 > cannot drift out of date. Start there when you want to know what a knob does;
 > read on here for how the pieces fit together.
+>
+> **[NODE_GUIDE.md](NODE_GUIDE.md)** says what each node is for, whether you need it, and how to wire the
+> main chain (detector -> optional editors -> Draw ViT Pose -> Wan-Animate).
 
 
 ## Improved Pose, Face & Iris Detection for Wan Video 2.2 Animate
