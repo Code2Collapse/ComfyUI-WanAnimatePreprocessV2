@@ -62,6 +62,10 @@ except ImportError:  # pragma: no cover - module run outside the package
     except ImportError:
         def _downloads_allowed():
             return False
+try:  # L5.08: resumable download with retries + Cancel
+    from ._fetch import fetch_file as _fetch_file
+except ImportError:  # pragma: no cover - module run outside the package
+    from _fetch import fetch_file as _fetch_file  # type: ignore
 import zipfile
 from typing import Any, Dict, Optional
 
@@ -122,9 +126,7 @@ def _ensure_task_file() -> Optional[str]:
         return None
     try:
         logger.info("[gaze-tflite] Downloading face_landmarker.task ...")
-        tmp = path + ".part"
-        urllib.request.urlretrieve(FACE_LANDMARKER_URL, tmp)
-        os.replace(tmp, path)
+        _fetch_file(FACE_LANDMARKER_URL, path, min_size=100_000)
         logger.info("[gaze-tflite] face_landmarker.task saved to %s", path)
         return path
     except Exception as exc:  # noqa: BLE001

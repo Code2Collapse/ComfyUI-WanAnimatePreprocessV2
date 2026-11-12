@@ -39,6 +39,10 @@ except ImportError:  # pragma: no cover - module run outside the package
     except ImportError:
         def _downloads_allowed():
             return False
+try:  # L5.08: resumable download with retries + Cancel
+    from .._fetch import fetch_file as _fetch_file
+except ImportError:  # pragma: no cover - module run outside the package
+    from _fetch import fetch_file as _fetch_file  # type: ignore
 
 import numpy as np
 
@@ -95,23 +99,17 @@ def _ensure_nlf(name):
             f"NLF model '{name}' is not installed and downloading is off - tick allow_download on this node, or "
             f"place the TorchScript file at {path} (see github.com/isarandi/nlf).")
     _models_dir(create=True)
-    import urllib.request
-
     part = path + ".part"
-    for url in _NLF_URLS:
+    for i, url in enumerate(_NLF_URLS):
         try:
             log.info("[pose3d_nlf] downloading NLF model: %s", url)
-            # A22 L9.121 W14: download to .part and rename only when complete - a partial file at `path` was taken
-            # for the model on the next run.
-            urllib.request.urlretrieve(url, part)
-            if os.path.getsize(part) > 1_000_000:
-                os.replace(part, path)
-                return path
-        except Exception as exc:  # noqa: BLE001
+            # A22 L9.121 W14: the file is renamed into place only when complete. L5.08: the .part is kept and
+            # resumed across retries and runs; a dropped connection no longer throws hundreds of MB away.
+            return _fetch_file(url, path, min_size=1_000_000)
+        except Exception as exc:  # noqa: BLE001 - ComfyUI's Cancel is a BaseException and passes through
             log.warning("[pose3d_nlf] download failed (%s): %s", url, exc)
-        finally:
-            if os.path.exists(part):
-                try:
+            if i + 1 < len(_NLF_URLS) and os.path.exists(part):
+                try:            # a partial file from one mirror is never resumed from another
                     os.remove(part)
                 except OSError:
                     pass

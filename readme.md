@@ -111,6 +111,11 @@ NLF model. A missing one is named in the log or the error, with the folder it go
 it there. ETH-XGaze no longer downloads ImageNet weights it immediately overwrites, and the NLF model list no longer
 creates `models/nlf` at start-up.
 
+**Downloads resume (2026-11-12).** The `face_landmarker.task` and NLF downloads keep their `.part` file: a dropped
+connection, a server error or ComfyUI's Cancel no longer throws the bytes away. The next try, or the next run, continues
+from where it stopped. Transient failures (server errors, rate limits, network drops) are retried three times. A file
+is only renamed into place once it is complete and large enough to be the real model.
+
 ### YOLO (Person Detection)
 
 | Model | Link |

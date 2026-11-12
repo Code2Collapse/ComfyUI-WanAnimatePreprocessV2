@@ -53,6 +53,10 @@ except ImportError:  # pragma: no cover - module run outside the package
     except ImportError:
         def _downloads_allowed():
             return False
+try:  # L5.08: resumable download with retries + Cancel
+    from ._fetch import fetch_file as _fetch_file
+except ImportError:  # pragma: no cover - module run outside the package
+    from _fetch import fetch_file as _fetch_file  # type: ignore
 from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
@@ -232,9 +236,7 @@ def _ensure_model_file() -> Optional[str]:
             "[gaze] Downloading face_landmarker.task from %s ...",
             FACE_LANDMARKER_URL,
         )
-        tmp = path + ".part"
-        urllib.request.urlretrieve(FACE_LANDMARKER_URL, tmp)
-        os.replace(tmp, path)
+        _fetch_file(FACE_LANDMARKER_URL, path, min_size=100_000)
         logger.info("[gaze] FaceLandmarker model saved to %s", path)
         return path
     except Exception as exc:  # noqa: BLE001
