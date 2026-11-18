@@ -1087,3 +1087,9 @@ A complete, auto-generated reference covering every node, return type and widget
 The sliders, number boxes, drop-downs, colour pickers and switches in this pack's node panels now carry their row
 label, so screen readers announce them by name. Typing 0 into a number box whose range starts below zero keeps 0
 (it used to jump to the minimum).
+
+## Model downloads switch (2026-11-18)
+
+This pack now also follows the C2C setting **Settings > C2C > Models & Downloads > Never download models** (from
+ComfyUI-CustomNodePacks): when it is on, no node downloads model weights, even with its own Allow Download ticked.
+The `C2C_NO_DOWNLOADS` environment variable still works and takes priority.
