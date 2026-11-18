@@ -1082,3 +1082,8 @@ Bounding-box outputs are also useful as input to crop / inpaint pipelines (e.g. 
 
 A complete, auto-generated reference covering every node, return type and widget exposed by this pack lives in [NODE_REFERENCE.md](./NODE_REFERENCE.md). It is regenerated whenever `INPUT_TYPES` change.
 
+## Accessibility update (2026-11-18)
+
+The sliders, number boxes, drop-downs, colour pickers and switches in this pack's node panels now carry their row
+label, so screen readers announce them by name. Typing 0 into a number box whose range starts below zero keeps 0
+(it used to jump to the minimum).
