@@ -122,6 +122,6 @@ def draw_body_skeleton_rgb(cv2, vis_rgb, meta, W, H, line_width=2, point_radius=
         drawn = 1
 
     if draw_hands:
-        _draw_ptset(cv2, vis_rgb, meta.get("keypoints_left_hand"), W, H, (120, 255, 0), 2)
-        _draw_ptset(cv2, vis_rgb, meta.get("keypoints_right_hand"), W, H, (0, 255, 140), 2)
+        _draw_ptset(cv2, vis_rgb, meta.get("keypoints_left_hand"), W, H, (120, 255, 0), max(1, point_radius // 2))
+        _draw_ptset(cv2, vis_rgb, meta.get("keypoints_right_hand"), W, H, (0, 255, 140), max(1, point_radius // 2))
     return drawn

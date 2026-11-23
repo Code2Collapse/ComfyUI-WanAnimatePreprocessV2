@@ -1112,13 +1112,24 @@ def draw_debug_overlay(frame_uint8, face_kps_norm, iris_data,
     """
     vis = frame_uint8.copy()
     kps_px = face_kps_norm[:, :2] * np.array([W, H])
+    # L2.31: marker sizes follow the frame (fixed 2-3 px dots vanished on a 4K
+    # plate and covered the face on a small one); 540p keeps the old sizes.
+    # Coordinates are ROUNDED, not truncated (int() put every landmark up to
+    # 1 px up-left of where it was detected).
+    _k = max(0.5, min(int(W), int(H)) / 540.0)
+
+    def _sz(v):
+        return max(1, int(round(v * _k)))
+
+    def _pt(x, y):
+        return int(round(float(x))), int(round(float(y)))
     kps_conf = face_kps_norm[:, 2]
 
     # --- Face landmarks ---
     for idx in range(1, min(69, len(kps_px))):
         if kps_conf[idx] < 0.05:
             continue
-        x, y = int(kps_px[idx, 0]), int(kps_px[idx, 1])
+        x, y = _pt(kps_px[idx, 0], kps_px[idx, 1])
         if not (0 <= x < W and 0 <= y < H):
             continue
         color = (180, 180, 180)
@@ -1126,18 +1137,18 @@ def draw_debug_overlay(frame_uint8, face_kps_norm, iris_data,
             if lo <= idx <= hi:
                 color = c
                 break
-        cv2.circle(vis, (x, y), 3, (255, 255, 255), -1, cv2.LINE_AA)
-        cv2.circle(vis, (x, y), 2, color, -1, cv2.LINE_AA)
+        cv2.circle(vis, (x, y), _sz(3), (255, 255, 255), -1, cv2.LINE_AA)
+        cv2.circle(vis, (x, y), _sz(2), color, -1, cv2.LINE_AA)
 
     # --- Eye contour polylines ---
     for eye_indices in _EYE_CONTOUR_INDICES:
         pts = []
         for i in eye_indices:
             if i < len(kps_px) and kps_conf[i] > 0.05:
-                pts.append([int(kps_px[i, 0]), int(kps_px[i, 1])])
+                pts.append(list(_pt(kps_px[i, 0], kps_px[i, 1])))
         if len(pts) >= 4:
             cv2.polylines(vis, [np.array(pts, np.int32)], True,
-                          (0, 255, 0), 1, cv2.LINE_AA)
+                          (0, 255, 0), _sz(1), cv2.LINE_AA)
 
     # --- Iris markers + gaze arrows ---
     for eye_key, gaze_key in [('right_iris', 'right_gaze'),
@@ -1146,41 +1157,40 @@ def draw_debug_overlay(frame_uint8, face_kps_norm, iris_data,
         gaze = iris_data.get(gaze_key)
         if iris is None or iris['confidence'] < 0.05:
             continue
-        ix, iy = int(iris['x']), int(iris['y'])
+        ix, iy = _pt(iris['x'], iris['y'])
         if 0 <= ix < W and 0 <= iy < H:
             cv2.drawMarker(vis, (ix, iy), (255, 0, 255),
-                           cv2.MARKER_CROSS, 14, 2, cv2.LINE_AA)
-            cv2.circle(vis, (ix, iy), 5, (255, 0, 255), 2, cv2.LINE_AA)
+                           cv2.MARKER_CROSS, _sz(14), _sz(2), cv2.LINE_AA)
+            cv2.circle(vis, (ix, iy), _sz(5), (255, 0, 255), _sz(2), cv2.LINE_AA)
             cv2.putText(vis, f"{iris['confidence']:.2f}",
-                        (ix + 8, iy - 8), cv2.FONT_HERSHEY_SIMPLEX,
-                        0.35, (255, 0, 255), 1, cv2.LINE_AA)
+                        (ix + _sz(8), iy - _sz(8)), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.35 * _k, (255, 0, 255), _sz(1), cv2.LINE_AA)
         if gaze and (abs(gaze['dx']) > 1e-4 or abs(gaze['dy']) > 1e-4):
             # Magnitude-aware arrow length: scale by gaze strength so
             # noise-level offsets shrink toward _GAZE_MIN_ARROW_LEN_PX.
             # dx/dy already carry the magnitude, so use a FIXED gain here -
             # scaling by magnitude_norm again would square it.
-            arrow_len = int(_GAZE_MAX_ARROW_LEN_PX)
-            ex = int(ix + gaze['dx'] * arrow_len)
-            ey = int(iy + gaze['dy'] * arrow_len)
+            arrow_len = float(_GAZE_MAX_ARROW_LEN_PX) * _k
+            ex, ey = _pt(ix + gaze['dx'] * arrow_len, iy + gaze['dy'] * arrow_len)
             cv2.arrowedLine(vis, (ix, iy), (ex, ey),
-                            (0, 200, 255), 2, cv2.LINE_AA, tipLength=0.3)
+                            (0, 200, 255), _sz(2), cv2.LINE_AA, tipLength=0.3)
 
     # --- Face bounding box (cyan) ---
     if face_bbox is not None:
         x1, x2, y1, y2 = face_bbox
-        cv2.rectangle(vis, (int(x1), int(y1)), (int(x2), int(y2)),
-                      (255, 255, 0), 2, cv2.LINE_AA)
-        cv2.putText(vis, "FACE", (int(x1), int(y1) - 5),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 0), 1, cv2.LINE_AA)
+        cv2.rectangle(vis, _pt(x1, y1), _pt(x2, y2),
+                      (255, 255, 0), _sz(2), cv2.LINE_AA)
+        cv2.putText(vis, "FACE", (_pt(x1, y1)[0], _pt(x1, y1)[1] - _sz(5)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45 * _k, (255, 255, 0), _sz(1), cv2.LINE_AA)
 
     # --- Body bounding box (green) ---
     if body_bbox is not None:
         bb = np.asarray(body_bbox).flatten()
         if len(bb) >= 4:
-            cv2.rectangle(vis, (int(bb[0]), int(bb[1])), (int(bb[2]), int(bb[3])),
-                          (0, 255, 0), 2, cv2.LINE_AA)
-            cv2.putText(vis, "BODY", (int(bb[0]), int(bb[1]) - 5),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1, cv2.LINE_AA)
+            cv2.rectangle(vis, _pt(bb[0], bb[1]), _pt(bb[2], bb[3]),
+                          (0, 255, 0), _sz(2), cv2.LINE_AA)
+            cv2.putText(vis, "BODY", (_pt(bb[0], bb[1])[0], _pt(bb[0], bb[1])[1] - _sz(5)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45 * _k, (0, 255, 0), _sz(1), cv2.LINE_AA)
 
     return vis
 
@@ -2542,14 +2552,20 @@ class PoseAndFaceDetectionV2:
         # and, because it is a temporal filter, contaminates the neighbouring
         # frames too. A handful of failed detections is enough to pull the crop
         # off the face for a long run of frames.
-        # Retired crop modes (central_face / jitterless / auto /
-        # reference_smooth) were slicing the SAME detected face. central_face
-        # additionally SHRANK it to eyebrow-mouth, which on a wide 832x480
-        # plate produced a 46x46 tile (11x upsample, ~4px eyeballs). They
-        # all now use the full 68-point box the encoder was trained on.
-        # Saved graphs keep loading; the name is remapped once here.
+        # Retired crop modes (central_face / reference_smooth) were slicing the
+        # SAME detected face. central_face additionally SHRANK it to
+        # eyebrow-mouth, which on a wide 832x480 plate produced a 46x46 tile
+        # (11x upsample, ~4px eyeballs). They now use the full 68-point box the
+        # encoder was trained on. Saved graphs keep loading; the name is
+        # remapped once here.
+        # L2.31: jitterless and auto were in this set too, although 13d36c6
+        # put them back in the dropdown and L2.33 showed their controls again -
+        # so both ran expression_lock and every control they show did nothing
+        # (measured: byte-identical boxes to expression_lock,
+        # docs/evidence/L2.31/expression_drift_BEFORE.json). They run their own
+        # branches below again.
         _retired_crop = {
-            "central_face", "auto", "jitterless", "reference_smooth",
+            "central_face", "reference_smooth",
         }
         if str(crop_mode) in _retired_crop:
             logging.getLogger(__name__).info(
@@ -2722,13 +2738,19 @@ class PoseAndFaceDetectionV2:
             # exists to remove.
             from .action_planner import ActionPlanError, plan_action_boxes
 
+            # L2.31: face boxes here are (x1, x2, y1, y2); the planner reads and
+            # returns (x0, y0, x1, y1). Handing it the face boxes unconverted
+            # made "detected" mean y1 > x1, so on an ordinary landscape frame
+            # every face counted as missing and the node stopped ("no frame has
+            # a detected face"), and the boxes it did return were read in the
+            # wrong order. Convert in, convert back out.
             _det_flags = [
-                (float(b[2]) - float(b[0])) > 1.0 and (float(b[3]) - float(b[1])) > 1.0
+                (float(b[1]) - float(b[0])) > 1.0 and (float(b[3]) - float(b[2])) > 1.0
                 for b in raw_face_bboxes
             ]
             try:
                 _plan = plan_action_boxes(
-                    [[float(v) for v in b[:4]] for b in raw_face_bboxes],
+                    [[float(b[0]), float(b[2]), float(b[1]), float(b[3])] for b in raw_face_bboxes],
                     image_w=W,
                     image_h=H,
                     size=(float(frame0_size) if int(frame0_size) > 0 else None),
@@ -2740,9 +2762,10 @@ class PoseAndFaceDetectionV2:
                 raise RuntimeError(
                     "PoseAndFaceDetectionV2: " + str(exc)
                 ) from exc
-            log.info("[WanAnimateV2] %s", _plan.report)
-            face_bboxes = [
-                (float(b[0]), float(b[1]), float(b[2]), float(b[3]))
+            # L2.31: `log` is not defined in this module (NameError on every action run)
+            logging.getLogger(__name__).info("[WanAnimateV2] %s", _plan.report)
+            face_bboxes = [   # planner (x0, y0, x1, y1) -> face box (x1, x2, y1, y2)
+                (float(b[0]), float(b[2]), float(b[1]), float(b[3]))
                 for b in _plan.boxes
             ]
         elif reference_smooth or expression_lock:
@@ -5115,7 +5138,10 @@ class PoseAndFaceDetectionV2:
             # body + face + hands + iris + gaze, no second node to wire).
             try:
                 from .nodes_extras.pose_overlay import draw_body_skeleton_rgb as _draw_body
-                _draw_body(cv2, vis, pose_metas[idx], W, H)
+                _ovk = max(0.5, min(int(W), int(H)) / 540.0)   # L2.31: same scale as draw_debug_overlay
+                _draw_body(cv2, vis, pose_metas[idx], W, H,
+                           line_width=max(1, int(round(2 * _ovk))),
+                           point_radius=max(1, int(round(4 * _ovk))))
             except Exception as _ov_exc:                                  # noqa: BLE001
                 logging.getLogger(__name__).debug(
                     "body-skeleton overlay skipped on frame %d: %s", idx, _ov_exc,
@@ -5220,9 +5246,23 @@ class PoseAndFaceDetectionV2:
                             _skel.append([round(float(_kp[0]) * float(W), 1),
                                           round(float(_kp[1]) * float(H), 1),
                                           round(_c, 3)])
+                # L2.31: the 68 face landmarks (dlib order, rows 1-68 of the
+                # 69-row face array; row 0 is a body anchor) in SOURCE px +
+                # confidence, so the viewer can draw the face the crop and the
+                # expression edits are built from - it showed iris dots only.
+                _face = []
+                _kp_face = pose_metas[_fi].get('keypoints_face') if _fi < len(pose_metas) else None
+                if _kp_face is not None:
+                    _kf_arr = np.asarray(_kp_face, dtype=np.float32)
+                    if _kf_arr.ndim == 2 and _kf_arr.shape[0] >= 69:
+                        for _r in _kf_arr[1:69]:
+                            _face.append([round(float(_r[0]) * float(W), 1),
+                                          round(float(_r[1]) * float(H), 1),
+                                          round(float(_r[2]) if _r.shape[0] > 2 else 1.0, 3)])
                 _viewer_frames.append({
                     "frame": _fi,
                     "skeleton": _skel,
+                    "face": _face,
                     "right_iris": [round(float(_ri.get('x', 0.0)), 1),
                                    round(float(_ri.get('y', 0.0)), 1)],
                     "left_iris":  [round(float(_li.get('x', 0.0)), 1),
@@ -5624,6 +5664,22 @@ class DrawViTPoseV2:
                 and (int(src_size[0]), int(src_size[1])) != (int(height), int(width)):
             canvas_hw = (int(src_size[0]), int(src_size[1]))
 
+        # L2.31: body_stick_width / hand_stick_width are OUTPUT pixels (the
+        # tooltip says so). Since W6 a non-retargeted pose is drawn on a
+        # source-size canvas and then shrunk to the target, which shrank an
+        # explicit width with it (4 px came out as 1-2 px from a 1080p plate).
+        # Draw it at width / scale on the source canvas so it lands at the
+        # requested width. -1 (auto) keeps the official Wan2.2 behaviour: auto
+        # is derived from the canvas it is drawn on, exactly as
+        # process_pipepline.py does.
+        _body_sw, _hand_sw = body_stick_width, hand_stick_width
+        if canvas_hw is not None and transform is not None and transform[0] > 0:
+            _s = float(transform[0])
+            if int(body_stick_width) > 0:
+                _body_sw = max(1, int(round(int(body_stick_width) / _s)))
+            if int(hand_stick_width) > 0:
+                _hand_sw = max(1, int(round(int(hand_stick_width) / _s)))
+
         comfy_pbar = ProgressBar(len(pose_metas))
         progress = 0
         pose_images = []
@@ -5646,8 +5702,8 @@ class DrawViTPoseV2:
                 meta,
                 draw_hand=draw_hand,
                 draw_head=draw_head,
-                body_stick_width=body_stick_width,
-                hand_stick_width=hand_stick_width,
+                body_stick_width=_body_sw,
+                hand_stick_width=_hand_sw,
                 threshold=pose_draw_threshold,
             )
             pose_image = padding_resize(pose_image, height, width)

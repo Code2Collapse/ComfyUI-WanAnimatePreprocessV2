@@ -4,46 +4,10 @@
 // (or the relevant crop_mode is selected); otherwise it is removed and the node
 // shrinks. Re-applied whenever a controlling widget changes.
 import { app } from "../../scripts/app.js";
+import { setHidden } from "./_widget_visibility.js";
 
-function setHidden(w, hidden) {
-    if (!w) return;
-    if (hidden) {
-        if (!("__mec_origType" in w)) w.__mec_origType = w.type;
-        if (!("__mec_origComputeSize" in w)) w.__mec_origComputeSize = w.computeSize;
-        w.type = "hidden";
-        w.computeSize = () => [0, -4];
-        w.hidden = true;
-        const el = w.element;
-        if (el) {
-            if (!("__mec_origElDisplay" in w)) w.__mec_origElDisplay = el.style.display;
-            el.style.display = "none";
-            const wrap = el.parentElement;
-            if (wrap && wrap.classList?.contains("dom-widget")) {
-                if (!("__mec_origWrapDisplay" in w)) w.__mec_origWrapDisplay = wrap.style.display;
-                wrap.style.display = "none";
-            }
-        }
-    } else {
-        if ("__mec_origType" in w) { w.type = w.__mec_origType; delete w.__mec_origType; }
-        if ("__mec_origComputeSize" in w) {
-            const cs = w.__mec_origComputeSize;
-            if (cs === undefined) delete w.computeSize; else w.computeSize = cs;
-            delete w.__mec_origComputeSize;
-        }
-        w.hidden = false;
-        const el = w.element;
-        if (el) {
-            el.style.display = ("__mec_origElDisplay" in w) ? (w.__mec_origElDisplay ?? "") : "";
-            delete w.__mec_origElDisplay;
-            const wrap = el.parentElement;
-            if (wrap && wrap.classList?.contains("dom-widget")) {
-                wrap.style.display = ("__mec_origWrapDisplay" in w) ? (w.__mec_origWrapDisplay ?? "") : "";
-                delete w.__mec_origWrapDisplay;
-            }
-        }
-    }
-}
-
+// L2.31: the pack's shared show/hide helper (also hides a DOM widget's wrapper and sets options.hidden) instead of a
+// local copy, so both conditional-UI files behave the same.
 function applyVisibility(node) {
     const get = (n) => node.widgets?.find(w => w.name === n);
     const useBlur    = !!get("use_blur_for_pose")?.value;
@@ -92,6 +56,8 @@ function applyVisibility(node) {
     const hasRetarget = Array.isArray(node.inputs) && node.inputs.some(
         (s) => s && s.name === "retarget_image" && s.link != null);
     const useFlux     = !!get("use_flux")?.value;
+    const faceSr      = String(get("face_sr")?.value ?? "none");
+    const gazeUsed    = String(get("apply_gaze_to_face_image")?.value ?? "off") !== "off";
 
     // visible[name] = true → show; everything not listed is always shown.
     const visible = {
@@ -133,32 +99,32 @@ function applyVisibility(node) {
         // so none of it reaches the model as conditioning — it only populates
         // this node's iris/pupil/debug OUTPUTS.
         //
-        // USER CUT (2026-08-13): the gaze stack is HIDDEN entirely now.
-        // motion_dim=20 has no gaze channel and the pose image has no iris,
-        // so NONE of these widgets can move the rendered eyes — they only
-        // feed the iris_data/debug outputs (which the user does not
-        // consume) and the pupil-xy outputs (which run on the detector
-        // result regardless of these knobs). Hiding them removes the
-        // "eye direction going off / yapping" surface area without losing
-        // any reachable effect. They stay in INPUT_TYPES so saved workflows
-        // keep loading (widgets match by position). To re-expose a knob
-        // for experimentation, flip its `false` to a condition here.
-        use_iris_smoothing:         false,
-        iris_smoothing_strength:    false,
-        iris_smoothing_method:      false,
-        iris_one_euro_min_cutoff:   false,
-        iris_one_euro_beta:         false,
-        gaze_lock_eyes:              false,
-        gaze_lock_strength:         false,
-        use_blendshape_gaze:         false,
-        gaze_one_euro_min_cutoff:   false,
-        gaze_one_euro_beta:         false,
-        gaze_max_yaw_deg:           false,
-        gaze_max_pitch_deg:         false,
-        gaze_kalman_meas_std_deg:   false,
-        gaze_kalman_process_std:    false,
-        gaze_calibration_frame:     false,
-        gaze_engine:                false,
+        // USER CUT (2026-08-13) hid the gaze stack entirely: motion_dim=20 has
+        // no gaze channel and the pose image has no iris, so these knobs cannot
+        // steer the face code. L2.31 (owner 2026-10-08 "parameters vanish /
+        // hidden"): they DO decide the pixels apply_gaze_to_face_image warps
+        // into face_images (warp / overlay / replace reach the model), and with
+        // that switch on there was no way to tune or even see the engine
+        // driving it. So: still hidden while apply_gaze_to_face_image = off
+        // (the default - the node stays compact), shown, each behind its own
+        // parent toggle, as soon as the warp uses them. They stay in
+        // INPUT_TYPES and in this order so saved workflows keep their values.
+        use_iris_smoothing:         gazeUsed,
+        iris_smoothing_method:      gazeUsed && irisSmooth,
+        iris_smoothing_strength:    gazeUsed && irisSmooth && irisMethod === "ema",
+        iris_one_euro_min_cutoff:   gazeUsed && irisSmooth && irisMethod === "one_euro",
+        iris_one_euro_beta:         gazeUsed && irisSmooth && irisMethod === "one_euro",
+        gaze_lock_eyes:             gazeUsed,
+        gaze_lock_strength:         gazeUsed && gazeLock,
+        use_blendshape_gaze:        gazeUsed,
+        gaze_one_euro_min_cutoff:   gazeUsed,
+        gaze_one_euro_beta:         gazeUsed,
+        gaze_max_yaw_deg:           gazeUsed,
+        gaze_max_pitch_deg:         gazeUsed,
+        gaze_kalman_meas_std_deg:   gazeUsed && kalmanEngine,
+        gaze_kalman_process_std:    gazeUsed && kalmanEngine,
+        gaze_calibration_frame:     gazeUsed,
+        gaze_engine:                gazeUsed,
         // --- pixel edits to face_images (these DO reach the model) ---------
         eye_open_mode:              eyesOpen,
         eye_open_blink_ear:         eyesOpen && String(get("eye_open_mode")?.value) === "blinks_only",
@@ -171,10 +137,19 @@ function applyVisibility(node) {
         // reference. flux_kontext_path follows the toggle.
         use_flux:                   hasRetarget,
         flux_kontext_path:          hasRetarget && useFlux,
+        // --- face super-resolution (L2.31) --------------------------------
+        // face_sr_model is read only by comfy_upscale; the stabiliser by any SR mode.
+        face_sr_model:              faceSr === "comfy_upscale",
+        face_sr_stabilise:          faceSr !== "none",
     };
+    // L2.31: only the widgets this rule set owns. Every other widget is left as it is - re-showing them all here
+    // undid pose_gaze_viewer.js hiding landmark_overrides_json (editor-driven, never typed by hand).
     for (const w of node.widgets) {
-        setHidden(w, (w.name in visible) ? !visible[w.name] : false);
+        if (w.name in visible) setHidden(w, !visible[w.name]);
     }
+    // Measured live (L2.31, fe 1.53.10): Nodes 2.0 drops a widget whose type is "hidden" from its rows and takes the
+    // node height written here, in both renderers. vueFitNodeHeight made the node GROW on every change (1310 -> 2462
+    // px), so it is not used.
     const sz = node.computeSize();
     node.size[0] = Math.max(node.size[0], sz[0]);
     node.size[1] = sz[1];
@@ -210,7 +185,7 @@ app.registerExtension({
                 "crop_containment_check", "auto_smoothing_method",
                 "force_eyes_open", "eye_open_mode",
                 "gaze_engine", "eye_align_mode", "au_amplify",
-                "use_flux",
+                "use_flux", "face_sr", "apply_gaze_to_face_image",
             ]) {
                 hookWidget(this, n);
             }

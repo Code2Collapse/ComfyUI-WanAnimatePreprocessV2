@@ -195,6 +195,24 @@ a text box, so nothing was listed). Saved workflows keep loading with their old 
 `crop_mode` jitterless, auto and action show their own controls again (frame-0 anchor, key frames, smoothing,
 constant box, safety margin, containment). The node hid them as if those modes were retired (fixed 2026-11-05).
 
+Fixed 2026-11-23 (L2.31):
+- `crop_mode` jitterless and auto now really run. Both still ran expression_lock, so every control they show did
+  nothing (the boxes were identical to expression_lock's). jitterless locks one crop size again; auto follows its own
+  smoothing / constant-box settings. A workflow saved with one of these modes now gets that mode.
+- `crop_mode` action works. It stopped with "no frame has a detected face" on ordinary landscape footage (the face
+  boxes reached the planner in the wrong order) and, past that, with a NameError.
+- `face_sr_model` shows only for `face_sr = comfy_upscale`, `face_sr_stabilise` only when `face_sr` is not none.
+- The gaze settings (gaze engine, gaze lock, Kalman, iris smoothing) show when `apply_gaze_to_face_image` is warp,
+  overlay or replace, the one switch in this node that uses them; with it off they stay hidden as before.
+- `debug_image`: landmarks are drawn where they were detected (they were truncated up to 1 px up-left) and marker
+  sizes follow the frame size (same as before at 540p; they vanished on a 4K plate).
+- The viewer draws the 68 face landmarks (new `face` chip), colours the skeleton like the real Wan pose image and no
+  longer draws dots for joints the detector did not find.
+
+Draw ViT Pose (V2), fixed 2026-11-23 (L2.31): an explicit `body_stick_width` / `hand_stick_width` is the width in the
+output image again when the source video is larger than the output (it came out 2-3x thinner). `-1` (auto) is
+unchanged and matches Wan2.2's own drawing.
+
 ---
 
 ### 2. Pose and Face Detection (V2)

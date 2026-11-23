@@ -3,33 +3,10 @@
 //   iris_radius / iris_min_confidence / iris_color  -> only when draw_iris
 //   gaze_arrow_len                                   -> only when draw_gaze
 import { app } from "../../scripts/app.js";
+import { setHidden } from "./_widget_visibility.js";
 
-function setHidden(w, hidden) {
-    if (!w) return;
-    if (hidden) {
-        if (!("__c2c_origType" in w)) w.__c2c_origType = w.type;
-        if (!("__c2c_origComputeSize" in w)) w.__c2c_origComputeSize = w.computeSize;
-        w.type = "hidden";
-        w.computeSize = () => [0, -4];
-        w.hidden = true;
-        const el = w.element;
-        if (el) {
-            if (!("__c2c_origElDisplay" in w)) w.__c2c_origElDisplay = el.style.display;
-            el.style.display = "none";
-        }
-    } else {
-        if ("__c2c_origType" in w) { w.type = w.__c2c_origType; delete w.__c2c_origType; }
-        if ("__c2c_origComputeSize" in w) {
-            const cs = w.__c2c_origComputeSize;
-            if (cs === undefined) delete w.computeSize; else w.computeSize = cs;
-            delete w.__c2c_origComputeSize;
-        }
-        w.hidden = false;
-        const el = w.element;
-        if (el) { el.style.display = ("__c2c_origElDisplay" in w) ? (w.__c2c_origElDisplay ?? "") : ""; delete w.__c2c_origElDisplay; }
-    }
-}
-
+// L2.31: the pack's shared show/hide helper (also hides a DOM widget's wrapper and sets options.hidden) instead of a
+// local copy, so both conditional-UI files behave the same.
 function applyVisibility(node) {
     const get = (n) => node.widgets?.find(w => w.name === n);
     // face_images and reference_expression_coeffs_json gate their sub-options
@@ -58,8 +35,11 @@ function applyVisibility(node) {
         top_k_aus:           hasRef,
     };
     for (const w of node.widgets) {
-        setHidden(w, (w.name in visible) ? !visible[w.name] : false);
+        if (w.name in visible) setHidden(w, !visible[w.name]);
     }
+    // Measured live (L2.31, fe 1.53.10): Nodes 2.0 drops a widget whose type is "hidden" from its rows and takes the
+    // node height written here, in both renderers. vueFitNodeHeight made the node GROW on every change (1310 -> 2462
+    // px), so it is not used.
     const sz = node.computeSize();
     node.size[0] = Math.max(node.size[0], sz[0]);
     node.size[1] = sz[1];

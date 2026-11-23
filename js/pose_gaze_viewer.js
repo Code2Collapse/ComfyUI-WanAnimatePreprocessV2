@@ -32,12 +32,31 @@ const PANEL_H    = 340;
 const JOINT_MIN_CONF = 0.5;
 const _ok = (p) => !!p && (p.length < 3 || p[2] >= JOINT_MIN_CONF);
 
+// L2.31: limbs in the colours of the real Wan pose image (official draw_aapose_new limbSeq / colors, limbs at 60 %),
+// so what the viewer shows is what the sampler gets. Edge i uses LIMB_RGB[i]; joint j uses LIMB_RGB[j].
 const SKELETON_EDGES = [
     [1, 2], [1, 5], [2, 3], [3, 4], [5, 6], [6, 7],
     [1, 8], [8, 9], [9, 10],
     [1, 11], [11, 12], [12, 13],
-    [1, 0], [0, 14], [0, 15], [14, 16], [15, 17],
+    [1, 0], [0, 14], [14, 16], [0, 15], [15, 17],
+    [13, 18], [10, 19],
 ];
+const LIMB_RGB = [
+    [255, 0, 0], [255, 85, 0], [255, 170, 0], [255, 255, 0], [170, 255, 0], [85, 255, 0], [0, 255, 0],
+    [0, 255, 85], [0, 255, 170], [0, 255, 255], [0, 170, 255], [0, 85, 255], [0, 0, 255], [85, 0, 255],
+    [170, 0, 255], [255, 0, 255], [255, 0, 170], [255, 0, 85], [200, 200, 0], [100, 100, 0],
+];
+const _rgb = (c, k = 1) => `rgb(${Math.round(c[0] * k)},${Math.round(c[1] * k)},${Math.round(c[2] * k)})`;
+
+// L2.31: the 68 face landmarks (iBUG order) the backend now sends per frame, drawn as contours.
+const FACE_MIN_CONF = 0.3;
+const FACE_GROUPS = [   // [from, to, closed, colour token]
+    [0, 16, false, "peach"], [17, 21, false, "peach"], [22, 26, false, "peach"],
+    [27, 30, false, "yellow"], [31, 35, false, "yellow"],
+    [36, 41, true, "teal"], [42, 47, true, "teal"],
+    [48, 59, true, "pink"], [60, 67, true, "pink"],
+];
+const _faceOk = (p) => !!p && p.length >= 2 && (p.length < 3 || p[2] >= FACE_MIN_CONF);
 
 // Decoded-image cache keyed by data-URL / src (avoid re-decoding each render).
 const IMG_CACHE = new Map();
@@ -112,7 +131,7 @@ function makePanel(node) {
     spacer.style.cssText = "flex:1 1 auto;";
     header.append(title, engineEl, spacer);
 
-    const state = { skel: true, iris: true, gaze: true, edit: false };
+    const state = { skel: true, face: true, iris: true, gaze: true, edit: false };
     const mkChip = (label, key, getColor, onToggle) => {
         const b = document.createElement("button");
         b.type = "button";
@@ -135,6 +154,7 @@ function makePanel(node) {
         mkChip("🦴 skeleton", "skel", () => C.blue),
         mkChip("👁 iris", "iris", () => C.red),
         mkChip("↗ gaze", "gaze", () => C.teal),
+        mkChip("◡ face", "face", () => C.peach),
     );
     // Edit mode — turns the skeleton into draggable handles that CORRECT the
     // detection. When on, the skeleton chip is forced visible so joints show.
@@ -276,8 +296,9 @@ function makePanel(node) {
             ctx.imageSmoothingEnabled = true; ctx.imageSmoothingQuality = "high";
             ctx.drawImage(bdImg, ix, iy, iw, ih);
             if (!srcW) { srcW = bdImg.naturalWidth; srcH = bdImg.naturalHeight; }
-        } else {
-            // Empty state — clear invitation, never a blank void.
+        } else if (!meta?.frames?.[frameIdx]) {
+            // Empty state — clear invitation, never a blank void. (L2.31: only when there is no detection to draw;
+            // a run without previews drew this text under the skeleton.)
             ctx.fillStyle = C.dim;
             ctx.globalAlpha = 0.55;
             ctx.textAlign = "center"; ctx.textBaseline = "middle";
@@ -293,6 +314,8 @@ function makePanel(node) {
             ctx.fillText("the skeleton, iris and gaze appear here on the frame", W / 2, H / 2 + 20);
             ctx.globalAlpha = 1;
             ctx.textAlign = "left"; ctx.textBaseline = "alphabetic";
+        }
+        if (!bdImg) {
             // Even without a backdrop, letterbox the overlay to the SOURCE
             // aspect ratio so the skeleton isn't stretched (and drag hit-tests
             // stay square). Otherwise it fills the canvas non-uniformly.
@@ -310,13 +333,34 @@ function makePanel(node) {
             const px = (x) => ix + x * sx, py = (y) => iy + y * sy;
             lastMap = { ix, iy, sx, sy, srcW, srcH };   // for edit hit-testing
 
-            if (state.skel && Array.isArray(frame.skeleton)) {
-                ctx.strokeStyle = C.blue; ctx.lineWidth = 2;
-                for (const [a, b] of SKELETON_EDGES) {
-                    const pa = frame.skeleton[a], pb = frame.skeleton[b];
-                    if (!_ok(pa) || !_ok(pb)) continue;
-                    ctx.beginPath(); ctx.moveTo(px(pa[0]), py(pa[1])); ctx.lineTo(px(pb[0]), py(pb[1])); ctx.stroke();
+            if (state.face && Array.isArray(frame.face) && frame.face.length >= 68) {
+                const F = frame.face;
+                ctx.lineWidth = 1;
+                for (const [from, to, closed, tok] of FACE_GROUPS) {
+                    const col = C[tok] || C.peach;
+                    ctx.strokeStyle = col; ctx.fillStyle = col; ctx.globalAlpha = 0.85;
+                    const last = closed ? to + 1 : to;
+                    for (let i = from; i < last; i++) {
+                        const a = F[i], b = F[i === to ? from : i + 1];
+                        if (!_faceOk(a) || !_faceOk(b)) continue;
+                        ctx.beginPath(); ctx.moveTo(px(a[0]), py(a[1])); ctx.lineTo(px(b[0]), py(b[1])); ctx.stroke();
+                    }
+                    ctx.globalAlpha = 1;
+                    for (let i = from; i <= to; i++) {
+                        if (!_faceOk(F[i])) continue;
+                        ctx.beginPath(); ctx.arc(px(F[i][0]), py(F[i][1]), 1.6, 0, Math.PI * 2); ctx.fill();
+                    }
                 }
+                ctx.globalAlpha = 1;
+            }
+            if (state.skel && Array.isArray(frame.skeleton)) {
+                ctx.lineWidth = 2;
+                SKELETON_EDGES.forEach(([a, b], i) => {
+                    const pa = frame.skeleton[a], pb = frame.skeleton[b];
+                    if (!_ok(pa) || !_ok(pb)) return;
+                    ctx.strokeStyle = _rgb(LIMB_RGB[i], 0.6);
+                    ctx.beginPath(); ctx.moveTo(px(pa[0]), py(pa[1])); ctx.lineTo(px(pb[0]), py(pb[1])); ctx.stroke();
+                });
                 if (state.edit) {
                     // Grabbable handles: ring + fill, larger; hovered/dragged
                     // joint highlighted; corrected joints tinted mauve.
@@ -334,11 +378,12 @@ function makePanel(node) {
                         ctx.stroke();
                     }
                 } else {
-                    ctx.fillStyle = C.green;
-                    for (const p of frame.skeleton) {
-                        if (!p) continue;
+                    // L2.31: undetected joints (stale coordinates) are not drawn - same gate as the limbs.
+                    frame.skeleton.forEach((p, j) => {
+                        if (!_ok(p)) return;
+                        ctx.fillStyle = _rgb(LIMB_RGB[j] || LIMB_RGB[0]);
                         ctx.beginPath(); ctx.arc(px(p[0]), py(p[1]), 2.5, 0, Math.PI * 2); ctx.fill();
-                    }
+                    });
                 }
             }
             const eyes = [
