@@ -132,6 +132,7 @@ function makePanel(node) {
     header.append(title, engineEl, spacer);
 
     const state = { skel: true, face: true, iris: true, gaze: true, edit: false };
+    // L9.321 (matrix R3): off chips, reset and the frame readout were overlay1 (3.4:1); --c2c-dim is >= 4.5:1
     const mkChip = (label, key, getColor, onToggle) => {
         const b = document.createElement("button");
         b.type = "button";
@@ -142,7 +143,7 @@ function makePanel(node) {
                 font-size:10.5px; padding:3px 8px; border-radius:999px; cursor:pointer;
                 border:1px solid ${state[key] ? color : "var(--c2c-surface1, #45475a)"};
                 background:${state[key] ? color + "22" : "transparent"};
-                color:${state[key] ? color : "var(--c2c-overlay1, #7f849c)"};
+                color:${state[key] ? color : "var(--c2c-dim, #9593c4)"};
             `;
         };
         paint();
@@ -169,7 +170,7 @@ function makePanel(node) {
     resetBtn.style.cssText = `
         display:none; font-size:10.5px; padding:3px 8px; border-radius:999px; cursor:pointer;
         border:1px solid var(--c2c-surface1, #45475a); background:transparent;
-        color:var(--c2c-overlay1, #7f849c);
+        color:var(--c2c-dim, #9593c4);
     `;
     resetBtn.onclick = () => resetFrame();
     const skelChip = header.children[3];   // the "skeleton" chip added above
@@ -207,7 +208,7 @@ function makePanel(node) {
     scrub.type = "range"; scrub.min = "0"; scrub.max = "0"; scrub.value = "0"; scrub.step = "1";
     scrub.style.cssText = "flex:1 1 auto; accent-color:var(--c2c-blue, #89b4fa);";
     const frameEl = document.createElement("span");
-    frameEl.style.cssText = "font:11px ui-monospace,monospace; color:var(--c2c-overlay1, #a6adc8); white-space:nowrap;";
+    frameEl.style.cssText = "font:11px ui-monospace,monospace; color:var(--c2c-dim, #9593c4); white-space:nowrap;";
     frameEl.textContent = "frame —";
     scrubRow.append(scrub, frameEl);
     root.appendChild(scrubRow);
