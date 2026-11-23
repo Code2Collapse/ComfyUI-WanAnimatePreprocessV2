@@ -1111,3 +1111,8 @@ label, so screen readers announce them by name. Typing 0 into a number box whose
 This pack now also follows the C2C setting **Settings > C2C > Models & Downloads > Never download models** (from
 ComfyUI-CustomNodePacks): when it is on, no node downloads model weights, even with its own Allow Download ticked.
 The `C2C_NO_DOWNLOADS` environment variable still works and takes priority.
+
+## Drop-downs fit the panel (2026-11-23)
+
+A drop-down in this pack's node panels with a long option (an OCIO view name, a long file name) no longer runs
+past the node edge: it shrinks to the panel and ends the text with "...". The full name is still in the list.
