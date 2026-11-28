@@ -172,7 +172,9 @@ def _ensure_interpreters() -> bool:
 
     task_path = _ensure_task_file()
     if task_path is None:
-        _INIT_FAILED = True
+        # Not sticky: the file may be missing only because allow_download is off this run. _ensure_task_file()
+        # already remembers a FAILED download itself; ticking allow_download or placing the file must work
+        # without restarting ComfyUI.
         return False
 
     try:
