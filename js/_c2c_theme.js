@@ -23,7 +23,8 @@
  * (night | mocha | oled | latte). §16 theme toggle.
  *
  * `night` is the default and the house identity: the ground is a blue-black
- * indigo ramp and violet is the only saturated hue on it.
+ * indigo ramp and violet is the only saturated hue on it, so the accent reads
+ * everywhere without a second colour competing.
  *
  * Backward-compat: `C` is re-exported with the exact same keys as
  * `_c2c_window.js` so existing imports keep working unchanged.
@@ -31,10 +32,20 @@
  * License: Apache-2.0
  */
 
-import { app } from "../../scripts/app.js";
-// NOTE: _c2c_native_offsets.js and c2c_omnibar.js live in CustomNodePacks only.
-// This satellite copy of _c2c_theme.js (for WanAnimatePreprocessV2) does not
-// need them — the main pack boots them via its own copy.
+// L7.33: no import of /scripts/app.js. The copies are served at different depths (CNP js/, WAPV2 js/, WNE web/js/),
+// so no one relative path fits them all. /scripts/app.js is only a shim for this same object (frontend 1.x:
+// `export const app = window.comfyAPI.app.app`), so the module reads it directly.
+const app = window.comfyAPI?.app?.app;
+// L7.33: this file ships byte-identical in CNP, WNE and WAPV2 (tools/sync_vendored.py js-theme). Two side-effect
+// modules live in CustomNodePacks only: _c2c_native_offsets.js (publishes --c2c-native-top/-left/-bottom off the
+// live native chrome) and c2c_omnibar.js (the P0.2 OmniBar). A STATIC import of either from another pack 404s and
+// kills that pack's whole front-end, so they load dynamically, and only from the CNP copy (CNP's own copy mounts
+// them for every pack when it is installed).
+const _C2C_THEME_URL = String(import.meta?.url || "").toLowerCase();
+if (_C2C_THEME_URL.includes("customnodepacks")) {
+    import("./_c2c_native_offsets.js").catch((e) => console.warn("[C2C theme] native offsets not loaded:", e));
+    import("./c2c_omnibar.js").catch((e) => console.warn("[C2C theme] OmniBar not loaded:", e));
+}
 import { reportFailure as __c2cReport } from "./_c2c_report.js";
 
 // ── Palettes ───────────────────────────────────────────────────────────────
@@ -788,10 +799,12 @@ export function applyResponsiveCSS() {
    black widget shape shows through (verified live 2026-05-28). We use a
    solid panel shade slightly lighter than the typical ComfyUI node body
    (#353535) so the textarea is visually delimited but not jarring. */
+/* agy review 2026-11-28: this rule reaches EVERY node's textarea (core and other packs), so it takes its colours from
+   ComfyUI's own palette variables (a light theme stays light); the old dark values are only the fallback. */
 textarea.comfy-multiline-input {
-    background: #2b2b30 !important;
-    color: var(--c2c-fg, #e6e6e6) !important;
-    border: 1px solid rgba(255, 255, 255, 0.10) !important;
+    background: var(--comfy-input-bg, #2b2b30) !important;
+    color: var(--input-text, var(--c2c-fg, #e6e6e6)) !important;
+    border: 1px solid var(--border-color, rgba(255, 255, 255, 0.10)) !important;
     border-radius: 4px !important;
     padding: 2px 6px !important;
     box-sizing: border-box !important;
@@ -799,11 +812,9 @@ textarea.comfy-multiline-input {
                 background     var(--c2c-dur-fast, 120ms) var(--c2c-ease-out, ease-out);
 }
 textarea.comfy-multiline-input:hover {
-    background: #32323a !important;
-    border-color: rgba(255, 255, 255, 0.18) !important;
+    border-color: var(--descrip-text, rgba(255, 255, 255, 0.18)) !important;
 }
 textarea.comfy-multiline-input:focus {
-    background: #32323a !important;
     outline: none !important;
     border-color: var(--c2c-mauve, #78aec9) !important;
     box-shadow: 0 0 0 1px var(--c2c-mauve, #78aec9) !important;   /* crisp ring, no halo (nightcall 4.2) */
@@ -853,8 +864,8 @@ export function listVariants() { return Object.keys(PALETTES); }
 applyThemeVars();
 
 // Register a setting so the user can switch variants from ComfyUI's Settings.
-const _C2C_THEME_SATELLITE = typeof import.meta?.url === "string"
-    && import.meta.url.includes("WanAnimatePreprocessV2");
+// WAPV2 satellite mode (kept from its copy): that pack never registers the setting itself; CNP or WNE does.
+const _C2C_THEME_SATELLITE = _C2C_THEME_URL.includes("wananimatepreprocessv2");
 if (!_C2C_THEME_SATELLITE && !window.__C2C_THEME_REG__) { window.__C2C_THEME_REG__ = true; try {
     app.registerExtension({
         name: "C2C.Theme",
@@ -862,7 +873,7 @@ if (!_C2C_THEME_SATELLITE && !window.__C2C_THEME_REG__) { window.__C2C_THEME_REG
             {
                 id: "c2c.theme.variant",
                 name: "C2C → Theme variant",
-                tooltip: "Catppuccin variant used across every C2C panel/HUD.",
+                tooltip: "Palette used across every C2C panel, HUD and widget.",
                 type: "combo",
                 options: [
                     { value: "nightcall", text: "Nightcall (default) — midnight blue-black, glacier steel" },
