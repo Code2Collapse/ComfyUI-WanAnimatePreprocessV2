@@ -1,275 +1,2510 @@
 {
-  "last_node_id": 5,
-  "last_link_id": 6,
-  "nodes": [
+ "id": "00000000-0000-0000-0000-000000000000",
+ "revision": 0,
+ "last_node_id": 5,
+ "last_link_id": 4,
+ "nodes": [
+  {
+   "id": 1,
+   "type": "LoadImage",
+   "pos": [
+    40,
+    40
+   ],
+   "size": [
+    282.796875,
+    314
+   ],
+   "flags": {},
+   "order": 0,
+   "mode": 0,
+   "showAdvanced": null,
+   "inputs": [
     {
-      "id": 1,
-      "type": "LoadImage",
-      "pos": [
-        40,
-        40
-      ],
-      "size": [
-        320,
-        130
-      ],
-      "flags": {},
-      "order": 0,
-      "mode": 0,
-      "properties": {
-        "Node name for S&R": "LoadImage"
-      },
-      "title": "Load Actor Footage",
-      "widgets_values": [
-        "actor_clip.png",
-        "image"
-      ],
-      "outputs": [
-        {
-          "name": "IMAGE",
-          "type": "IMAGE",
-          "links": [
-            1,
-            3
-          ],
-          "slot_index": 0
-        },
-        {
-          "name": "MASK",
-          "type": "MASK",
-          "links": [],
-          "slot_index": 1
-        }
-      ]
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "image",
+     "locked": null,
+     "name": "image",
+     "nameLocked": null,
+     "removable": null,
+     "shape": null,
+     "type": "COMBO",
+     "widget": {
+      "name": "image"
+     },
+     "link": null
     },
     {
-      "id": 2,
-      "type": "OnnxDetectionModelLoaderV2",
-      "pos": [
-        40,
-        240
-      ],
-      "size": [
-        320,
-        130
-      ],
-      "flags": {},
-      "order": 1,
-      "mode": 0,
-      "properties": {
-        "Node name for S&R": "OnnxDetectionModelLoaderV2"
-      },
-      "title": "V2 Detection Loader",
-      "widgets_values": [
-        "yolox_l.onnx",
-        "vitpose_h.onnx",
-        "auto"
-      ],
-      "outputs": [
-        {
-          "name": "model",
-          "type": "ONNX_MODEL",
-          "links": [
-            2
-          ],
-          "slot_index": 0
-        }
-      ]
-    },
-    {
-      "id": 3,
-      "type": "PoseAndFaceDetectionV2",
-      "pos": [
-        440,
-        40
-      ],
-      "size": [
-        320,
-        130
-      ],
-      "flags": {},
-      "order": 2,
-      "mode": 0,
-      "properties": {
-        "Node name for S&R": "PoseAndFaceDetectionV2"
-      },
-      "title": "Pose+Face Detect",
-      "widgets_values": [
-        0.5,
-        0.45,
-        true
-      ],
-      "outputs": [
-        {
-          "name": "pose",
-          "type": "POSE",
-          "links": [
-            4
-          ],
-          "slot_index": 0
-        },
-        {
-          "name": "face",
-          "type": "FACE_LANDMARKS",
-          "links": [
-            5
-          ],
-          "slot_index": 1
-        },
-        {
-          "name": "bbox",
-          "type": "BBOX",
-          "links": [],
-          "slot_index": 2
-        }
-      ],
-      "inputs": [
-        {
-          "name": "model",
-          "type": "ONNX_MODEL",
-          "link": 2
-        },
-        {
-          "name": "image",
-          "type": "IMAGE",
-          "link": 1
-        }
-      ]
-    },
-    {
-      "id": 4,
-      "type": "DrawViTPoseV2",
-      "pos": [
-        840,
-        40
-      ],
-      "size": [
-        320,
-        130
-      ],
-      "flags": {},
-      "order": 3,
-      "mode": 0,
-      "properties": {
-        "Node name for S&R": "DrawViTPoseV2"
-      },
-      "title": "Draw V2",
-      "widgets_values": [
-        true,
-        true,
-        true,
-        2.0
-      ],
-      "outputs": [
-        {
-          "name": "IMAGE",
-          "type": "IMAGE",
-          "links": [
-            6
-          ],
-          "slot_index": 0
-        }
-      ],
-      "inputs": [
-        {
-          "name": "image",
-          "type": "IMAGE",
-          "link": 3
-        },
-        {
-          "name": "pose",
-          "type": "POSE",
-          "link": 4
-        },
-        {
-          "name": "face",
-          "type": "FACE_LANDMARKS",
-          "link": 5
-        }
-      ]
-    },
-    {
-      "id": 5,
-      "type": "SaveImage",
-      "pos": [
-        1240,
-        40
-      ],
-      "size": [
-        320,
-        130
-      ],
-      "flags": {},
-      "order": 4,
-      "mode": 0,
-      "properties": {
-        "Node name for S&R": "SaveImage"
-      },
-      "title": "Save",
-      "widgets_values": [
-        "wan_animate_v2_%batch_num%"
-      ],
-      "inputs": [
-        {
-          "name": "images",
-          "type": "IMAGE",
-          "link": 6
-        }
-      ]
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "choose file to upload",
+     "locked": null,
+     "name": "upload",
+     "nameLocked": null,
+     "removable": null,
+     "shape": null,
+     "type": "IMAGEUPLOAD",
+     "widget": {
+      "name": "upload"
+     },
+     "link": null
     }
+   ],
+   "outputs": [
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "IMAGE",
+     "locked": null,
+     "name": "IMAGE",
+     "nameLocked": null,
+     "removable": null,
+     "shape": null,
+     "type": "IMAGE",
+     "pos": null,
+     "slot_index": null,
+     "links": [
+      2
+     ]
+    },
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "MASK",
+     "locked": null,
+     "name": "MASK",
+     "nameLocked": null,
+     "removable": null,
+     "shape": null,
+     "type": "MASK",
+     "pos": null,
+     "slot_index": null,
+     "links": null
+    }
+   ],
+   "properties": {
+    "Node name for S&R": "LoadImage"
+   },
+   "widgets_values": [
+    "c2c_p02_texture.png",
+    "image"
+   ],
+   "widgets_values_named": {
+    "image": "c2c_p02_texture.png",
+    "upload": "image"
+   }
+  },
+  {
+   "id": 2,
+   "type": "OnnxDetectionModelLoaderV2",
+   "pos": [
+    40,
+    420
+   ],
+   "size": [
+    340.078125,
+    143
+   ],
+   "flags": {},
+   "order": 1,
+   "mode": 0,
+   "showAdvanced": null,
+   "inputs": [
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "vitpose_model",
+     "locked": null,
+     "name": "vitpose_model",
+     "nameLocked": null,
+     "removable": null,
+     "shape": null,
+     "type": "COMBO",
+     "widget": {
+      "name": "vitpose_model"
+     },
+     "link": null
+    },
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "yolo_model",
+     "locked": null,
+     "name": "yolo_model",
+     "nameLocked": null,
+     "removable": null,
+     "shape": null,
+     "type": "COMBO",
+     "widget": {
+      "name": "yolo_model"
+     },
+     "link": null
+    },
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "onnx_device",
+     "locked": null,
+     "name": "onnx_device",
+     "nameLocked": null,
+     "removable": null,
+     "shape": null,
+     "type": "COMBO",
+     "widget": {
+      "name": "onnx_device"
+     },
+     "link": null
+    }
+   ],
+   "outputs": [
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "model",
+     "locked": null,
+     "name": "model",
+     "nameLocked": null,
+     "removable": null,
+     "shape": null,
+     "type": "POSEMODEL",
+     "pos": null,
+     "slot_index": null,
+     "links": [
+      1
+     ]
+    }
+   ],
+   "properties": {
+    "Node name for S&R": "OnnxDetectionModelLoaderV2"
+   },
+   "widgets_values": [
+    "(place .onnx models in ComfyUI/models/detection)",
+    "(place .onnx models in ComfyUI/models/detection)",
+    "CUDAExecutionProvider"
+   ],
+   "widgets_values_named": {
+    "vitpose_model": "(place .onnx models in ComfyUI/models/detection)",
+    "yolo_model": "(place .onnx models in ComfyUI/models/detection)",
+    "onnx_device": "CUDAExecutionProvider"
+   },
+   "color": "#10141d",
+   "bgcolor": "#0c0f16"
+  },
+  {
+   "id": 3,
+   "type": "PoseAndFaceDetectionV2",
+   "pos": [
+    460,
+    40
+   ],
+   "size": [
+    400,
+    1262
+   ],
+   "flags": {},
+   "order": 2,
+   "mode": 0,
+   "showAdvanced": null,
+   "inputs": [
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "model",
+     "locked": null,
+     "name": "model",
+     "nameLocked": null,
+     "removable": null,
+     "shape": null,
+     "type": "POSEMODEL",
+     "pos": null,
+     "link": 1
+    },
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "images",
+     "locked": null,
+     "name": "images",
+     "nameLocked": null,
+     "removable": null,
+     "shape": null,
+     "type": "IMAGE",
+     "pos": null,
+     "link": 2
+    },
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "bbox_override",
+     "locked": null,
+     "name": "bbox_override",
+     "nameLocked": null,
+     "removable": null,
+     "shape": 7,
+     "type": "BBOX",
+     "pos": null,
+     "link": null
+    },
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "hires_images",
+     "locked": null,
+     "name": "hires_images",
+     "nameLocked": null,
+     "removable": null,
+     "shape": 7,
+     "type": "IMAGE",
+     "pos": null,
+     "link": null
+    },
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "retarget_image",
+     "locked": null,
+     "name": "retarget_image",
+     "nameLocked": null,
+     "removable": null,
+     "shape": 7,
+     "type": "IMAGE",
+     "pos": null,
+     "link": null
+    },
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "width",
+     "locked": null,
+     "name": "width",
+     "nameLocked": null,
+     "removable": null,
+     "shape": null,
+     "type": "INT",
+     "widget": {
+      "name": "width"
+     },
+     "link": null
+    },
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "height",
+     "locked": null,
+     "name": "height",
+     "nameLocked": null,
+     "removable": null,
+     "shape": null,
+     "type": "INT",
+     "widget": {
+      "name": "height"
+     },
+     "link": null
+    },
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "detection_threshold",
+     "locked": null,
+     "name": "detection_threshold",
+     "nameLocked": null,
+     "removable": null,
+     "shape": null,
+     "type": "FLOAT",
+     "widget": {
+      "name": "detection_threshold"
+     },
+     "link": null
+    },
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "pose_threshold",
+     "locked": null,
+     "name": "pose_threshold",
+     "nameLocked": null,
+     "removable": null,
+     "shape": null,
+     "type": "FLOAT",
+     "widget": {
+      "name": "pose_threshold"
+     },
+     "link": null
+    },
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "use_clahe",
+     "locked": null,
+     "name": "use_clahe",
+     "nameLocked": null,
+     "removable": null,
+     "shape": null,
+     "type": "BOOLEAN",
+     "widget": {
+      "name": "use_clahe"
+     },
+     "link": null
+    },
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "clahe_clip_limit",
+     "locked": null,
+     "name": "clahe_clip_limit",
+     "nameLocked": null,
+     "removable": null,
+     "shape": null,
+     "type": "FLOAT",
+     "widget": {
+      "name": "clahe_clip_limit"
+     },
+     "link": null
+    },
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "clahe_grid_size",
+     "locked": null,
+     "name": "clahe_grid_size",
+     "nameLocked": null,
+     "removable": null,
+     "shape": null,
+     "type": "INT",
+     "widget": {
+      "name": "clahe_grid_size"
+     },
+     "link": null
+    },
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "detect_gamma",
+     "locked": null,
+     "name": "detect_gamma",
+     "nameLocked": null,
+     "removable": null,
+     "shape": null,
+     "type": "FLOAT",
+     "widget": {
+      "name": "detect_gamma"
+     },
+     "link": null
+    },
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "detect_white_balance",
+     "locked": null,
+     "name": "detect_white_balance",
+     "nameLocked": null,
+     "removable": null,
+     "shape": null,
+     "type": "BOOLEAN",
+     "widget": {
+      "name": "detect_white_balance"
+     },
+     "link": null
+    },
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "detect_denoise",
+     "locked": null,
+     "name": "detect_denoise",
+     "nameLocked": null,
+     "removable": null,
+     "shape": null,
+     "type": "FLOAT",
+     "widget": {
+      "name": "detect_denoise"
+     },
+     "link": null
+    },
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "detect_sharpen",
+     "locked": null,
+     "name": "detect_sharpen",
+     "nameLocked": null,
+     "removable": null,
+     "shape": null,
+     "type": "FLOAT",
+     "widget": {
+      "name": "detect_sharpen"
+     },
+     "link": null
+    },
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "detect_saturation",
+     "locked": null,
+     "name": "detect_saturation",
+     "nameLocked": null,
+     "removable": null,
+     "shape": null,
+     "type": "FLOAT",
+     "widget": {
+      "name": "detect_saturation"
+     },
+     "link": null
+    },
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "use_blur_for_pose",
+     "locked": null,
+     "name": "use_blur_for_pose",
+     "nameLocked": null,
+     "removable": null,
+     "shape": null,
+     "type": "BOOLEAN",
+     "widget": {
+      "name": "use_blur_for_pose"
+     },
+     "link": null
+    },
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "blur_radius",
+     "locked": null,
+     "name": "blur_radius",
+     "nameLocked": null,
+     "removable": null,
+     "shape": null,
+     "type": "INT",
+     "widget": {
+      "name": "blur_radius"
+     },
+     "link": null
+    },
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "blur_sigma",
+     "locked": null,
+     "name": "blur_sigma",
+     "nameLocked": null,
+     "removable": null,
+     "shape": null,
+     "type": "FLOAT",
+     "widget": {
+      "name": "blur_sigma"
+     },
+     "link": null
+    },
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "use_face_smoothing",
+     "locked": null,
+     "name": "use_face_smoothing",
+     "nameLocked": null,
+     "removable": null,
+     "shape": null,
+     "type": "BOOLEAN",
+     "widget": {
+      "name": "use_face_smoothing"
+     },
+     "link": null
+    },
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "face_smoothing_strength",
+     "locked": null,
+     "name": "face_smoothing_strength",
+     "nameLocked": null,
+     "removable": null,
+     "shape": null,
+     "type": "FLOAT",
+     "widget": {
+      "name": "face_smoothing_strength"
+     },
+     "link": null
+    },
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "use_constant_face_box",
+     "locked": null,
+     "name": "use_constant_face_box",
+     "nameLocked": null,
+     "removable": null,
+     "shape": null,
+     "type": "BOOLEAN",
+     "widget": {
+      "name": "use_constant_face_box"
+     },
+     "link": null
+    },
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "face_crop_scale",
+     "locked": null,
+     "name": "face_crop_scale",
+     "nameLocked": null,
+     "removable": null,
+     "shape": null,
+     "type": "FLOAT",
+     "widget": {
+      "name": "face_crop_scale"
+     },
+     "link": null
+    },
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "face_box_size_px",
+     "locked": null,
+     "name": "face_box_size_px",
+     "nameLocked": null,
+     "removable": null,
+     "shape": null,
+     "type": "INT",
+     "widget": {
+      "name": "face_box_size_px"
+     },
+     "link": null
+    },
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "use_iris_smoothing",
+     "locked": null,
+     "name": "use_iris_smoothing",
+     "nameLocked": null,
+     "removable": null,
+     "shape": null,
+     "type": "BOOLEAN",
+     "widget": {
+      "name": "use_iris_smoothing"
+     },
+     "link": null
+    },
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "iris_smoothing_strength",
+     "locked": null,
+     "name": "iris_smoothing_strength",
+     "nameLocked": null,
+     "removable": null,
+     "shape": null,
+     "type": "FLOAT",
+     "widget": {
+      "name": "iris_smoothing_strength"
+     },
+     "link": null
+    },
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "iris_smoothing_method",
+     "locked": null,
+     "name": "iris_smoothing_method",
+     "nameLocked": null,
+     "removable": null,
+     "shape": null,
+     "type": "COMBO",
+     "widget": {
+      "name": "iris_smoothing_method"
+     },
+     "link": null
+    },
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "iris_one_euro_min_cutoff",
+     "locked": null,
+     "name": "iris_one_euro_min_cutoff",
+     "nameLocked": null,
+     "removable": null,
+     "shape": null,
+     "type": "FLOAT",
+     "widget": {
+      "name": "iris_one_euro_min_cutoff"
+     },
+     "link": null
+    },
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "iris_one_euro_beta",
+     "locked": null,
+     "name": "iris_one_euro_beta",
+     "nameLocked": null,
+     "removable": null,
+     "shape": null,
+     "type": "FLOAT",
+     "widget": {
+      "name": "iris_one_euro_beta"
+     },
+     "link": null
+    },
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "gaze_lock_eyes",
+     "locked": null,
+     "name": "gaze_lock_eyes",
+     "nameLocked": null,
+     "removable": null,
+     "shape": null,
+     "type": "BOOLEAN",
+     "widget": {
+      "name": "gaze_lock_eyes"
+     },
+     "link": null
+    },
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "gaze_lock_strength",
+     "locked": null,
+     "name": "gaze_lock_strength",
+     "nameLocked": null,
+     "removable": null,
+     "shape": null,
+     "type": "FLOAT",
+     "widget": {
+      "name": "gaze_lock_strength"
+     },
+     "link": null
+    },
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "use_mediapipe_face",
+     "locked": null,
+     "name": "use_mediapipe_face",
+     "nameLocked": null,
+     "removable": null,
+     "shape": null,
+     "type": "BOOLEAN",
+     "widget": {
+      "name": "use_mediapipe_face"
+     },
+     "link": null
+    },
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "use_blendshape_gaze",
+     "locked": null,
+     "name": "use_blendshape_gaze",
+     "nameLocked": null,
+     "removable": null,
+     "shape": null,
+     "type": "BOOLEAN",
+     "widget": {
+      "name": "use_blendshape_gaze"
+     },
+     "link": null
+    },
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "gaze_one_euro_min_cutoff",
+     "locked": null,
+     "name": "gaze_one_euro_min_cutoff",
+     "nameLocked": null,
+     "removable": null,
+     "shape": null,
+     "type": "FLOAT",
+     "widget": {
+      "name": "gaze_one_euro_min_cutoff"
+     },
+     "link": null
+    },
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "gaze_one_euro_beta",
+     "locked": null,
+     "name": "gaze_one_euro_beta",
+     "nameLocked": null,
+     "removable": null,
+     "shape": null,
+     "type": "FLOAT",
+     "widget": {
+      "name": "gaze_one_euro_beta"
+     },
+     "link": null
+    },
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "gaze_max_yaw_deg",
+     "locked": null,
+     "name": "gaze_max_yaw_deg",
+     "nameLocked": null,
+     "removable": null,
+     "shape": null,
+     "type": "FLOAT",
+     "widget": {
+      "name": "gaze_max_yaw_deg"
+     },
+     "link": null
+    },
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "gaze_max_pitch_deg",
+     "locked": null,
+     "name": "gaze_max_pitch_deg",
+     "nameLocked": null,
+     "removable": null,
+     "shape": null,
+     "type": "FLOAT",
+     "widget": {
+      "name": "gaze_max_pitch_deg"
+     },
+     "link": null
+    },
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "crop_mode",
+     "locked": null,
+     "name": "crop_mode",
+     "nameLocked": null,
+     "removable": null,
+     "shape": null,
+     "type": "COMBO",
+     "widget": {
+      "name": "crop_mode"
+     },
+     "link": null
+    },
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "frame0_cx",
+     "locked": null,
+     "name": "frame0_cx",
+     "nameLocked": null,
+     "removable": null,
+     "shape": null,
+     "type": "INT",
+     "widget": {
+      "name": "frame0_cx"
+     },
+     "link": null
+    },
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "frame0_cy",
+     "locked": null,
+     "name": "frame0_cy",
+     "nameLocked": null,
+     "removable": null,
+     "shape": null,
+     "type": "INT",
+     "widget": {
+      "name": "frame0_cy"
+     },
+     "link": null
+    },
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "frame0_size",
+     "locked": null,
+     "name": "frame0_size",
+     "nameLocked": null,
+     "removable": null,
+     "shape": null,
+     "type": "INT",
+     "widget": {
+      "name": "frame0_size"
+     },
+     "link": null
+    },
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "keyframes_json",
+     "locked": null,
+     "name": "keyframes_json",
+     "nameLocked": null,
+     "removable": null,
+     "shape": null,
+     "type": "STRING",
+     "widget": {
+      "name": "keyframes_json"
+     },
+     "link": null
+    },
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "smoothing_method",
+     "locked": null,
+     "name": "smoothing_method",
+     "nameLocked": null,
+     "removable": null,
+     "shape": null,
+     "type": "COMBO",
+     "widget": {
+      "name": "smoothing_method"
+     },
+     "link": null
+    },
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "crop_one_euro_min_cutoff",
+     "locked": null,
+     "name": "crop_one_euro_min_cutoff",
+     "nameLocked": null,
+     "removable": null,
+     "shape": null,
+     "type": "FLOAT",
+     "widget": {
+      "name": "crop_one_euro_min_cutoff"
+     },
+     "link": null
+    },
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "crop_one_euro_beta",
+     "locked": null,
+     "name": "crop_one_euro_beta",
+     "nameLocked": null,
+     "removable": null,
+     "shape": null,
+     "type": "FLOAT",
+     "widget": {
+      "name": "crop_one_euro_beta"
+     },
+     "link": null
+    },
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "crop_gaussian_window",
+     "locked": null,
+     "name": "crop_gaussian_window",
+     "nameLocked": null,
+     "removable": null,
+     "shape": null,
+     "type": "INT",
+     "widget": {
+      "name": "crop_gaussian_window"
+     },
+     "link": null
+    },
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "crop_safety_margin",
+     "locked": null,
+     "name": "crop_safety_margin",
+     "nameLocked": null,
+     "removable": null,
+     "shape": null,
+     "type": "FLOAT",
+     "widget": {
+      "name": "crop_safety_margin"
+     },
+     "link": null
+    },
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "crop_size_one_euro_beta",
+     "locked": null,
+     "name": "crop_size_one_euro_beta",
+     "nameLocked": null,
+     "removable": null,
+     "shape": null,
+     "type": "FLOAT",
+     "widget": {
+      "name": "crop_size_one_euro_beta"
+     },
+     "link": null
+    },
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "crop_containment_check",
+     "locked": null,
+     "name": "crop_containment_check",
+     "nameLocked": null,
+     "removable": null,
+     "shape": null,
+     "type": "BOOLEAN",
+     "widget": {
+      "name": "crop_containment_check"
+     },
+     "link": null
+    },
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "crop_containment_tolerance",
+     "locked": null,
+     "name": "crop_containment_tolerance",
+     "nameLocked": null,
+     "removable": null,
+     "shape": null,
+     "type": "INT",
+     "widget": {
+      "name": "crop_containment_tolerance"
+     },
+     "link": null
+    },
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "auto_smoothing_method",
+     "locked": null,
+     "name": "auto_smoothing_method",
+     "nameLocked": null,
+     "removable": null,
+     "shape": null,
+     "type": "COMBO",
+     "widget": {
+      "name": "auto_smoothing_method"
+     },
+     "link": null
+    },
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "preserve_face_aspect",
+     "locked": null,
+     "name": "preserve_face_aspect",
+     "nameLocked": null,
+     "removable": null,
+     "shape": null,
+     "type": "BOOLEAN",
+     "widget": {
+      "name": "preserve_face_aspect"
+     },
+     "link": null
+    },
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "force_eyes_open",
+     "locked": null,
+     "name": "force_eyes_open",
+     "nameLocked": null,
+     "removable": null,
+     "shape": null,
+     "type": "FLOAT",
+     "widget": {
+      "name": "force_eyes_open"
+     },
+     "link": null
+    },
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "eye_open_mode",
+     "locked": null,
+     "name": "eye_open_mode",
+     "nameLocked": null,
+     "removable": null,
+     "shape": null,
+     "type": "COMBO",
+     "widget": {
+      "name": "eye_open_mode"
+     },
+     "link": null
+    },
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "eye_open_blink_ear",
+     "locked": null,
+     "name": "eye_open_blink_ear",
+     "nameLocked": null,
+     "removable": null,
+     "shape": null,
+     "type": "FLOAT",
+     "widget": {
+      "name": "eye_open_blink_ear"
+     },
+     "link": null
+    },
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "eye_align_mode",
+     "locked": null,
+     "name": "eye_align_mode",
+     "nameLocked": null,
+     "removable": null,
+     "shape": null,
+     "type": "COMBO",
+     "widget": {
+      "name": "eye_align_mode"
+     },
+     "link": null
+    },
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "eye_y_fraction",
+     "locked": null,
+     "name": "eye_y_fraction",
+     "nameLocked": null,
+     "removable": null,
+     "shape": null,
+     "type": "FLOAT",
+     "widget": {
+      "name": "eye_y_fraction"
+     },
+     "link": null
+    },
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "face_cfg_scale",
+     "locked": null,
+     "name": "face_cfg_scale",
+     "nameLocked": null,
+     "removable": null,
+     "shape": null,
+     "type": "FLOAT",
+     "widget": {
+      "name": "face_cfg_scale"
+     },
+     "link": null
+    },
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "gaze_engine",
+     "locked": null,
+     "name": "gaze_engine",
+     "nameLocked": null,
+     "removable": null,
+     "shape": null,
+     "type": "COMBO",
+     "widget": {
+      "name": "gaze_engine"
+     },
+     "link": null
+    },
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "gaze_kalman_meas_std_deg",
+     "locked": null,
+     "name": "gaze_kalman_meas_std_deg",
+     "nameLocked": null,
+     "removable": null,
+     "shape": null,
+     "type": "FLOAT",
+     "widget": {
+      "name": "gaze_kalman_meas_std_deg"
+     },
+     "link": null
+    },
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "gaze_kalman_process_std",
+     "locked": null,
+     "name": "gaze_kalman_process_std",
+     "nameLocked": null,
+     "removable": null,
+     "shape": null,
+     "type": "FLOAT",
+     "widget": {
+      "name": "gaze_kalman_process_std"
+     },
+     "link": null
+    },
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "gaze_fps",
+     "locked": null,
+     "name": "gaze_fps",
+     "nameLocked": null,
+     "removable": null,
+     "shape": null,
+     "type": "FLOAT",
+     "widget": {
+      "name": "gaze_fps"
+     },
+     "link": null
+    },
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "gaze_calibration_frame",
+     "locked": null,
+     "name": "gaze_calibration_frame",
+     "nameLocked": null,
+     "removable": null,
+     "shape": null,
+     "type": "INT",
+     "widget": {
+      "name": "gaze_calibration_frame"
+     },
+     "link": null
+    },
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "apply_gaze_to_face_image",
+     "locked": null,
+     "name": "apply_gaze_to_face_image",
+     "nameLocked": null,
+     "removable": null,
+     "shape": null,
+     "type": "COMBO",
+     "widget": {
+      "name": "apply_gaze_to_face_image"
+     },
+     "link": null
+    },
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "au_amplify",
+     "locked": null,
+     "name": "au_amplify",
+     "nameLocked": null,
+     "removable": null,
+     "shape": null,
+     "type": "FLOAT",
+     "widget": {
+      "name": "au_amplify"
+     },
+     "link": null
+    },
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "au_amplify_neutral_frame",
+     "locked": null,
+     "name": "au_amplify_neutral_frame",
+     "nameLocked": null,
+     "removable": null,
+     "shape": null,
+     "type": "INT",
+     "widget": {
+      "name": "au_amplify_neutral_frame"
+     },
+     "link": null
+    },
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "export_expression_coeffs",
+     "locked": null,
+     "name": "export_expression_coeffs",
+     "nameLocked": null,
+     "removable": null,
+     "shape": null,
+     "type": "BOOLEAN",
+     "widget": {
+      "name": "export_expression_coeffs"
+     },
+     "link": null
+    },
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "landmark_overrides_json",
+     "locked": null,
+     "name": "landmark_overrides_json",
+     "nameLocked": null,
+     "removable": null,
+     "shape": 7,
+     "type": "STRING",
+     "widget": {
+      "name": "landmark_overrides_json"
+     },
+     "link": null
+    },
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "face_resize_filter",
+     "locked": null,
+     "name": "face_resize_filter",
+     "nameLocked": null,
+     "removable": null,
+     "shape": 7,
+     "type": "COMBO",
+     "widget": {
+      "name": "face_resize_filter"
+     },
+     "link": null
+    },
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "face_sr",
+     "locked": null,
+     "name": "face_sr",
+     "nameLocked": null,
+     "removable": null,
+     "shape": 7,
+     "type": "COMBO",
+     "widget": {
+      "name": "face_sr"
+     },
+     "link": null
+    },
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "face_sr_model",
+     "locked": null,
+     "name": "face_sr_model",
+     "nameLocked": null,
+     "removable": null,
+     "shape": 7,
+     "type": "COMBO",
+     "widget": {
+      "name": "face_sr_model"
+     },
+     "link": null
+    },
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "face_sr_stabilise",
+     "locked": null,
+     "name": "face_sr_stabilise",
+     "nameLocked": null,
+     "removable": null,
+     "shape": 7,
+     "type": "FLOAT",
+     "widget": {
+      "name": "face_sr_stabilise"
+     },
+     "link": null
+    },
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "use_flux",
+     "locked": null,
+     "name": "use_flux",
+     "nameLocked": null,
+     "removable": null,
+     "shape": 7,
+     "type": "BOOLEAN",
+     "widget": {
+      "name": "use_flux"
+     },
+     "link": null
+    },
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "flux_kontext_path",
+     "locked": null,
+     "name": "flux_kontext_path",
+     "nameLocked": null,
+     "removable": null,
+     "shape": 7,
+     "type": "STRING",
+     "widget": {
+      "name": "flux_kontext_path"
+     },
+     "link": null
+    },
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "allow_download",
+     "locked": null,
+     "name": "allow_download",
+     "nameLocked": null,
+     "removable": null,
+     "shape": 7,
+     "type": "BOOLEAN",
+     "widget": {
+      "name": "allow_download"
+     },
+     "link": null
+    }
+   ],
+   "outputs": [
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "pose_data",
+     "locked": null,
+     "name": "pose_data",
+     "nameLocked": null,
+     "removable": null,
+     "shape": null,
+     "type": "POSEDATA",
+     "pos": null,
+     "slot_index": null,
+     "links": [
+      3
+     ]
+    },
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "face_images",
+     "locked": null,
+     "name": "face_images",
+     "nameLocked": null,
+     "removable": null,
+     "shape": null,
+     "type": "IMAGE",
+     "pos": null,
+     "slot_index": null,
+     "links": null
+    },
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "key_frame_body_points",
+     "locked": null,
+     "name": "key_frame_body_points",
+     "nameLocked": null,
+     "removable": null,
+     "shape": null,
+     "type": "STRING",
+     "pos": null,
+     "slot_index": null,
+     "links": null
+    },
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "bboxes",
+     "locked": null,
+     "name": "bboxes",
+     "nameLocked": null,
+     "removable": null,
+     "shape": null,
+     "type": "BBOX",
+     "pos": null,
+     "slot_index": null,
+     "links": null
+    },
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "face_bboxes",
+     "locked": null,
+     "name": "face_bboxes",
+     "nameLocked": null,
+     "removable": null,
+     "shape": null,
+     "type": "BBOX",
+     "pos": null,
+     "slot_index": null,
+     "links": null
+    },
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "iris_data",
+     "locked": null,
+     "name": "iris_data",
+     "nameLocked": null,
+     "removable": null,
+     "shape": null,
+     "type": "STRING",
+     "pos": null,
+     "slot_index": null,
+     "links": null
+    },
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "debug_image",
+     "locked": null,
+     "name": "debug_image",
+     "nameLocked": null,
+     "removable": null,
+     "shape": null,
+     "type": "IMAGE",
+     "pos": null,
+     "slot_index": null,
+     "links": null
+    },
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "right_pupil_xy",
+     "locked": null,
+     "name": "right_pupil_xy",
+     "nameLocked": null,
+     "removable": null,
+     "shape": null,
+     "type": "STRING",
+     "pos": null,
+     "slot_index": null,
+     "links": null
+    },
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "left_pupil_xy",
+     "locked": null,
+     "name": "left_pupil_xy",
+     "nameLocked": null,
+     "removable": null,
+     "shape": null,
+     "type": "STRING",
+     "pos": null,
+     "slot_index": null,
+     "links": null
+    },
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "lip_openness_ratio",
+     "locked": null,
+     "name": "lip_openness_ratio",
+     "nameLocked": null,
+     "removable": null,
+     "shape": null,
+     "type": "FLOAT",
+     "pos": null,
+     "slot_index": null,
+     "links": null
+    },
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "restore_info",
+     "locked": null,
+     "name": "restore_info",
+     "nameLocked": null,
+     "removable": null,
+     "shape": null,
+     "type": "FACE_RESTORE_INFO",
+     "pos": null,
+     "slot_index": null,
+     "links": null
+    },
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "face_cfg_scale",
+     "locked": null,
+     "name": "face_cfg_scale",
+     "nameLocked": null,
+     "removable": null,
+     "shape": null,
+     "type": "FLOAT",
+     "pos": null,
+     "slot_index": null,
+     "links": null
+    },
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "face_images_512",
+     "locked": null,
+     "name": "face_images_512",
+     "nameLocked": null,
+     "removable": null,
+     "shape": null,
+     "type": "IMAGE",
+     "pos": null,
+     "slot_index": null,
+     "links": null
+    },
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "expression_coeffs_json",
+     "locked": null,
+     "name": "expression_coeffs_json",
+     "nameLocked": null,
+     "removable": null,
+     "shape": null,
+     "type": "STRING",
+     "pos": null,
+     "slot_index": null,
+     "links": null
+    }
+   ],
+   "properties": {
+    "Node name for S&R": "PoseAndFaceDetectionV2"
+   },
+   "widgets_values": [
+    832,
+    480,
+    0.05,
+    0.3,
+    true,
+    2,
+    8,
+    1,
+    false,
+    0,
+    0,
+    1,
+    false,
+    5,
+    2,
+    true,
+    0.6,
+    true,
+    1.3,
+    0,
+    true,
+    0.4,
+    "one_euro",
+    1,
+    0.05,
+    true,
+    0.7,
+    true,
+    true,
+    1.7,
+    0.3,
+    30,
+    25,
+    "default",
+    -1,
+    -1,
+    0,
+    "[]",
+    "one_euro",
+    1,
+    0.05,
+    7,
+    1.12,
+    0.2,
+    true,
+    4,
+    "legacy_ema",
+    false,
+    0,
+    "blinks_only",
+    0.18,
+    "default",
+    0.3,
+    1,
+    "l2cs_gaze360",
+    3,
+    0.8,
+    30,
+    -1,
+    "off",
+    1,
+    0,
+    false,
+    "{}",
+    "mitchell",
+    "none",
+    "none",
+    0.5,
+    false,
+    "",
+    false
+   ],
+   "widgets_values_named": {
+    "width": 832,
+    "height": 480,
+    "detection_threshold": 0.05,
+    "pose_threshold": 0.3,
+    "use_clahe": true,
+    "clahe_clip_limit": 2,
+    "clahe_grid_size": 8,
+    "detect_gamma": 1,
+    "detect_white_balance": false,
+    "detect_denoise": 0,
+    "detect_sharpen": 0,
+    "detect_saturation": 1,
+    "use_blur_for_pose": false,
+    "blur_radius": 5,
+    "blur_sigma": 2,
+    "use_face_smoothing": true,
+    "face_smoothing_strength": 0.6,
+    "use_constant_face_box": true,
+    "face_crop_scale": 1.3,
+    "face_box_size_px": 0,
+    "use_iris_smoothing": true,
+    "iris_smoothing_strength": 0.4,
+    "iris_smoothing_method": "one_euro",
+    "iris_one_euro_min_cutoff": 1,
+    "iris_one_euro_beta": 0.05,
+    "gaze_lock_eyes": true,
+    "gaze_lock_strength": 0.7,
+    "use_mediapipe_face": true,
+    "use_blendshape_gaze": true,
+    "gaze_one_euro_min_cutoff": 1.7,
+    "gaze_one_euro_beta": 0.3,
+    "gaze_max_yaw_deg": 30,
+    "gaze_max_pitch_deg": 25,
+    "crop_mode": "default",
+    "frame0_cx": -1,
+    "frame0_cy": -1,
+    "frame0_size": 0,
+    "keyframes_json": "[]",
+    "smoothing_method": "one_euro",
+    "crop_one_euro_min_cutoff": 1,
+    "crop_one_euro_beta": 0.05,
+    "crop_gaussian_window": 7,
+    "crop_safety_margin": 1.12,
+    "crop_size_one_euro_beta": 0.2,
+    "crop_containment_check": true,
+    "crop_containment_tolerance": 4,
+    "auto_smoothing_method": "legacy_ema",
+    "preserve_face_aspect": false,
+    "force_eyes_open": 0,
+    "eye_open_mode": "blinks_only",
+    "eye_open_blink_ear": 0.18,
+    "eye_align_mode": "default",
+    "eye_y_fraction": 0.3,
+    "face_cfg_scale": 1,
+    "gaze_engine": "l2cs_gaze360",
+    "gaze_kalman_meas_std_deg": 3,
+    "gaze_kalman_process_std": 0.8,
+    "gaze_fps": 30,
+    "gaze_calibration_frame": -1,
+    "apply_gaze_to_face_image": "off",
+    "au_amplify": 1,
+    "au_amplify_neutral_frame": 0,
+    "export_expression_coeffs": false,
+    "landmark_overrides_json": "{}",
+    "face_resize_filter": "mitchell",
+    "face_sr": "none",
+    "face_sr_model": "none",
+    "face_sr_stabilise": 0.5,
+    "use_flux": false,
+    "flux_kontext_path": "",
+    "allow_download": false
+   },
+   "color": "#10141d",
+   "bgcolor": "#0c0f16"
+  },
+  {
+   "id": 4,
+   "type": "DrawViTPoseV2",
+   "pos": [
+    980,
+    40
+   ],
+   "size": [
+    400,
+    500
+   ],
+   "flags": {},
+   "order": 3,
+   "mode": 0,
+   "showAdvanced": null,
+   "inputs": [
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "pose_data",
+     "locked": null,
+     "name": "pose_data",
+     "nameLocked": null,
+     "removable": null,
+     "shape": null,
+     "type": "POSEDATA",
+     "pos": null,
+     "link": 3
+    },
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "face_images",
+     "locked": null,
+     "name": "face_images",
+     "nameLocked": null,
+     "removable": null,
+     "shape": 7,
+     "type": "IMAGE",
+     "pos": null,
+     "link": null
+    },
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "face_cfg_scale",
+     "locked": null,
+     "name": "face_cfg_scale",
+     "nameLocked": null,
+     "removable": null,
+     "shape": 7,
+     "type": "FLOAT",
+     "pos": null,
+     "link": null
+    },
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "width",
+     "locked": null,
+     "name": "width",
+     "nameLocked": null,
+     "removable": null,
+     "shape": null,
+     "type": "INT",
+     "widget": {
+      "name": "width"
+     },
+     "link": null
+    },
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "height",
+     "locked": null,
+     "name": "height",
+     "nameLocked": null,
+     "removable": null,
+     "shape": null,
+     "type": "INT",
+     "widget": {
+      "name": "height"
+     },
+     "link": null
+    },
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "retarget_padding",
+     "locked": null,
+     "name": "retarget_padding",
+     "nameLocked": null,
+     "removable": null,
+     "shape": null,
+     "type": "INT",
+     "widget": {
+      "name": "retarget_padding"
+     },
+     "link": null
+    },
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "body_stick_width",
+     "locked": null,
+     "name": "body_stick_width",
+     "nameLocked": null,
+     "removable": null,
+     "shape": null,
+     "type": "INT",
+     "widget": {
+      "name": "body_stick_width"
+     },
+     "link": null
+    },
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "hand_stick_width",
+     "locked": null,
+     "name": "hand_stick_width",
+     "nameLocked": null,
+     "removable": null,
+     "shape": null,
+     "type": "INT",
+     "widget": {
+      "name": "hand_stick_width"
+     },
+     "link": null
+    },
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "draw_head",
+     "locked": null,
+     "name": "draw_head",
+     "nameLocked": null,
+     "removable": null,
+     "shape": null,
+     "type": "BOOLEAN",
+     "widget": {
+      "name": "draw_head"
+     },
+     "link": null
+    },
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "pose_draw_threshold",
+     "locked": null,
+     "name": "pose_draw_threshold",
+     "nameLocked": null,
+     "removable": null,
+     "shape": null,
+     "type": "FLOAT",
+     "widget": {
+      "name": "pose_draw_threshold"
+     },
+     "link": null
+    },
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "draw_iris",
+     "locked": null,
+     "name": "draw_iris",
+     "nameLocked": null,
+     "removable": null,
+     "shape": 7,
+     "type": "BOOLEAN",
+     "widget": {
+      "name": "draw_iris"
+     },
+     "link": null
+    },
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "draw_gaze",
+     "locked": null,
+     "name": "draw_gaze",
+     "nameLocked": null,
+     "removable": null,
+     "shape": 7,
+     "type": "BOOLEAN",
+     "widget": {
+      "name": "draw_gaze"
+     },
+     "link": null
+    },
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "iris_radius",
+     "locked": null,
+     "name": "iris_radius",
+     "nameLocked": null,
+     "removable": null,
+     "shape": 7,
+     "type": "INT",
+     "widget": {
+      "name": "iris_radius"
+     },
+     "link": null
+    },
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "gaze_arrow_len",
+     "locked": null,
+     "name": "gaze_arrow_len",
+     "nameLocked": null,
+     "removable": null,
+     "shape": 7,
+     "type": "INT",
+     "widget": {
+      "name": "gaze_arrow_len"
+     },
+     "link": null
+    },
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "iris_min_confidence",
+     "locked": null,
+     "name": "iris_min_confidence",
+     "nameLocked": null,
+     "removable": null,
+     "shape": 7,
+     "type": "FLOAT",
+     "widget": {
+      "name": "iris_min_confidence"
+     },
+     "link": null
+    },
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "iris_color",
+     "locked": null,
+     "name": "iris_color",
+     "nameLocked": null,
+     "removable": null,
+     "shape": 7,
+     "type": "COMBO",
+     "widget": {
+      "name": "iris_color"
+     },
+     "link": null
+    },
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "enforce_512_face",
+     "locked": null,
+     "name": "enforce_512_face",
+     "nameLocked": null,
+     "removable": null,
+     "shape": 7,
+     "type": "BOOLEAN",
+     "widget": {
+      "name": "enforce_512_face"
+     },
+     "link": null
+    },
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "reference_expression_coeffs_json",
+     "locked": null,
+     "name": "reference_expression_coeffs_json",
+     "nameLocked": null,
+     "removable": null,
+     "shape": 7,
+     "type": "STRING",
+     "widget": {
+      "name": "reference_expression_coeffs_json"
+     },
+     "link": null
+    },
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "segment_length",
+     "locked": null,
+     "name": "segment_length",
+     "nameLocked": null,
+     "removable": null,
+     "shape": 7,
+     "type": "INT",
+     "widget": {
+      "name": "segment_length"
+     },
+     "link": null
+    },
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "top_k_aus",
+     "locked": null,
+     "name": "top_k_aus",
+     "nameLocked": null,
+     "removable": null,
+     "shape": 7,
+     "type": "INT",
+     "widget": {
+      "name": "top_k_aus"
+     },
+     "link": null
+    },
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "apply_pose_edits_to_face",
+     "locked": null,
+     "name": "apply_pose_edits_to_face",
+     "nameLocked": null,
+     "removable": null,
+     "shape": 7,
+     "type": "COMBO",
+     "widget": {
+      "name": "apply_pose_edits_to_face"
+     },
+     "link": null
+    }
+   ],
+   "outputs": [
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "pose_images",
+     "locked": null,
+     "name": "pose_images",
+     "nameLocked": null,
+     "removable": null,
+     "shape": null,
+     "type": "IMAGE",
+     "pos": null,
+     "slot_index": null,
+     "links": [
+      4
+     ]
+    },
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "face_video",
+     "locked": null,
+     "name": "face_video",
+     "nameLocked": null,
+     "removable": null,
+     "shape": null,
+     "type": "IMAGE",
+     "pos": null,
+     "slot_index": null,
+     "links": null
+    },
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "face_cfg_scale",
+     "locked": null,
+     "name": "face_cfg_scale",
+     "nameLocked": null,
+     "removable": null,
+     "shape": null,
+     "type": "FLOAT",
+     "pos": null,
+     "slot_index": null,
+     "links": null
+    },
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "critic_report_json",
+     "locked": null,
+     "name": "critic_report_json",
+     "nameLocked": null,
+     "removable": null,
+     "shape": null,
+     "type": "STRING",
+     "pos": null,
+     "slot_index": null,
+     "links": null
+    },
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "worst_aus_csv",
+     "locked": null,
+     "name": "worst_aus_csv",
+     "nameLocked": null,
+     "removable": null,
+     "shape": null,
+     "type": "STRING",
+     "pos": null,
+     "slot_index": null,
+     "links": null
+    },
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "overall_mae",
+     "locked": null,
+     "name": "overall_mae",
+     "nameLocked": null,
+     "removable": null,
+     "shape": null,
+     "type": "FLOAT",
+     "pos": null,
+     "slot_index": null,
+     "links": null
+    }
+   ],
+   "properties": {
+    "Node name for S&R": "DrawViTPoseV2"
+   },
+   "widgets_values": [
+    832,
+    480,
+    16,
+    -1,
+    -1,
+    true,
+    0.3,
+    true,
+    true,
+    4,
+    30,
+    0.05,
+    "white",
+    true,
+    "",
+    77,
+    10,
+    "warp"
+   ],
+   "widgets_values_named": {
+    "width": 832,
+    "height": 480,
+    "retarget_padding": 16,
+    "body_stick_width": -1,
+    "hand_stick_width": -1,
+    "draw_head": true,
+    "pose_draw_threshold": 0.3,
+    "draw_iris": true,
+    "draw_gaze": true,
+    "iris_radius": 4,
+    "gaze_arrow_len": 30,
+    "iris_min_confidence": 0.05,
+    "iris_color": "white",
+    "enforce_512_face": true,
+    "reference_expression_coeffs_json": "",
+    "segment_length": 77,
+    "top_k_aus": 10,
+    "apply_pose_edits_to_face": "warp"
+   },
+   "color": "#10141d",
+   "bgcolor": "#0c0f16"
+  },
+  {
+   "id": 5,
+   "type": "PreviewImage",
+   "pos": [
+    1400,
+    40
+   ],
+   "size": [
+    225,
+    34
+   ],
+   "flags": {},
+   "order": 4,
+   "mode": 0,
+   "showAdvanced": null,
+   "inputs": [
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "images",
+     "locked": null,
+     "name": "images",
+     "nameLocked": null,
+     "removable": null,
+     "shape": null,
+     "type": "IMAGE",
+     "pos": null,
+     "link": 4
+    }
+   ],
+   "outputs": [
+    {
+     "color_off": null,
+     "color_on": null,
+     "dir": null,
+     "label": null,
+     "localized_name": "images",
+     "locked": null,
+     "name": "images",
+     "nameLocked": null,
+     "removable": null,
+     "shape": null,
+     "type": "IMAGE",
+     "pos": null,
+     "slot_index": null,
+     "links": null
+    }
+   ],
+   "properties": {
+    "Node name for S&R": "PreviewImage"
+   }
+  }
+ ],
+ "links": [
+  [
+   1,
+   2,
+   0,
+   3,
+   0,
+   "POSEMODEL"
   ],
-  "links": [
-    [
-      1,
-      1,
-      0,
-      3,
-      1,
-      "IMAGE"
-    ],
-    [
-      2,
-      2,
-      0,
-      3,
-      0,
-      "ONNX_MODEL"
-    ],
-    [
-      3,
-      1,
-      0,
-      4,
-      0,
-      "IMAGE"
-    ],
-    [
-      4,
-      3,
-      0,
-      4,
-      1,
-      "POSE"
-    ],
-    [
-      5,
-      3,
-      1,
-      4,
-      2,
-      "FACE_LANDMARKS"
-    ],
-    [
-      6,
-      4,
-      0,
-      5,
-      0,
-      "IMAGE"
-    ]
+  [
+   2,
+   1,
+   0,
+   3,
+   1,
+   "IMAGE"
   ],
-  "groups": [],
-  "config": {},
-  "extra": {},
-  "version": 0.4
+  [
+   3,
+   3,
+   0,
+   4,
+   0,
+   "POSEDATA"
+  ],
+  [
+   4,
+   4,
+   0,
+   5,
+   0,
+   "IMAGE"
+  ]
+ ],
+ "floatingLinks": null,
+ "groups": [],
+ "definitions": null,
+ "config": {},
+ "extra": {
+  "c2c": {
+   "bookmarks": {}
+  },
+  "ds": {
+   "scale": 1,
+   "offset": [
+    0,
+    0
+   ]
+  },
+  "reroutes": null
+ },
+ "version": 0.4
 }
