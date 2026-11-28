@@ -728,7 +728,9 @@ def _gaussian_blur(heatmaps, kernel=11):
             dr[border:-border, border:-border] = heatmaps[i, j].copy()
             dr = cv2.GaussianBlur(dr, (kernel, kernel), 0)
             heatmaps[i, j] = dr[border:-border, border:-border].copy()
-            heatmaps[i, j] *= origin_max / np.max(heatmaps[i, j])
+            m = np.max(heatmaps[i, j])
+            if m > 0:   # an all-zero heatmap (keypoint not found) stays zero instead of NaN
+                heatmaps[i, j] *= origin_max / m
     return heatmaps
 
 
