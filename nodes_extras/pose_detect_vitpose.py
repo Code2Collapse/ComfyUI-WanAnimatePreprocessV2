@@ -115,8 +115,10 @@ class WanPoseDetectViTPoseV2:
                     "default": False,
                     "tooltip": "Apply a Gaussian blur to the images before YOLO+ViTPose (anti-aliases noisy frames).",
                 }),
-                "blur_radius": ("INT",   {"default": 2, "min": 0, "max": 32, "step": 1}),
-                "blur_sigma":  ("FLOAT", {"default": 1.5, "min": 0.0, "max": 8.0, "step": 0.1}),
+                "blur_radius": ("INT",   {"default": 2, "min": 0, "max": 32, "step": 1,
+                                          "tooltip": "Gaussian blur kernel radius (kernel size = 2*radius + 1 px) applied before detection when use_blur_for_pose is enabled. Raising it smooths heavier grain but can soften small joint details; 0 disables blur."}),
+                "blur_sigma":  ("FLOAT", {"default": 1.5, "min": 0.0, "max": 8.0, "step": 0.1,
+                                          "tooltip": "Gaussian blur standard deviation used when use_blur_for_pose is enabled. Raising it spreads the blur more strongly across the kernel; lowering it keeps the smoothing tighter."}),
                 "rescale": ("FLOAT", {
                     "default": 1.25, "min": 1.0, "max": 2.0, "step": 0.05,
                     "tooltip": "Bbox padding factor before crop for ViTPose. 1.25 = match the main preprocessor.",

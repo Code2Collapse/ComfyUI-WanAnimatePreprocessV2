@@ -302,8 +302,10 @@ class WanPoseFormatConvertV2:
                     "default": "edited",
                     "tooltip": "Whether to read from pose_metas (edited) or pose_metas_original.",
                 }),
-                "emit_face":      ("BOOLEAN", {"default": True}),
-                "emit_hands":     ("BOOLEAN", {"default": True}),
+                "emit_face":      ("BOOLEAN", {"default": True,
+                                               "tooltip": "Include 2D face keypoints (face_keypoints_2d) in the output POSE_KEYPOINT JSON. Turn off to emit body-only OpenPose JSON."}),
+                "emit_hands":     ("BOOLEAN", {"default": True,
+                                               "tooltip": "Include left and right 2D hand keypoints in the output POSE_KEYPOINT JSON. Turn off if downstream OpenPose consumers should ignore hands."}),
             },
         }
 

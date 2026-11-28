@@ -151,17 +151,20 @@ class WanSHLightingTransferV2:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "source_image": ("IMAGE",),
-                "source_normal": ("IMAGE",),
-                "operation": (["fit_only", "transfer", "rotate_lights"], {"default": "fit_only"}),
-                "rotate_yaw_deg": ("FLOAT", {"default": 0.0, "min": -180.0, "max": 180.0, "step": 1.0}),
-                "intensity": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 4.0, "step": 0.05}),
+                "source_image": ("IMAGE", {"tooltip": "Lit source image batch (B,H,W,3) from which 9-band spherical-harmonics lighting coefficients are fitted."}),
+                "source_normal": ("IMAGE", {"tooltip": "RGB surface normal map matching source_image (1 frame is broadcast across the batch) used to fit the spherical-harmonics lighting."}),
+                "operation": (["fit_only", "transfer", "rotate_lights"], {"default": "fit_only",
+                                                                          "tooltip": "Lighting operation: 'fit_only' reconstructs source lighting, 'transfer' relights target_image using source SH coefficients, and 'rotate_lights' yaws the fitted lighting around the vertical axis."}),
+                "rotate_yaw_deg": ("FLOAT", {"default": 0.0, "min": -180.0, "max": 180.0, "step": 1.0,
+                                             "tooltip": "Horizontal light rotation angle in degrees around the vertical Y axis when operation is 'rotate_lights'. Positive or negative values swing the fitted illumination left or right."}),
+                "intensity": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 4.0, "step": 0.05,
+                                        "tooltip": "Output brightness multiplier applied to both relit_image and shading_map. Raising it brightens the relit result; lowering it toward 0 dims it."}),
             },
             "optional": {
-                "source_albedo": ("IMAGE",),
-                "target_image": ("IMAGE",),
-                "target_normal": ("IMAGE",),
-                "target_albedo": ("IMAGE",),
+                "source_albedo": ("IMAGE", {"tooltip": "Optional source albedo map used to factor out surface color during SH fitting. Leave unconnected to fit directly on source_image intensity."}),
+                "target_image": ("IMAGE", {"tooltip": "Target image batch to relight when operation is 'transfer'. Required for 'transfer'; ignored otherwise."}),
+                "target_normal": ("IMAGE", {"tooltip": "Target RGB surface normal map used to shade target_image when operation is 'transfer'. Required for 'transfer'."}),
+                "target_albedo": ("IMAGE", {"tooltip": "Optional target albedo map for 'transfer' mode. When omitted, target albedo is approximated by dividing target_image by its own fitted shading."}),
             },
         }
 

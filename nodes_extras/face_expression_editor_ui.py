@@ -262,10 +262,10 @@ class WanFaceExpressionEditorUI:
                 "reference_pose_data": ("POSEDATA", {"tooltip": "Single-frame reference whose expression delta is the target."}),
                 "strength":            ("FLOAT", {"default": 0.7, "min": 0.0, "max": 1.0, "step": 0.05,
                                                   "tooltip": "Per-landmark alpha multiplier (0=pass-through, 1=full delta)."}),
-                "affect_mouth":        ("BOOLEAN", {"default": True}),
-                "affect_brows":        ("BOOLEAN", {"default": True}),
+                "affect_mouth":        ("BOOLEAN", {"default": True, "tooltip": "Apply the reference expression delta to mouth landmarks (iBUG-68 indices 48-67). Turn off to keep the driving clip's original mouth shape."}),
+                "affect_brows":        ("BOOLEAN", {"default": True, "tooltip": "Apply the reference expression delta to eyebrow landmarks (iBUG-68 indices 17-26). Turn off to keep the driving clip's original brow motion."}),
                 "affect_eyes":         ("BOOLEAN", {"default": False, "tooltip": "Upper eyelid landmarks 37/38/43/44 get 1.5× emphasis."}),
-                "affect_jaw":          ("BOOLEAN", {"default": False}),
+                "affect_jaw":          ("BOOLEAN", {"default": False, "tooltip": "Apply the reference expression delta to lower-jaw/chin landmarks (iBUG-68 indices 5-11). Turn on to transfer chin shape or jaw opening from the reference."}),
             },
             "optional": {
                 "landmark_overrides_json": ("STRING", {

@@ -461,7 +461,8 @@ class WanGazeETHXGazeV2:
                     "default": "",
                     "tooltip": "Absolute path to override the dropdown selection. Empty = use the dropdown.",
                 }),
-                "device": (["auto", "cuda", "cpu"], {"default": "auto"}),
+                "device": (["auto", "cuda", "cpu"], {"default": "auto",
+                                                    "tooltip": "Compute device for ETH-XGaze ResNet-50 inference. 'auto' picks CUDA when available and falls back to CPU."}),
                 "blend": ("FLOAT", {
                     "default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05,
                     "tooltip": "0 = keep original iris_data gaze, 1 = full ETH-XGaze. Useful to smooth-blend in the new model.",

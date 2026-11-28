@@ -134,10 +134,14 @@ class WanExpressionCoefficientsV2:
                                "the wire is missing, not that a value is "
                                "wanted. Right-click the widget to convert it "
                                "to an input socket."}),
-                "fps": ("FLOAT", {"default": 30.0, "min": 1.0, "max": 240.0, "step": 1.0}),
-                "smooth_min_cutoff": ("FLOAT", {"default": 1.5, "min": 0.01, "max": 30.0, "step": 0.1}),
-                "smooth_beta": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.001}),
-                "active_threshold": ("FLOAT", {"default": 0.10, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "fps": ("FLOAT", {"default": 30.0, "min": 1.0, "max": 240.0, "step": 1.0,
+                                  "tooltip": "Frame rate of the source clip used to step the One-Euro smoother timestamps and recorded in the output JSON. Raise or lower it to match your video's native fps."}),
+                "smooth_min_cutoff": ("FLOAT", {"default": 1.5, "min": 0.01, "max": 30.0, "step": 0.1,
+                                                "tooltip": "One-Euro minimum cutoff frequency (Hz) for smoothed_json. Lowering it removes more resting jitter at the cost of slight lag; raising it preserves subtle rapid changes."}),
+                "smooth_beta": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.001,
+                                          "tooltip": "One-Euro speed coefficient for smoothed_json. Raising it reduces lag during fast expression changes; keeping it at 0.0 applies constant-cutoff smoothing."}),
+                "active_threshold": ("FLOAT", {"default": 0.10, "min": 0.0, "max": 1.0, "step": 0.01,
+                                               "tooltip": "Minimum peak blendshape value required for a coefficient to be counted in active_count. Raising it excludes subtle activations; lowering it counts minor movements."}),
                 "topk": ("INT", {"default": 0, "min": 0, "max": 52,
                                  "tooltip": "0 = keep all; >0 = keep top-K by variance."}),
             },

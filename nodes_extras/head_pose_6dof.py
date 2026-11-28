@@ -172,10 +172,13 @@ class WanHeadPose6DoFV2:
                     "tooltip": "JSON: list of frames; each frame is a list of [x,y] (iBUG-68, length >= 68) or a dict with face_landmarks/kps_face."}),
             },
             "optional": {
-                "image": ("IMAGE",),
-                "image_width_override": ("INT", {"default": 0, "min": 0, "max": 16384}),
-                "image_height_override": ("INT", {"default": 0, "min": 0, "max": 16384}),
-                "axis_length": ("FLOAT", {"default": 6.0, "min": 1.0, "max": 30.0, "step": 0.5}),
+                "image": ("IMAGE", {"tooltip": "Optional video frames (B,H,W,3) used to read image dimensions and draw the 3D pose-axis overlay onto."}),
+                "image_width_override": ("INT", {"default": 0, "min": 0, "max": 16384,
+                                                 "tooltip": "Fallback image width in pixels when no image is connected (0 = default 1280). Set to match the footage width so normalized landmarks and camera intrinsics scale accurately."}),
+                "image_height_override": ("INT", {"default": 0, "min": 0, "max": 16384,
+                                                  "tooltip": "Fallback image height in pixels when no image is connected (0 = default 720). Set to match the footage height so normalized landmarks and camera intrinsics scale accurately."}),
+                "axis_length": ("FLOAT", {"default": 6.0, "min": 1.0, "max": 30.0, "step": 0.5,
+                                          "tooltip": "Length of the projected 3D X/Y/Z axes drawn at the nose tip on the overlay image. Raising it makes the axes longer; lowering it makes them more compact."}),
             },
         }
 

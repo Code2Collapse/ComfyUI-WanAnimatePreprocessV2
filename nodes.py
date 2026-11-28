@@ -7025,14 +7025,18 @@ class EARBlinkDetectorC2C:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "pose_data": ("POSEDATA",),
+                "pose_data": ("POSEDATA", {"tooltip": "Pose data bundle from Pose and Face Detection (V2) containing per-frame face keypoints."}),
                 "threshold": ("FLOAT", {"default": 0.21, "min": 0.05,
-                                         "max": 0.5, "step": 0.005}),
+                                         "max": 0.5, "step": 0.005,
+                                         "tooltip": "Eye-Aspect-Ratio (EAR) below which both eyes count as closed. Raising this catches lighter blinks or squints; lowering it requires a fuller eye closure."}),
                 "min_consecutive_frames": ("INT", {"default": 2, "min": 1,
-                                                    "max": 30}),
+                                                    "max": 30,
+                                                    "tooltip": "Minimum number of consecutive frames below the EAR threshold to count as a blink. Raising it suppresses single-frame detection noise; lowering it catches faster blinks."}),
                 "fps": ("FLOAT", {"default": 30.0, "min": 1.0, "max": 240.0,
-                                   "step": 0.5}),
-                "smooth_window": ("INT", {"default": 3, "min": 1, "max": 9}),
+                                   "step": 0.5,
+                                   "tooltip": "Frame rate of the source clip used to compute blink_rate_hz. Raising or lowering it scales the reported blinks-per-second rate inversely with clip duration."}),
+                "smooth_window": ("INT", {"default": 3, "min": 1, "max": 9,
+                                          "tooltip": "Causal median filter window (frames, rounded up to odd) applied to the EAR series before thresholding. Raising it suppresses detection jitter; lowering it preserves brief blinks."}),
             },
         }
 
@@ -7160,15 +7164,18 @@ class SaccadeClassifierC2C:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "pose_data": ("POSEDATA",),
+                "pose_data": ("POSEDATA", {"tooltip": "Pose data bundle from Pose and Face Detection (V2) containing per-frame iris_data gaze angles."}),
                 "fps": ("FLOAT", {"default": 30.0, "min": 1.0, "max": 240.0,
-                                   "step": 0.5}),
+                                   "step": 0.5,
+                                   "tooltip": "Frame rate of the source clip used to convert per-frame gaze deltas into degrees/second and compute saccade_rate_hz. Setting this higher increases calculated angular velocities; setting it lower reduces them."}),
                 "velocity_threshold_deg_s": ("FLOAT", {"default": 300.0,
                                                         "min": 30.0,
                                                         "max": 1000.0,
-                                                        "step": 5.0}),
+                                                        "step": 5.0,
+                                                        "tooltip": "Gaze angular speed (degrees/second) at or above which a frame is flagged as a saccade. Raising it restricts detection to faster eye jumps; lowering it flags slower gaze shifts too."}),
                 "min_consecutive_frames": ("INT", {"default": 1, "min": 1,
-                                                    "max": 30}),
+                                                    "max": 30,
+                                                    "tooltip": "Minimum consecutive frames above the velocity threshold required to count as a saccade. Raising it rejects single-frame tracking spikes; lowering it to 1 catches instantaneous jumps."}),
                 "one_euro_min_cutoff": ("FLOAT", {"default": 1.0, "min": 0.1,
                                                    "max": 10.0, "step": 0.1, "tooltip": (
                     "Smoothing of the reported yaw / pitch series only; saccades are measured on the raw gaze "
@@ -7317,20 +7324,25 @@ class PupilDilationTrackerC2C:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "pose_data": ("POSEDATA",),
+                "pose_data": ("POSEDATA", {"tooltip": "Pose data bundle from Pose and Face Detection (V2) providing per-frame iris radii and face keypoints."}),
                 "normaliser": (["eye_width", "face_bbox_diag",
                                  "first_frame_radius"],
-                                {"default": "eye_width"}),
+                                {"default": "eye_width",
+                                 "tooltip": "Reference scale used to divide raw pupil radius so camera-distance changes cancel out. 'eye_width' uses eye-corner span, 'face_bbox_diag' uses the optional face_bboxes diagonal, and 'first_frame_radius' expresses radius relative to the first valid frame."}),
                 "event_threshold": ("FLOAT", {"default": 1.25, "min": 1.0,
-                                               "max": 3.0, "step": 0.01}),
+                                               "max": 3.0, "step": 0.01,
+                                               "tooltip": "Multiplier above the clip's mean normalized pupil radius that defines a dilation event. Raising it reports only stronger pupil expansions; lowering it toward 1.0 detects subtle increases."}),
                 "min_consecutive_frames": ("INT", {"default": 3, "min": 1,
-                                                    "max": 60}),
-                "smooth_window": ("INT", {"default": 5, "min": 1, "max": 31}),
+                                                    "max": 60,
+                                                    "tooltip": "Minimum consecutive frames above event_threshold to record a dilation event. Raising it filters out brief jitter spikes; lowering it catches shorter dilation beats."}),
+                "smooth_window": ("INT", {"default": 5, "min": 1, "max": 31,
+                                          "tooltip": "Causal median smoothing window (frames, rounded up to odd) applied to the normalized pupil radius series. Raising it reduces measurement noise; lowering it preserves rapid per-frame changes."}),
                 "fps": ("FLOAT", {"default": 30.0, "min": 1.0, "max": 240.0,
-                                   "step": 0.5}),
+                                   "step": 0.5,
+                                   "tooltip": "Frame rate metadata (frames per second) recorded in the dilation report JSON for downstream timing calculations."}),
             },
             "optional": {
-                "face_bboxes": ("BBOX",),
+                "face_bboxes": ("BBOX", {"tooltip": "Optional per-frame face bounding boxes (x1, y1, x2, y2) from Pose and Face Detection (V2). Used as the scale divisor when normaliser is set to 'face_bbox_diag'."}),
             },
         }
 
