@@ -85,6 +85,10 @@ class WanPoseDetectViTPoseV2:
     )
     RETURN_TYPES = ("POSEDATA", "STRING")
     RETURN_NAMES = ("pose_data", "info")
+    OUTPUT_TOOLTIPS = (
+        "Detected POSEDATA bundle containing pose_metas_original, AAPoseMeta pose_metas, and empty iris_data. Connect to Draw ViT Pose (V2), Wan Face Controller 3D, or pose conversion nodes.",
+        "Plain-text summary of detected frame count, missed detections, full-frame fallbacks, and thresholds. Connect to a text display or logging node.",
+    )
     FUNCTION     = "run"
 
     @classmethod

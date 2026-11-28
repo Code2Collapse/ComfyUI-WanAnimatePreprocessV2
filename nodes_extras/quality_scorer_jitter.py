@@ -106,6 +106,14 @@ class WanQualityScorerJitterV2:
     RETURN_NAMES = ("metrics_json", "quality_score",
                     "mean_body_velocity", "mean_face_velocity",
                     "mean_expression_jitter", "bad_frame_count")
+    OUTPUT_TOOLTIPS = (
+        "JSON report with per-frame velocity, visibility, expression jitter, bad flags, and clip summary. Connect to a text display or logging node.",
+        "Aggregate clip quality score in [0.0, 1.0] combining visibility, motion stability, and expression jitter. Connect to a quality gate or float display node.",
+        "Mean per-frame body keypoint displacement in pixels across valid frames. Connect to a float display or motion-threshold gate node.",
+        "Mean per-frame face keypoint displacement in pixels across valid frames. Connect to a float display or face-stability gate node.",
+        "Mean rolling variance of ARKit blendshape coefficients (0.0 if expression JSON is omitted). Connect to a float display or jitter gate node.",
+        "Count of frames flagged as bad for exceeding velocity, visibility, or jitter thresholds. Connect to an integer display or clip-filtering gate node.",
+    )
     DESCRIPTION = "Per-frame quality and jitter metrics from pose + (optional) expression JSON. Outputs aggregate quality score in [0,1]."
 
     @classmethod

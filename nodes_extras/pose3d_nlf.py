@@ -225,6 +225,10 @@ class WanPose3DRefineNLFV2:
 
     RETURN_TYPES = ("POSEDATA", "STRING")
     RETURN_NAMES = ("pose_data", "info")
+    OUTPUT_TOOLTIPS = (
+        "Deep-copied POSEDATA bundle with OpenPose-18 body joints refined and temporally smoothed via NLF 3D pose estimation. Connect to Draw ViT Pose (V2) or downstream pose nodes.",
+        "Plain-text summary of refined frame count, device, blend/smoothing settings, and drawn-pose update status. Connect to a text display or logging node.",
+    )
     FUNCTION = "refine"
     CATEGORY = "WanAnimatePreprocess/Pose"
     DESCRIPTION = "Refine ViTPose POSEDATA with NLF 3D pose (jitter/occlusion/temporal) — Wan-Animate ready."

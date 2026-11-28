@@ -144,6 +144,11 @@ class WanSHLightingTransferV2:
     FUNCTION = "execute"
     RETURN_TYPES = ("IMAGE", "STRING", "IMAGE")
     RETURN_NAMES = ("relit_image", "sh_coeffs_json", "shading_map")
+    OUTPUT_TOOLTIPS = (
+        "Relit IMAGE batch from the spherical-harmonics transfer, light rotation, or source fit. Connect to a compositor, preview, or video output node.",
+        "JSON containing the operation mode and per-frame 9-band RGB SH coefficients with RMS error. Connect to a text display or logging node.",
+        "Pure spherical-harmonics irradiance IMAGE batch scaled by intensity. Connect to a preview node to verify lighting or a blend/multiply node.",
+    )
     DESCRIPTION = ("Spherical-harmonics lighting fit (L=2, 9 basis, per RGB channel) "
                    "with optional relighting onto a target. Basri-Jacobs/Ramamoorthi formulation.")
 

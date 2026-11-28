@@ -7043,6 +7043,12 @@ class EARBlinkDetectorC2C:
     RETURN_TYPES = ("STRING", "STRING", "INT", "FLOAT")
     RETURN_NAMES = ("blink_report_json", "ear_series_json",
                     "blink_count", "blink_rate_hz")
+    OUTPUT_TOOLTIPS = (
+        "JSON blink summary with per-frame blink_mask, thresholds, and counts. Connect to a text display or JSON inspection node.",
+        "JSON per-frame Eye-Aspect-Ratio series (left, right, mean_smoothed, open_eye_smoothed). Connect to a plotter, logger, or text display node.",
+        "Total number of detected blinks across the clip. Connect to an integer display, counter, or logic gate node.",
+        "Average blink rate in blinks per second (Hz) at the specified fps. Connect to a float display or timing/analytics node.",
+    )
     FUNCTION = "detect"
     CATEGORY = "WanAnimatePreprocess_V2/KANIBUS"
 
@@ -7189,6 +7195,12 @@ class SaccadeClassifierC2C:
     RETURN_TYPES = ("STRING", "STRING", "INT", "FLOAT")
     RETURN_NAMES = ("saccade_report_json", "velocity_series_json",
                     "saccade_count", "saccade_rate_hz")
+    OUTPUT_TOOLTIPS = (
+        "JSON saccade summary with per-frame saccade_mask, thresholds, and counts. Connect to a text display or JSON inspection node.",
+        "JSON per-frame gaze angular velocity (deg/s) and smoothed yaw/pitch series. Connect to a plotter, logger, or text display node.",
+        "Total number of detected saccade events across the clip. Connect to an integer display, counter, or logic gate node.",
+        "Average saccade rate in events per second (Hz) at the specified fps. Connect to a float display or timing/analytics node.",
+    )
     FUNCTION = "classify"
     CATEGORY = "WanAnimatePreprocess_V2/KANIBUS"
 
@@ -7349,6 +7361,12 @@ class PupilDilationTrackerC2C:
     RETURN_TYPES = ("STRING", "STRING", "FLOAT", "FLOAT")
     RETURN_NAMES = ("dilation_report_json", "radius_series_json",
                     "mean_normalized", "stddev_normalized")
+    OUTPUT_TOOLTIPS = (
+        "JSON pupil dilation summary with detected event frame ranges and stats. Connect to a text display or JSON inspection node.",
+        "JSON per-frame raw pixel radii, normaliser scale, and smoothed normalized series. Connect to a plotter, logger, or text display node.",
+        "Mean normalized pupil radius across valid frames. Connect to a float display or downstream threshold/analytics node.",
+        "Standard deviation of the smoothed normalized pupil radius across valid frames. Connect to a float display or analytics node.",
+    )
     FUNCTION = "track"
     CATEGORY = "WanAnimatePreprocess_V2/KANIBUS"
 

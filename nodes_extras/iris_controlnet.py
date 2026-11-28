@@ -143,6 +143,11 @@ class WanIrisControlNetV2:
     FUNCTION = "execute"
     RETURN_TYPES = ("IMAGE", "MASK", "STRING")
     RETURN_NAMES = ("control_image", "iris_mask", "info")
+    OUTPUT_TOOLTIPS = (
+        "Rendered iris and gaze ControlNet conditioning IMAGE batch (eye ellipses, pupil discs, arrows, heatmap). Connect to a ControlNet Apply or preview node.",
+        "Per-frame binary eye-region MASK batch matching the rendered eye ellipses. Connect to a mask-aware composite, inpaint, or ControlNet mask input.",
+        "JSON summary of frame count, image dimensions, render_style, iris_radius_px, and iris data presence. Connect to a text display or logging node.",
+    )
     DESCRIPTION = "Render an iris/gaze ControlNet conditioning image from iris_data JSON. Eye masks, iris discs, gaze arrows, gaze-target heatmap."
 
     @classmethod

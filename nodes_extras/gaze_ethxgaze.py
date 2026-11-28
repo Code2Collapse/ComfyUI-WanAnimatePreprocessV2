@@ -440,6 +440,10 @@ class WanGazeETHXGazeV2:
     )
     RETURN_TYPES = ("POSEDATA", "STRING")
     RETURN_NAMES = ("pose_data", "info")
+    OUTPUT_TOOLTIPS = (
+        "Copy of the POSEDATA bundle with iris_data left_gaze and right_gaze updated from ETH-XGaze predictions. Connect to Draw ViT Pose (V2) or Wan Iris ControlNet Conditioning (V2).",
+        "Plain-text summary of predicted frames, skipped frame counts, compute device, checkpoint, and blend factor. Connect to a text display or logging node.",
+    )
     FUNCTION     = "run"
 
     @classmethod

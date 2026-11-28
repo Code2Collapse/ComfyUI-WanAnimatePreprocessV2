@@ -556,6 +556,7 @@ class FacePoseDeltaCoreMEC:
         "Modified landmarks (T, N, 2) — same shape and ordering as input.",
         "JSON: per-frame anchor stats, keyframes used, deltas applied, "
         "weights at head/tail frames. Useful for debugging the blend.",
+        "Deep-copied POSEDATA bundle with face keypoints updated by the anchor-relative keyframe deltas (None if only landmarks were connected). Connect to Draw ViT Pose (V2).",
     )
 
     @classmethod

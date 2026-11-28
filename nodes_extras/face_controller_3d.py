@@ -1165,7 +1165,13 @@ class WanFaceController3DV2:
                     "lp_rotate_pitch", "lp_rotate_yaw", "lp_rotate_roll",
                     "lp_pupil_x", "lp_pupil_y")
     OUTPUT_TOOLTIPS = (
-        "", "", "", "", "", "", "",
+        "Edited copy of the POSEDATA bundle with updated face/body landmarks and iris gaze. Connect to Draw ViT Pose (V2) or downstream POSEDATA nodes.",
+        "Plain-text summary of edited frames, expression/rotation/gaze/blend counts, and UI overrides. Connect to a text display or logging node.",
+        "Compact JSON time series of active per-frame FACS coefficients, head-pose overrides, and gaze overrides. Connect to a text display or analytics node.",
+        "Single-frame overlay preview IMAGE at preview_frame_idx showing the edited face mesh, body skeleton, and gaze arrows. Connect to a Preview Image node.",
+        "Rendered overlay IMAGE batch over the selected frame range showing all edits across time. Connect to a video preview or Save Video node.",
+        "CSV table of resolved per-frame head, jaw, neck, translation, and gaze DOF values. Connect to a text display or file-export node.",
+        "Compact JSON of per-frame max and mean face/body keypoint displacement relative to input pose_data. Connect to a text display or QA logging node.",
         "Head pitch for LivePortrait ExpressionEditor (clamped ±20°). Wire to rotate_pitch.",
         "Head yaw for ExpressionEditor (clamped ±20°). Wire to rotate_yaw.",
         "Head roll for ExpressionEditor (clamped ±20°). Wire to rotate_roll.",

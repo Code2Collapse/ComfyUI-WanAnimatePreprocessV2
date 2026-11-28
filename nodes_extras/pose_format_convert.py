@@ -282,6 +282,11 @@ class WanPoseFormatConvertV2:
     )
     RETURN_TYPES = ("POSEDATA", "POSE_KEYPOINT", "STRING")
     RETURN_NAMES = ("pose_data", "pose_keypoint", "info")
+    OUTPUT_TOOLTIPS = (
+        "Copy of the POSEDATA bundle augmented with converted keypoints_body_<format> joints and body_format metadata. Connect to Draw ViT Pose (V2) or downstream pose nodes.",
+        "OpenPose-compatible POSE_KEYPOINT list with pixel-space body and optional face/hand keypoints per frame. Connect to OpenPose ControlNet or pose preview nodes.",
+        "Plain-text summary of converted frames, target skeleton format, and joint coverage. Connect to a text display or logging node.",
+    )
     FUNCTION     = "run"
 
     @classmethod
